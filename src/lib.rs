@@ -1,7 +1,12 @@
 pub mod accounting;
 pub mod api;
+pub mod attempts;
+pub mod cipher;
+pub mod egress;
 pub mod error;
+pub mod gateway;
 pub mod money;
+pub mod protocol;
 pub mod store;
 
 use sqlx::{PgPool, postgres::PgPoolOptions};

@@ -23,6 +23,18 @@ pub enum Error {
     InProgress,
     #[error("database schema does not match this gateway version")]
     SchemaMismatch,
+    #[error("no authorized endpoint satisfies this request")]
+    NoEndpoint,
+    #[error("upstream outcome is uncertain; inspect the request before taking further action")]
+    UpstreamUnknown,
+    #[error("all candidate endpoints failed before submission")]
+    NotSubmitted,
+    #[error("gateway configuration is missing or invalid")]
+    Configuration,
+    #[error("stored result is expired or unavailable; it will not be regenerated automatically")]
+    ResultUnavailable,
+    #[error("gateway concurrency capacity is full")]
+    Busy,
     #[error("internal persistence failure")]
     Database(#[from] sqlx::Error),
 }
@@ -38,6 +50,12 @@ impl IntoResponse for Error {
             Self::MissingFx => (StatusCode::SERVICE_UNAVAILABLE, "exchange_rate_missing"),
             Self::InProgress => (StatusCode::CONFLICT, "operation_in_progress"),
             Self::SchemaMismatch => (StatusCode::SERVICE_UNAVAILABLE, "schema_mismatch"),
+            Self::NoEndpoint => (StatusCode::BAD_REQUEST, "no_compatible_endpoint"),
+            Self::UpstreamUnknown => (StatusCode::BAD_GATEWAY, "submission_unknown"),
+            Self::NotSubmitted => (StatusCode::BAD_GATEWAY, "not_submitted"),
+            Self::Configuration => (StatusCode::SERVICE_UNAVAILABLE, "configuration_error"),
+            Self::ResultUnavailable => (StatusCode::GONE, "result_unavailable"),
+            Self::Busy => (StatusCode::SERVICE_UNAVAILABLE, "gateway_busy"),
             Self::Database(_) => (StatusCode::SERVICE_UNAVAILABLE, "persistence_unavailable"),
         };
         // Database errors can include sensitive query data. Log only the category.

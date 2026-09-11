@@ -8,19 +8,23 @@ DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_operator') THEN
         CREATE ROLE brokerrouter_operator NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_reconciler') THEN
+        CREATE ROLE brokerrouter_reconciler NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
 END $$;
 
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT USAGE ON SCHEMA public TO brokerrouter_runtime, brokerrouter_operator;
 GRANT SELECT ON _sqlx_migrations, tenants, virtual_keys, models, key_models,
-    fx_rates, endpoints, requests, ledger_entries, audit_events
+    fx_rates, endpoints, requests, ledger_entries, audit_events, attempts
     TO brokerrouter_runtime, brokerrouter_operator;
 
 GRANT UPDATE (spent_micros, reserved_micros) ON tenants, virtual_keys TO brokerrouter_runtime;
-GRANT INSERT ON requests, ledger_entries TO brokerrouter_runtime;
-GRANT UPDATE (status, final_micros, result_ciphertext, error_code, updated_at)
+GRANT INSERT ON requests, ledger_entries, attempts TO brokerrouter_runtime;
+GRANT UPDATE (status, final_micros, result_ciphertext, result_expires_at, error_code, updated_at)
     ON requests TO brokerrouter_runtime;
 GRANT USAGE ON SEQUENCE ledger_entries_id_seq TO brokerrouter_runtime;
+GRANT UPDATE (status,http_status,error_code,usage,cost_micros,finished_at) ON attempts TO brokerrouter_runtime;
 
 GRANT INSERT ON tenants, virtual_keys, models, key_models, endpoints, fx_rates, audit_events
     TO brokerrouter_operator;
@@ -30,4 +34,7 @@ GRANT UPDATE (name, active) ON models TO brokerrouter_operator;
 GRANT UPDATE (active) ON endpoints TO brokerrouter_operator;
 GRANT DELETE ON key_models TO brokerrouter_operator;
 GRANT USAGE ON SEQUENCE fx_rates_id_seq, audit_events_id_seq TO brokerrouter_operator;
+GRANT brokerrouter_runtime TO brokerrouter_reconciler;
+GRANT INSERT ON audit_events TO brokerrouter_reconciler;
+GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_reconciler;
 COMMIT;

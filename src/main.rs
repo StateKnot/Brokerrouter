@@ -16,6 +16,20 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Migrate,
+    RequestReconcile {
+        #[arg(long)]
+        tenant: Uuid,
+        #[arg(long)]
+        id: Uuid,
+        #[arg(long)]
+        evidence: String,
+        #[arg(long)]
+        no_charge: bool,
+        #[arg(long)]
+        input_tokens: Option<u64>,
+        #[arg(long)]
+        output_tokens: Option<u64>,
+    },
     Serve {
         #[arg(long, env = "BROKERROUTER_BIND", default_value = "127.0.0.1:8080")]
         bind: SocketAddr,
@@ -101,6 +115,12 @@ enum Command {
         priority: i32,
         #[arg(long)]
         allow_private: bool,
+        #[arg(long, default_value="chat", value_parser=["chat","embedding"])]
+        operation: String,
+        #[arg(long)]
+        supports_tools: bool,
+        #[arg(long)]
+        embedding_dimension: Option<i32>,
     },
 }
 
@@ -119,17 +139,51 @@ async fn main() -> anyhow::Result<()> {
         anyhow::anyhow!("database connection failed; verify DATABASE_URL and network")
     })?;
     match cli.command {
+        Command::RequestReconcile {
+            tenant,
+            id,
+            evidence,
+            no_charge,
+            input_tokens,
+            output_tokens,
+        } => {
+            let usage = match (no_charge, input_tokens, output_tokens) {
+                (true, None, None) => None,
+                (false, Some(i), Some(o)) => Some((i, o)),
+                _ => {
+                    anyhow::bail!("specify --no-charge OR both --input-tokens and --output-tokens")
+                }
+            };
+            brokerrouter::attempts::reconcile(&pool, tenant, id, usage, &evidence).await?;
+            println!("Request reconciled; no model request was sent");
+        }
         Command::Migrate => {
             migrate(&pool).await?;
             println!("Migrations applied");
         }
         Command::Serve { bind } => {
             brokerrouter::check_schema(&pool).await?;
+            let gateway = brokerrouter::gateway::Gateway::from_env(pool.clone()).await?;
+            let maintenance_pool = pool.clone();
+            let maintenance = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    if brokerrouter::attempts::maintain(&maintenance_pool)
+                        .await
+                        .is_err()
+                    {
+                        tracing::error!("request maintenance failed");
+                    }
+                }
+            });
             let listener = tokio::net::TcpListener::bind(bind).await?;
             tracing::info!(address=%bind,"brokerrouter listening");
-            axum::serve(listener, api::router(pool.clone()))
+            axum::serve(listener, api::gateway_router(gateway.clone()))
                 .with_graceful_shutdown(shutdown())
                 .await?;
+            gateway.drain().await;
+            maintenance.abort();
         }
         Command::TenantCreate { name, budget_cny } => println!(
             "{}",
@@ -210,6 +264,9 @@ async fn main() -> anyhow::Result<()> {
             max_output_tokens,
             priority,
             allow_private,
+            operation,
+            supports_tools,
+            embedding_dimension,
         } => {
             let e = store::Endpoint {
                 id: Uuid::new_v4(),
@@ -226,6 +283,9 @@ async fn main() -> anyhow::Result<()> {
                 context_tokens,
                 max_output_tokens,
                 priority,
+                operation,
+                supports_tools,
+                embedding_dimension,
             };
             store::add_endpoint(&pool, &e).await?;
             println!("{}", e.id);

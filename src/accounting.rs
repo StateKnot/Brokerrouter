@@ -23,6 +23,9 @@ pub struct Reservation {
     #[serde(skip)]
     pub result_ciphertext: Option<Vec<u8>>,
     pub error_code: Option<String>,
+    pub routing_snapshot: Option<Value>,
+    pub dispatch_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    pub result_expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 pub struct Admission<'a> {
@@ -32,11 +35,16 @@ pub struct Admission<'a> {
     pub request_hash: &'a [u8],
     pub maximum_micros: i64,
     pub snapshot: PriceSnapshot,
+    pub routing: Option<Value>,
+    pub timeout_seconds: i32,
 }
 
-const COLUMNS: &str = "id,tenant_id,key_id,model_id,status,reserve_micros,final_micros,price_snapshot,request_hash,result_ciphertext,error_code";
+pub(crate) const COLUMNS: &str = "id,tenant_id,key_id,model_id,status,reserve_micros,final_micros,price_snapshot,request_hash,result_ciphertext,error_code,routing_snapshot,dispatch_deadline,result_expires_at";
 
-async fn lock_accounts(tx: &mut Transaction<'_, Postgres>, who: &Identity) -> Result<()> {
+pub(crate) async fn lock_accounts(
+    tx: &mut Transaction<'_, Postgres>,
+    who: &Identity,
+) -> Result<()> {
     // Every money transaction uses the same tenant -> key -> request lock order.
     let tenant: Option<bool> =
         sqlx::query_scalar("SELECT active FROM tenants WHERE id=$1 FOR UPDATE")
@@ -61,6 +69,7 @@ async fn lock_accounts(tx: &mut Transaction<'_, Postgres>, who: &Identity) -> Re
 pub async fn reserve(pool: &PgPool, a: Admission<'_>) -> Result<(Reservation, bool)> {
     a.snapshot.validate()?;
     if a.maximum_micros < 0
+        || !(1..=600).contains(&a.timeout_seconds)
         || a.idempotency_key.is_empty()
         || a.idempotency_key.len() > 200
         || a.request_hash.len() != 32
@@ -105,8 +114,8 @@ pub async fn reserve(pool: &PgPool, a: Admission<'_>) -> Result<(Reservation, bo
         return Err(Error::Budget);
     }
     let id = Uuid::new_v4();
-    let row=sqlx::query_as::<_,Reservation>(&format!("INSERT INTO requests(id,tenant_id,key_id,model_id,idempotency_key,request_hash,status,reserve_micros,price_snapshot) VALUES($1,$2,$3,$4,$5,$6,'reserved',$7,$8) RETURNING {COLUMNS}"))
-        .bind(id).bind(who.tenant_id).bind(who.key_id).bind(a.model).bind(a.idempotency_key).bind(a.request_hash).bind(a.maximum_micros).bind(sqlx::types::Json(a.snapshot)).fetch_one(&mut *tx).await?;
+    let row=sqlx::query_as::<_,Reservation>(&format!("INSERT INTO requests(id,tenant_id,key_id,model_id,idempotency_key,request_hash,status,reserve_micros,price_snapshot,routing_snapshot,dispatch_deadline) VALUES($1,$2,$3,$4,$5,$6,'reserved',$7,$8,$9,now()+make_interval(secs=>$10)) RETURNING {COLUMNS}"))
+        .bind(id).bind(who.tenant_id).bind(who.key_id).bind(a.model).bind(a.idempotency_key).bind(a.request_hash).bind(a.maximum_micros).bind(sqlx::types::Json(a.snapshot)).bind(a.routing).bind(f64::from(a.timeout_seconds)).fetch_one(&mut *tx).await?;
     sqlx::query("INSERT INTO ledger_entries(tenant_id,request_id,kind,amount_micros) VALUES($1,$2,'reserve',$3)").bind(who.tenant_id).bind(id).bind(a.maximum_micros).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok((row, true))
@@ -164,11 +173,27 @@ pub async fn finish(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(Error::NotFound)?;
+    finish_locked(&mut tx, who, &row, actual, result, details).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn finish_locked(
+    tx: &mut Transaction<'_, Postgres>,
+    who: &Identity,
+    row: &Reservation,
+    actual: i64,
+    result: Option<&[u8]>,
+    details: Value,
+) -> Result<()> {
+    if actual < 0 {
+        return Err(Error::Invalid("negative cost"));
+    }
+    let id = row.id;
     if row.status == "succeeded" {
         if row.final_micros != Some(actual) {
             return Err(Error::Conflict);
         }
-        tx.commit().await?;
         return Ok(());
     }
     if row.status != "submitting" && row.status != "submission_unknown" {
@@ -179,11 +204,10 @@ pub async fn finish(
             "actual cost exceeds reservation; reconciliation required",
         ));
     }
-    sqlx::query("UPDATE tenants SET reserved_micros=reserved_micros-$2,spent_micros=spent_micros+$3 WHERE id=$1").bind(who.tenant_id).bind(row.reserve_micros).bind(actual).execute(&mut *tx).await?;
-    sqlx::query("UPDATE virtual_keys SET reserved_micros=reserved_micros-$3,spent_micros=spent_micros+$4 WHERE tenant_id=$1 AND id=$2").bind(who.tenant_id).bind(who.key_id).bind(row.reserve_micros).bind(actual).execute(&mut *tx).await?;
-    sqlx::query("UPDATE requests SET status='succeeded',final_micros=$4,result_ciphertext=$5,error_code=NULL,updated_at=now() WHERE tenant_id=$1 AND key_id=$2 AND id=$3").bind(who.tenant_id).bind(who.key_id).bind(id).bind(actual).bind(result).execute(&mut *tx).await?;
-    sqlx::query("INSERT INTO ledger_entries(tenant_id,request_id,kind,amount_micros,details) VALUES($1,$2,'finalize',$3,$4),($1,$2,'release',$5,'{}')").bind(who.tenant_id).bind(id).bind(actual).bind(details).bind(row.reserve_micros-actual).execute(&mut *tx).await?;
-    tx.commit().await?;
+    sqlx::query("UPDATE tenants SET reserved_micros=reserved_micros-$2,spent_micros=spent_micros+$3 WHERE id=$1").bind(who.tenant_id).bind(row.reserve_micros).bind(actual).execute(&mut **tx).await?;
+    sqlx::query("UPDATE virtual_keys SET reserved_micros=reserved_micros-$3,spent_micros=spent_micros+$4 WHERE tenant_id=$1 AND id=$2").bind(who.tenant_id).bind(who.key_id).bind(row.reserve_micros).bind(actual).execute(&mut **tx).await?;
+    sqlx::query("UPDATE requests SET status='succeeded',final_micros=$4,result_ciphertext=$5,error_code=NULL,updated_at=now() WHERE tenant_id=$1 AND key_id=$2 AND id=$3").bind(who.tenant_id).bind(who.key_id).bind(id).bind(actual).bind(result).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO ledger_entries(tenant_id,request_id,kind,amount_micros,details) VALUES($1,$2,'finalize',$3,$4),($1,$2,'release',$5,'{}')").bind(who.tenant_id).bind(id).bind(actual).bind(details).bind(row.reserve_micros-actual).execute(&mut **tx).await?;
     Ok(())
 }
 

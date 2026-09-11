@@ -17,6 +17,7 @@ cargo run -- migrate
 cargo test --locked
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
+# Inject result-encryption keys before starting the data plane; see docs/m2-text-gateway.md.
 cargo run -- serve
 ```
 
@@ -45,5 +46,11 @@ cargo run -- fx-history --tenant <TENANT_UUID> --limit 20
 - `GET /health/ready`：数据库可连接，且迁移版本和 checksum 与运行二进制一致。
 - `GET /v1/models`：只返回当前虚拟密钥被授权的活跃模型。
 - `GET /v1/exchange-rates`：当前租户汇率版本与人民币主币种。
+- `POST /v1/chat/completions`：非流式文本/工具调用协议。
+- `POST /v1/embeddings`：文本向量，固定向量空间维度。
+- `GET /v1/requests`：当前虚拟密钥的请求日志及人民币金额。
+- `GET /v1/requests/{id}` 与 `/result`：查询逻辑请求/attempt 状态与原结果。
 
 业务接口通过 `Authorization: Bearer <VIRTUAL_KEY>` 鉴权。所有响应包含网关生成的 `x-request-id`；日志不记录鉴权头和请求正文。
+
+收费 POST 还需 `Idempotency-Key`。完整支持字段、明确拒绝能力、恢复方式、费用核对与密钥配置见 [M2 调用契约](docs/m2-text-gateway.md)。此阶段不宣称流式、Responses、护栏审批或任何供应商已完成认证。

@@ -74,6 +74,9 @@ async fn tenant_isolation_key_revocation_and_fx_history(pool: PgPool) {
         context_tokens: 1000,
         max_output_tokens: 100,
         priority: 10,
+        operation: "chat".into(),
+        supports_tools: false,
+        embedding_dimension: None,
     };
     store::add_endpoint(&pool, &endpoint).await.unwrap();
     let snapshot = endpoint.price(&pool).await.unwrap();
@@ -186,6 +189,8 @@ async fn concurrent_budget_idempotency_and_uncertain_submission(pool: PgPool) {
         request_hash: &digest,
         maximum_micros: 700_000,
         snapshot: snapshot.clone(),
+        routing: None,
+        timeout_seconds: 120,
     };
     let (a, b) = tokio::join!(
         accounting::reserve(&pool, make("a")),
@@ -319,6 +324,8 @@ async fn cny_ledger_keeps_original_usd_and_immutable_fx_snapshot(pool: PgPool) {
         request_hash: &digest,
         maximum_micros: 1_000_000,
         snapshot,
+        routing: None,
+        timeout_seconds: 120,
     };
     let (other, _) = fixture(&pool, 10_000_000).await;
     let foreign_version = store::set_fx(&pool, other.tenant_id, rate, now, "manual")
@@ -489,6 +496,8 @@ async fn key_budget_failure_rolls_back_tenant_and_revoked_model_cannot_dispatch(
         request_hash: &digest,
         maximum_micros: maximum,
         snapshot: price.clone(),
+        routing: None,
+        timeout_seconds: 120,
     };
     assert!(matches!(
         accounting::reserve(&pool, make(101)).await,
@@ -595,6 +604,8 @@ async fn production_database_roles_allow_accounting_but_deny_configuration_and_f
             request_hash: &digest,
             maximum_micros: 100,
             snapshot: price,
+            routing: None,
+            timeout_seconds: 120,
         },
     )
     .await

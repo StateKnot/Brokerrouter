@@ -214,6 +214,9 @@ pub struct Endpoint {
     pub context_tokens: i32,
     pub max_output_tokens: i32,
     pub priority: i32,
+    pub operation: String,
+    pub supports_tools: bool,
+    pub embedding_dimension: Option<i32>,
 }
 
 impl Endpoint {
@@ -248,6 +251,18 @@ impl Endpoint {
         }
         crate::money::nonnegative(&self.input_per_million.to_string())?;
         crate::money::nonnegative(&self.output_per_million.to_string())?;
+        if !matches!(self.operation.as_str(), "chat" | "embedding")
+            || (self.operation == "chat" && self.embedding_dimension.is_some())
+            || (self.operation == "embedding"
+                && (self.supports_tools
+                    || !self
+                        .embedding_dimension
+                        .is_some_and(|n| (1..=65536).contains(&n))))
+        {
+            return Err(Error::Invalid(
+                "invalid endpoint operation or embedding dimension",
+            ));
+        }
         Ok(())
     }
     pub async fn price(&self, pool: &PgPool) -> Result<PriceSnapshot> {
@@ -272,8 +287,20 @@ impl Endpoint {
 pub async fn add_endpoint(pool: &PgPool, e: &Endpoint) -> Result<()> {
     e.validate()?;
     let mut tx = pool.begin().await?;
-    sqlx::query("INSERT INTO endpoints(id,tenant_id,model_id,name,upstream_model,base_url,credential_env,allow_private,currency,input_per_million,output_per_million,context_tokens,max_output_tokens,priority) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)")
-        .bind(e.id).bind(e.tenant_id).bind(&e.model_id).bind(&e.name).bind(&e.upstream_model).bind(&e.base_url).bind(&e.credential_env).bind(e.allow_private).bind(&e.currency).bind(e.input_per_million).bind(e.output_per_million).bind(e.context_tokens).bind(e.max_output_tokens).bind(e.priority).execute(&mut *tx).await?;
+    sqlx::query("SELECT id FROM models WHERE tenant_id=$1 AND id=$2 FOR UPDATE")
+        .bind(e.tenant_id)
+        .bind(&e.model_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(Error::NotFound)?;
+    let conflict:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM endpoints WHERE tenant_id=$1 AND model_id=$2 AND (operation<>$3 OR embedding_dimension IS DISTINCT FROM $4))").bind(e.tenant_id).bind(&e.model_id).bind(&e.operation).bind(e.embedding_dimension).fetch_one(&mut *tx).await?;
+    if conflict {
+        return Err(Error::Invalid(
+            "logical model operation and embedding space dimension must be consistent",
+        ));
+    }
+    sqlx::query("INSERT INTO endpoints(id,tenant_id,model_id,name,upstream_model,base_url,credential_env,allow_private,currency,input_per_million,output_per_million,context_tokens,max_output_tokens,priority,operation,supports_tools,embedding_dimension) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)")
+        .bind(e.id).bind(e.tenant_id).bind(&e.model_id).bind(&e.name).bind(&e.upstream_model).bind(&e.base_url).bind(&e.credential_env).bind(e.allow_private).bind(&e.currency).bind(e.input_per_million).bind(e.output_per_million).bind(e.context_tokens).bind(e.max_output_tokens).bind(e.priority).bind(&e.operation).bind(e.supports_tools).bind(e.embedding_dimension).execute(&mut *tx).await?;
     audit(
         &mut tx,
         e.tenant_id,
@@ -292,6 +319,16 @@ pub async fn endpoints(
     model: &str,
     max_output: i32,
 ) -> Result<Vec<Endpoint>> {
-    Ok(sqlx::query_as("SELECT e.id,e.tenant_id,e.model_id,e.name,e.upstream_model,e.base_url,e.credential_env,e.allow_private,e.currency,e.input_per_million,e.output_per_million,e.context_tokens,e.max_output_tokens,e.priority FROM endpoints e JOIN models m ON m.tenant_id=e.tenant_id AND m.id=e.model_id JOIN key_models k ON k.tenant_id=e.tenant_id AND k.model_id=e.model_id WHERE e.tenant_id=$1 AND k.key_id=$2 AND e.model_id=$3 AND e.active AND m.active AND e.max_output_tokens>=$4 ORDER BY e.priority,e.id")
+    Ok(sqlx::query_as("SELECT e.id,e.tenant_id,e.model_id,e.name,e.upstream_model,e.base_url,e.credential_env,e.allow_private,e.currency,e.input_per_million,e.output_per_million,e.context_tokens,e.max_output_tokens,e.priority,e.operation,e.supports_tools,e.embedding_dimension FROM endpoints e JOIN models m ON m.tenant_id=e.tenant_id AND m.id=e.model_id JOIN key_models k ON k.tenant_id=e.tenant_id AND k.model_id=e.model_id WHERE e.tenant_id=$1 AND k.key_id=$2 AND e.model_id=$3 AND e.active AND m.active AND e.max_output_tokens>=$4 ORDER BY e.priority,e.id")
         .bind(identity.tenant_id).bind(identity.key_id).bind(model).bind(max_output).fetch_all(pool).await?)
+}
+
+pub async fn authorize_model(pool: &PgPool, who: &Identity, model: &str) -> Result<()> {
+    let allowed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM virtual_keys k JOIN tenants t ON t.id=k.tenant_id JOIN key_models g ON g.tenant_id=k.tenant_id AND g.key_id=k.id JOIN models m ON m.tenant_id=g.tenant_id AND m.id=g.model_id WHERE k.tenant_id=$1 AND k.id=$2 AND t.active AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>now()) AND g.model_id=$3 AND m.active)")
+        .bind(who.tenant_id).bind(who.key_id).bind(model).fetch_one(pool).await?;
+    if allowed {
+        Ok(())
+    } else {
+        Err(Error::Unauthorized)
+    }
 }
