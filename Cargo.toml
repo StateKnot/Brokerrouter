@@ -1,0 +1,37 @@
+[package]
+name = "brokerrouter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+description = "Governed multi-provider AI gateway with durable CNY accounting"
+
+[dependencies]
+anyhow = "1.0.98"
+axum = "0.8.9"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5.38", features = ["derive", "env"] }
+rand = "0.9.1"
+rust_decimal = { version = "1.37", features = ["serde-with-str"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha2 = "0.10.9"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "rust_decimal", "json", "migrate", "macros"] }
+thiserror = "2.0.12"
+tokio = { version = "1.45.0", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
+url = "2.5"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5.2", features = ["util"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[lints.rust]
+unsafe_code = "forbid"
