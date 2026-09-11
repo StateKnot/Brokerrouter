@@ -191,6 +191,7 @@ async fn concurrent_budget_idempotency_and_uncertain_submission(pool: PgPool) {
         snapshot: snapshot.clone(),
         routing: None,
         timeout_seconds: 120,
+        governance_turn_id: None,
     };
     let (a, b) = tokio::join!(
         accounting::reserve(&pool, make("a")),
@@ -326,6 +327,7 @@ async fn cny_ledger_keeps_original_usd_and_immutable_fx_snapshot(pool: PgPool) {
         snapshot,
         routing: None,
         timeout_seconds: 120,
+        governance_turn_id: None,
     };
     let (other, _) = fixture(&pool, 10_000_000).await;
     let foreign_version = store::set_fx(&pool, other.tenant_id, rate, now, "manual")
@@ -498,6 +500,7 @@ async fn key_budget_failure_rolls_back_tenant_and_revoked_model_cannot_dispatch(
         snapshot: price.clone(),
         routing: None,
         timeout_seconds: 120,
+        governance_turn_id: None,
     };
     assert!(matches!(
         accounting::reserve(&pool, make(101)).await,
@@ -606,6 +609,7 @@ async fn production_database_roles_allow_accounting_but_deny_configuration_and_f
             snapshot: price,
             routing: None,
             timeout_seconds: 120,
+            governance_turn_id: None,
         },
     )
     .await

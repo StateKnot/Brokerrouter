@@ -53,4 +53,6 @@ cargo run -- fx-history --tenant <TENANT_UUID> --limit 20
 
 业务接口通过 `Authorization: Bearer <VIRTUAL_KEY>` 鉴权。所有响应包含网关生成的 `x-request-id`；日志不记录鉴权头和请求正文。
 
-收费 POST 还需 `Idempotency-Key`。完整支持字段、明确拒绝能力、恢复方式、费用核对与密钥配置见 [M2 调用契约](docs/m2-text-gateway.md)。此阶段不宣称流式、Responses、护栏审批或任何供应商已完成认证。
+收费 POST 还需 `Idempotency-Key`。完整支持字段、明确拒绝能力、恢复方式、费用核对与密钥配置见 [M2 调用契约](docs/m2-text-gateway.md)。
+
+M3 已增加确定性护栏、模型输入/输出审批、当前 turn 豁免、独立真人控制面与工具执行恢复契约，见 [M3 治理协议](docs/m3-governance.md)。受管调用必须携带服务端登记的 `X-Brokerrouter-Turn-Id`。`serve-control` 使用独立数据库角色和用户 BFF 公钥，不能与 Agent 凭据混用。真实 BFF/Runtime、供应商与 SDK 认证仍在 [验收待办](docs/acceptance-backlog.md)；不宣称普通 SDK 已能弹窗、语义/多模态护栏服务已接入或整个平台生产认证完成。

@@ -1,3 +1,4 @@
+mod common;
 use axum::{
     Json, Router,
     body::Body,
@@ -708,6 +709,7 @@ async fn restart_maintenance_retains_uncertain_but_releases_never_started(pool: 
                     price: price.clone()
                 }])),
                 timeout_seconds: 1,
+                governance_turn_id: None,
             },
         )
         .await
@@ -797,4 +799,190 @@ async fn runtime_role_can_serve_but_only_reconciler_can_finalize_unknown(pool: P
     assert_eq!(g.request(&other, id).await.unwrap()["status"], "reconciled");
     runtime.close().await;
     reconciler.close().await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn real_http_approval_loop_holds_input_and_output_then_replays_one_paid_result(pool: PgPool) {
+    use brokerrouter::governance_api::{Control, control_router};
+    let upstream = Mock::start(Reply::Chat).await;
+    let (who, key, _) = setup(&pool, "chat", &upstream.url).await;
+    common::provision(&pool, &who, "alice").await;
+    let turn = common::turn(&pool, &who, "alice", 0).await;
+    for (id, stage) in [("input", "pre"), ("output", "post")] {
+        common::guardrail(&pool, who.tenant_id, id, 1, stage, json!({"kind":"always"})).await;
+    }
+    let g = Gateway::new(
+        pool.clone(),
+        common::cipher(),
+        HashMap::from([("FIXTURE_PROVIDER_KEY".into(), "fixture".into())]),
+        8,
+        5,
+        60,
+    )
+    .unwrap();
+    let data_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let data_url = format!("http://{}", data_listener.local_addr().unwrap());
+    let app = api::gateway_router(g.clone());
+    let data_server = tokio::spawn(async move { axum::serve(data_listener, app).await.unwrap() });
+    let control_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let control_url = format!("http://{}", control_listener.local_addr().unwrap());
+    let app = control_router(Control {
+        pool: pool.clone(),
+        verifier: Arc::new(common::verifier()),
+        cipher: Arc::new(common::cipher()),
+    });
+    let control_server =
+        tokio::spawn(async move { axum::serve(control_listener, app).await.unwrap() });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .retry(reqwest::retry::never())
+        .build()
+        .unwrap();
+    let send = || {
+        client
+            .post(format!("{data_url}/v1/chat/completions"))
+            .bearer_auth(&key)
+            .header("idempotency-key", "governed")
+            .header("x-brokerrouter-turn-id", turn.to_string())
+            .json(&chat())
+            .send()
+    };
+    let first = send().await.unwrap();
+    assert_eq!(first.status(), 409);
+    assert_eq!(first.headers()["x-should-retry"], "false");
+    let first: Value = first.json().await.unwrap();
+    assert!(!first.to_string().contains("private answer"));
+    let pre: Uuid = serde_json::from_value(first["error"]["approval"]["id"].clone()).unwrap();
+    assert_eq!(upstream.count(), 0);
+    let requests: i64 = sqlx::query_scalar("SELECT count(*) FROM requests")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(requests, 0);
+    for (approval, guardrail) in [(pre, "input")] {
+        let path = format!("/v1/approvals/{approval}/resolve");
+        let body = common::approve(&[guardrail]);
+        let token = common::sign(&common::claims(who.tenant_id, "alice", &path, &body));
+        let denied = client
+            .post(format!("{control_url}{path}"))
+            .bearer_auth(&key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), 401);
+        let approved = client
+            .post(format!("{control_url}{path}"))
+            .bearer_auth(token)
+            .body(serde_json::to_vec(&body).unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(approved.status(), 200);
+    }
+    let second = send().await.unwrap();
+    assert_eq!(second.status(), 409);
+    let request_id = second.headers()["x-brokerrouter-request-id"]
+        .to_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let second: Value = second.json().await.unwrap();
+    assert!(!second.to_string().contains("private answer"));
+    assert_eq!(upstream.count(), 1);
+    assert_eq!(
+        g.request(&who, request_id).await.unwrap()["cost_cny"],
+        "0.000007"
+    );
+    assert!(matches!(
+        g.result(&who, request_id).await,
+        Err(Error::ApprovalRequired(_))
+    ));
+    let post: Uuid = serde_json::from_value(second["error"]["approval"]["id"].clone()).unwrap();
+    let path = format!("/v1/approvals/{post}/resolve");
+    let body = common::approve(&["output"]);
+    let approved = client
+        .post(format!("{control_url}{path}"))
+        .bearer_auth(common::sign(&common::claims(
+            who.tenant_id,
+            "alice",
+            &path,
+            &body,
+        )))
+        .body(serde_json::to_vec(&body).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approved.status(), 200);
+    let result = send().await.unwrap();
+    assert_eq!(result.status(), 200);
+    assert_eq!(
+        result.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
+        "private answer"
+    );
+    assert_eq!(
+        g.result(&who, request_id).await.unwrap()["id"],
+        "chatcmpl-fixture"
+    );
+    assert_eq!(upstream.count(), 1);
+    let finalized: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ledger_entries WHERE kind='finalize'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(finalized, 1);
+    let omitted = client
+        .post(format!("{data_url}/v1/chat/completions"))
+        .bearer_auth(&key)
+        .header("idempotency-key", "omit")
+        .json(&chat())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(omitted.status(), 400);
+    data_server.abort();
+    control_server.abort();
+    g.drain().await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn output_rejection_destroys_result_without_reversing_real_charge(pool: PgPool) {
+    let upstream = Mock::start(Reply::Chat).await;
+    let (who, _, _) = setup(&pool, "chat", &upstream.url).await;
+    common::provision(&pool, &who, "alice").await;
+    let turn = common::turn(&pool, &who, "alice", 0).await;
+    common::guardrail(
+        &pool,
+        who.tenant_id,
+        "output",
+        1,
+        "post",
+        json!({"kind":"always"}),
+    )
+    .await;
+    let g = gateway(pool.clone(), 5);
+    let (id, result) = g
+        .execute_in_turn(&who, "reject-output", chat(), "chat", Some(turn))
+        .await
+        .unwrap();
+    let approval = match result {
+        Err(Error::ApprovalRequired(a)) => serde_json::from_value(a["id"].clone()).unwrap(),
+        _ => panic!("protected output must wait"),
+    };
+    common::decide(&pool, "alice", approval, json!({"decision":"reject"}))
+        .await
+        .unwrap();
+    assert!(matches!(
+        g.result(&who, id).await,
+        Err(Error::ResultUnavailable)
+    ));
+    assert_eq!(g.request(&who, id).await.unwrap()["cost_cny"], "0.000007");
+    assert_eq!(upstream.count(), 1);
+    let stored: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT result_ciphertext FROM requests WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(stored.is_none());
 }

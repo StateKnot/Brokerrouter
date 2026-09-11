@@ -21,22 +21,38 @@ pub fn router(pool: PgPool) -> Router {
 
 pub fn gateway_router(gateway: Gateway) -> Router {
     common(
-        base_routes(gateway.pool.clone()).merge(
-            Router::new()
-                .route("/v1/chat/completions", post(chat))
-                .route("/v1/embeddings", post(embedding))
-                .route("/v1/requests", get(request_logs))
-                .route("/v1/requests/{id}", get(request_details))
-                .route("/v1/requests/{id}/result", get(request_result))
-                .with_state(gateway),
-        ),
+        base_routes(gateway.pool.clone())
+            .merge(crate::governance_api::runtime_routes(gateway.clone()))
+            .merge(
+                Router::new()
+                    .route("/v1/chat/completions", post(chat))
+                    .route("/v1/embeddings", post(embedding))
+                    .route("/v1/requests", get(request_logs))
+                    .route("/v1/requests/{id}", get(request_details))
+                    .route("/v1/requests/{id}/result", get(request_result))
+                    .with_state(gateway),
+            ),
     )
 }
 
 fn common(router: Router) -> Router {
     router
         .layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024))
+        .layer(middleware::from_fn_with_state(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+            http_capacity,
+        ))
         .layer(middleware::from_fn(request_id))
+}
+pub(crate) async fn http_capacity(
+    State(capacity): State<std::sync::Arc<tokio::sync::Semaphore>>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let Ok(_permit) = capacity.try_acquire() else {
+        return Error::Busy.into_response();
+    };
+    next.run(request).await
 }
 
 fn base_routes(pool: PgPool) -> Router {
@@ -72,11 +88,22 @@ async fn execute(g: Gateway, headers: HeaderMap, body: Value, operation: &'stati
         return Error::Invalid("Idempotency-Key header required for billable requests")
             .into_response();
     };
+    let turn = match headers.get("x-brokerrouter-turn-id") {
+        Some(value) => match value.to_str().ok().and_then(|s| s.parse::<Uuid>().ok()) {
+            Some(id) => Some(id),
+            None => return Error::Invalid("invalid trusted turn ID").into_response(),
+        },
+        None => None,
+    };
     // Detached from client disconnect; bounded by Gateway capacity and its persisted deadline.
     let worker = g.clone();
     let completed = g
         .tasks
-        .spawn(async move { worker.execute(&who, &key, body, operation).await })
+        .spawn(async move {
+            worker
+                .execute_in_turn(&who, &key, body, operation, turn)
+                .await
+        })
         .await;
     match completed {
         Ok(Ok((id, result))) => {
@@ -129,7 +156,7 @@ async fn request_result(
     Ok(Json(g.result(&who, id).await?))
 }
 
-async fn request_id(mut request: Request<axum::body::Body>, next: Next) -> Response {
+pub(crate) async fn request_id(mut request: Request<axum::body::Body>, next: Next) -> Response {
     let id = Uuid::new_v4().to_string();
     request
         .headers_mut()

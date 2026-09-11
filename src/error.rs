@@ -35,6 +35,18 @@ pub enum Error {
     ResultUnavailable,
     #[error("gateway concurrency capacity is full")]
     Busy,
+    #[error("a trusted current-turn context is required")]
+    GovernanceContext,
+    #[error("human approval is required before continuing")]
+    ApprovalRequired(serde_json::Value),
+    #[error("turn is closed or expired")]
+    TurnClosed,
+    #[error("action was rejected or replaced by user feedback")]
+    ActionRejected,
+    #[error("policy changed; recheck the original operation before approval")]
+    PolicyChanged,
+    #[error("valid request-bound human attestation required")]
+    HumanUnauthorized,
     #[error("internal persistence failure")]
     Database(#[from] sqlx::Error),
 }
@@ -56,17 +68,24 @@ impl IntoResponse for Error {
             Self::Configuration => (StatusCode::SERVICE_UNAVAILABLE, "configuration_error"),
             Self::ResultUnavailable => (StatusCode::GONE, "result_unavailable"),
             Self::Busy => (StatusCode::SERVICE_UNAVAILABLE, "gateway_busy"),
+            Self::GovernanceContext => (StatusCode::BAD_REQUEST, "governance_context_required"),
+            Self::ApprovalRequired(_) => (StatusCode::CONFLICT, "approval_required"),
+            Self::TurnClosed => (StatusCode::GONE, "turn_closed"),
+            Self::ActionRejected => (StatusCode::CONFLICT, "action_rejected"),
+            Self::PolicyChanged => (StatusCode::CONFLICT, "policy_changed"),
+            Self::HumanUnauthorized => (StatusCode::UNAUTHORIZED, "invalid_human_attestation"),
             Self::Database(_) => (StatusCode::SERVICE_UNAVAILABLE, "persistence_unavailable"),
         };
         // Database errors can include sensitive query data. Log only the category.
         if status.is_server_error() {
             tracing::error!(error_code = code, "request failed");
         }
-        let mut response = (
-            status,
-            Json(json!({"error":{"code":code,"message":self.to_string(),"type":"gateway_error"}})),
-        )
-            .into_response();
+        let mut body =
+            json!({"error":{"code":code,"message":self.to_string(),"type":"gateway_error"}});
+        if let Self::ApprovalRequired(approval) = &self {
+            body["error"]["approval"] = approval.clone();
+        }
+        let mut response = (status, Json(body)).into_response();
         response
             .headers_mut()
             .insert("x-should-retry", "false".parse().expect("static header"));

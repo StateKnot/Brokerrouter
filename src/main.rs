@@ -16,6 +16,42 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Migrate,
+    ServeControl {
+        #[arg(long, default_value = "127.0.0.1:8081")]
+        bind: SocketAddr,
+    },
+    GovernanceUserAdd {
+        #[arg(long)]
+        tenant: Uuid,
+        #[arg(long)]
+        issuer: String,
+        #[arg(long)]
+        subject: String,
+    },
+    RuntimeBind {
+        #[arg(long)]
+        tenant: Uuid,
+        #[arg(long)]
+        key: Uuid,
+        #[arg(long)]
+        user: Uuid,
+        #[arg(long)]
+        runtime: String,
+        #[arg(long)]
+        agent: String,
+    },
+    GuardrailPublish {
+        #[arg(long)]
+        tenant: Uuid,
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+    PolicyPut {
+        #[arg(long)]
+        tenant: Uuid,
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
     RequestReconcile {
         #[arg(long)]
         tenant: Uuid,
@@ -139,6 +175,67 @@ async fn main() -> anyhow::Result<()> {
         anyhow::anyhow!("database connection failed; verify DATABASE_URL and network")
     })?;
     match cli.command {
+        Command::ServeControl { bind } => {
+            brokerrouter::check_schema(&pool).await?;
+            let control = brokerrouter::governance_api::Control {
+                pool: pool.clone(),
+                verifier: std::sync::Arc::new(brokerrouter::human::Verifier::from_env()?),
+                cipher: std::sync::Arc::new(brokerrouter::cipher::ResultCipher::from_env()?),
+            };
+            let listener = tokio::net::TcpListener::bind(bind).await?;
+            tracing::info!(address=%bind,"human governance control listening; keep separate from Agent execution environment");
+            let maintenance_pool = pool.clone();
+            let maintenance = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    if brokerrouter::human::maintain(&maintenance_pool)
+                        .await
+                        .is_err()
+                    {
+                        tracing::error!("human governance maintenance failed");
+                    }
+                }
+            });
+            axum::serve(
+                listener,
+                brokerrouter::governance_api::control_router(control),
+            )
+            .with_graceful_shutdown(shutdown())
+            .await?;
+            maintenance.abort();
+        }
+        Command::GovernanceUserAdd {
+            tenant,
+            issuer,
+            subject,
+        } => println!(
+            "{}",
+            brokerrouter::human::add_user(&pool, tenant, &issuer, &subject).await?
+        ),
+        Command::RuntimeBind {
+            tenant,
+            key,
+            user,
+            runtime,
+            agent,
+        } => brokerrouter::human::bind_runtime(&pool, tenant, key, user, &runtime, &agent).await?,
+        Command::GuardrailPublish { tenant, file } => {
+            brokerrouter::human::publish_guardrail(
+                &pool,
+                tenant,
+                serde_json::from_str(&std::fs::read_to_string(file)?)?,
+            )
+            .await?
+        }
+        Command::PolicyPut { tenant, file } => {
+            brokerrouter::human::put_policy(
+                &pool,
+                tenant,
+                serde_json::from_str(&std::fs::read_to_string(file)?)?,
+            )
+            .await?
+        }
         Command::RequestReconcile {
             tenant,
             id,
@@ -174,6 +271,12 @@ async fn main() -> anyhow::Result<()> {
                         .is_err()
                     {
                         tracing::error!("request maintenance failed");
+                    }
+                    if brokerrouter::governance::maintain(&maintenance_pool)
+                        .await
+                        .is_err()
+                    {
+                        tracing::error!("governance maintenance failed");
                     }
                 }
             });

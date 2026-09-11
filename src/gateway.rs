@@ -4,6 +4,7 @@ use crate::{
     cipher::ResultCipher,
     egress,
     error::{Error, Result},
+    governance,
     money::{self, PriceSnapshot},
     protocol::{self, ValidatedRequest},
     store::{self, Endpoint, Identity},
@@ -54,7 +55,7 @@ pub struct Route {
 #[derive(Clone)]
 pub struct Gateway {
     pub pool: PgPool,
-    cipher: Arc<ResultCipher>,
+    pub(crate) cipher: Arc<ResultCipher>,
     credentials: Arc<HashMap<String, String>>,
     capacity: Arc<Semaphore>,
     timeout_seconds: i32,
@@ -123,6 +124,17 @@ impl Gateway {
         body: Value,
         operation: &'static str,
     ) -> Result<(Uuid, Result<Value>)> {
+        self.execute_in_turn(who, idempotency, body, operation, None)
+            .await
+    }
+    pub async fn execute_in_turn(
+        &self,
+        who: &Identity,
+        idempotency: &str,
+        body: Value,
+        operation: &'static str,
+        turn_id: Option<Uuid>,
+    ) -> Result<(Uuid, Result<Value>)> {
         let _permit = self.capacity.try_acquire().map_err(|_| Error::Busy)?;
         if idempotency.is_empty()
             || idempotency.len() > 200
@@ -134,8 +146,12 @@ impl Gateway {
         }
         let request = protocol::validate(body, operation)?;
         store::authorize_model(&self.pool, who, &request.model).await?;
-        let bytes = serde_json::to_vec(&json!({"operation":operation,"request":request.body}))
-            .map_err(|_| Error::Invalid("invalid JSON"))?;
+        governance::context(&self.pool, who, turn_id, &request.model).await?;
+        let mut envelope = json!({"operation":operation,"request":request.body});
+        if let Some(id) = turn_id {
+            envelope["turn_id"] = json!(id);
+        }
+        let bytes = serde_json::to_vec(&envelope).map_err(|_| Error::Invalid("invalid JSON"))?;
         let digest = store::hash(&bytes);
         let existing = sqlx::query_as::<_, Reservation>(&format!(
             "SELECT {} FROM requests WHERE tenant_id=$1 AND key_id=$2 AND idempotency_key=$3",
@@ -146,6 +162,26 @@ impl Gateway {
         .bind(idempotency)
         .fetch_optional(&self.pool)
         .await?;
+        if existing.as_ref().is_none_or(|r| r.status == "reserved")
+            && let Some(turn_id) = turn_id
+        {
+            governance::require_ready(
+                governance::check(
+                    &self.pool,
+                    &self.cipher,
+                    who,
+                    governance::Check {
+                        turn_id,
+                        operation_key: idempotency.into(),
+                        stage: "pre".into(),
+                        model_id: Some(request.model.clone()),
+                        tool_name: None,
+                        payload: request.body.clone(),
+                    },
+                )
+                .await?,
+            )?;
+        }
         let row = if let Some(row) = existing {
             if row.request_hash != digest {
                 return Err(Error::Conflict);
@@ -199,6 +235,7 @@ impl Gateway {
                     snapshot: bound.ok_or(Error::NoEndpoint)?,
                     routing: Some(serde_json::to_value(routes).map_err(|_| Error::Configuration)?),
                     timeout_seconds: self.timeout_seconds,
+                    governance_turn_id: turn_id,
                 },
             )
             .await?
@@ -299,6 +336,7 @@ impl Gateway {
             // DNS may have taken seconds; check live hard permissions again at the send boundary.
             let authority=async {
                 store::authorize_model(&self.pool,who,&row.model_id).await?;
+                governance::context(&self.pool,who,row.governance_turn_id,&row.model_id).await?;
                 let active:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM endpoints WHERE tenant_id=$1 AND id=$2 AND active)").bind(who.tenant_id).bind(route.endpoint.id).fetch_one(&self.pool).await?;
                 if active {Ok(())}else{Err(Error::Unauthorized)}
             }.await;
@@ -415,6 +453,7 @@ impl Gateway {
     pub async fn result(&self, who: &Identity, id: Uuid) -> Result<Value> {
         let row = accounting::get(&self.pool, who, id).await?;
         store::authorize_model(&self.pool, who, &row.model_id).await?;
+        governance::context(&self.pool, who, row.governance_turn_id, &row.model_id).await?;
         if row.status == "reconciled" {
             return Err(Error::ResultUnavailable);
         }
@@ -437,7 +476,26 @@ impl Gateway {
                 .as_deref()
                 .ok_or(Error::ResultUnavailable)?,
         )?;
-        serde_json::from_slice(&bytes).map_err(|_| Error::ResultUnavailable)
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| Error::ResultUnavailable)?;
+        if let Some(turn_id) = row.governance_turn_id {
+            governance::require_ready(
+                governance::check(
+                    &self.pool,
+                    &self.cipher,
+                    who,
+                    governance::Check {
+                        turn_id,
+                        operation_key: id.to_string(),
+                        stage: "post".into(),
+                        model_id: Some(row.model_id),
+                        tool_name: None,
+                        payload: value.clone(),
+                    },
+                )
+                .await?,
+            )?;
+        }
+        Ok(value)
     }
     pub async fn request(&self, who: &Identity, id: Uuid) -> Result<Value> {
         let row = accounting::get(&self.pool, who, id).await?;

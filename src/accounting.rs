@@ -26,6 +26,7 @@ pub struct Reservation {
     pub routing_snapshot: Option<Value>,
     pub dispatch_deadline: Option<chrono::DateTime<chrono::Utc>>,
     pub result_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub governance_turn_id: Option<Uuid>,
 }
 
 pub struct Admission<'a> {
@@ -37,9 +38,10 @@ pub struct Admission<'a> {
     pub snapshot: PriceSnapshot,
     pub routing: Option<Value>,
     pub timeout_seconds: i32,
+    pub governance_turn_id: Option<Uuid>,
 }
 
-pub(crate) const COLUMNS: &str = "id,tenant_id,key_id,model_id,status,reserve_micros,final_micros,price_snapshot,request_hash,result_ciphertext,error_code,routing_snapshot,dispatch_deadline,result_expires_at";
+pub(crate) const COLUMNS: &str = "id,tenant_id,key_id,model_id,status,reserve_micros,final_micros,price_snapshot,request_hash,result_ciphertext,error_code,routing_snapshot,dispatch_deadline,result_expires_at,governance_turn_id";
 
 pub(crate) async fn lock_accounts(
     tx: &mut Transaction<'_, Postgres>,
@@ -84,6 +86,9 @@ pub async fn reserve(pool: &PgPool, a: Admission<'_>) -> Result<(Reservation, bo
     if !allowed {
         return Err(Error::Unauthorized);
     }
+    if let Some(turn) = a.governance_turn_id {
+        crate::governance::turn_locked(&mut tx, who, turn, true).await?;
+    }
     if let Some(existing) = sqlx::query_as::<_, Reservation>(&format!(
         "SELECT {COLUMNS} FROM requests WHERE tenant_id=$1 AND key_id=$2 AND idempotency_key=$3"
     ))
@@ -114,8 +119,8 @@ pub async fn reserve(pool: &PgPool, a: Admission<'_>) -> Result<(Reservation, bo
         return Err(Error::Budget);
     }
     let id = Uuid::new_v4();
-    let row=sqlx::query_as::<_,Reservation>(&format!("INSERT INTO requests(id,tenant_id,key_id,model_id,idempotency_key,request_hash,status,reserve_micros,price_snapshot,routing_snapshot,dispatch_deadline) VALUES($1,$2,$3,$4,$5,$6,'reserved',$7,$8,$9,now()+make_interval(secs=>$10)) RETURNING {COLUMNS}"))
-        .bind(id).bind(who.tenant_id).bind(who.key_id).bind(a.model).bind(a.idempotency_key).bind(a.request_hash).bind(a.maximum_micros).bind(sqlx::types::Json(a.snapshot)).bind(a.routing).bind(f64::from(a.timeout_seconds)).fetch_one(&mut *tx).await?;
+    let row=sqlx::query_as::<_,Reservation>(&format!("INSERT INTO requests(id,tenant_id,key_id,model_id,idempotency_key,request_hash,status,reserve_micros,price_snapshot,routing_snapshot,dispatch_deadline,governance_turn_id) VALUES($1,$2,$3,$4,$5,$6,'reserved',$7,$8,$9,now()+make_interval(secs=>$10),$11) RETURNING {COLUMNS}"))
+        .bind(id).bind(who.tenant_id).bind(who.key_id).bind(a.model).bind(a.idempotency_key).bind(a.request_hash).bind(a.maximum_micros).bind(sqlx::types::Json(a.snapshot)).bind(a.routing).bind(f64::from(a.timeout_seconds)).bind(a.governance_turn_id).fetch_one(&mut *tx).await?;
     sqlx::query("INSERT INTO ledger_entries(tenant_id,request_id,kind,amount_micros) VALUES($1,$2,'reserve',$3)").bind(who.tenant_id).bind(id).bind(a.maximum_micros).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok((row, true))
