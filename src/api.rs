@@ -30,6 +30,7 @@ pub fn gateway_router(gateway: Gateway) -> Router {
                     .route("/v1/requests", get(request_logs))
                     .route("/v1/requests/{id}", get(request_details))
                     .route("/v1/requests/{id}/result", get(request_result))
+                    .route("/v1/requests/{id}/check-result", post(check_result))
                     .with_state(gateway),
             ),
     )
@@ -154,6 +155,19 @@ async fn request_result(
 ) -> Result<Json<Value>> {
     let who = identity(&g.pool, &headers).await?;
     Ok(Json(g.result(&who, id).await?))
+}
+async fn check_result(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>> {
+    let who = identity(&g.pool, &headers).await?;
+    // Explicit POST authorizes a newly required, potentially billable check.
+    let worker = g.clone();
+    let task = g
+        .tasks
+        .spawn(async move { worker.check_result(&who, id).await });
+    Ok(Json(task.await.map_err(|_| Error::Configuration)??))
 }
 
 pub(crate) async fn request_id(mut request: Request<axum::body::Body>, next: Next) -> Response {

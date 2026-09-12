@@ -29,6 +29,9 @@ enum Reply {
     Http(u16),
     Slow,
     Tool,
+    Judge(&'static str),
+    JudgeSlow,
+    SmartJudge,
 }
 #[derive(Clone)]
 struct MockState {
@@ -77,7 +80,10 @@ async fn mock(
         Reply::Embedding=>Json(json!({"object":"list","model":"upstream","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2,0.3]}],"usage":{"prompt_tokens":3,"total_tokens":3}})).into_response(),
         reply=>{
             if matches!(reply,Reply::Slow){tokio::time::sleep(Duration::from_millis(1300)).await;}
+            if matches!(reply,Reply::JudgeSlow){tokio::time::sleep(Duration::from_millis(1300)).await;}
             let mut value=json!({"id":"chatcmpl-fixture","object":"chat.completion","created":1,"model":"upstream","choices":[{"index":0,"message":{"role":"assistant","content":"private answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}});
+            if let Reply::Judge(content)=reply {value["choices"][0]["message"]["content"]=content.into();}
+            if matches!(reply,Reply::JudgeSlow) || (matches!(reply,Reply::SmartJudge) && body["messages"][0]["content"].as_str().is_some_and(|s|s.starts_with("You are a security classifier"))) {value["choices"][0]["message"]["content"]="{\"decision\":\"pass\"}".into();}
             if matches!(reply,Reply::MissingUsage){value.as_object_mut().unwrap().remove("usage");}
             if matches!(reply,Reply::Tool){value["choices"][0]["message"]=json!({"role":"assistant","content":null,"tool_calls":[{"id":"call_fixture","type":"function","function":{"name":"lookup","arguments":"{}"}}]});value["choices"][0]["finish_reason"]="tool_calls".into();}
             Json(value).into_response()
@@ -174,6 +180,651 @@ async fn json_body(response: Response) -> Value {
             .to_bytes(),
     )
     .unwrap()
+}
+
+fn semantic_rule() -> Value {
+    json!({"kind":"model_judge","model":"logical/model","instructions":"Flag secrets or destructive actions.","input_format":"text_json","max_input_bytes":65536,"max_output_tokens":32,"maximum_cny":"0.1"})
+}
+fn semantic_action(turn: Uuid, key: &str) -> brokerrouter::governance::Check {
+    brokerrouter::governance::Check {
+        turn_id: turn,
+        operation_key: key.into(),
+        stage: "tool_input".into(),
+        model_id: None,
+        tool_name: Some("shell".into()),
+        payload: json!({"command":"sensitive fixture action"}),
+    }
+}
+async fn semantic_setup(
+    pool: &PgPool,
+    reply: Reply,
+    timeout: i32,
+    stage: &str,
+) -> (Mock, store::Identity, Gateway, Uuid) {
+    let mock = Mock::start(reply).await;
+    let (who, _, _) = setup(pool, "chat", &mock.url).await;
+    common::provision(pool, &who, "judge-user").await;
+    common::guardrail(pool, who.tenant_id, "semantic", 1, stage, semantic_rule()).await;
+    let turn = common::turn(pool, &who, "judge-user", 0).await;
+    let g = Gateway::new(
+        pool.clone(),
+        common::cipher(),
+        HashMap::from([("FIXTURE_PROVIDER_KEY".into(), "fake-provider-secret".into())]),
+        1,
+        timeout,
+        60,
+    )
+    .unwrap();
+    (mock, who, g, turn)
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn semantic_risk_has_cny_cost_and_only_human_turn_exemption(pool: PgPool) {
+    let (mock, who, g, turn) = semantic_setup(
+        &pool,
+        Reply::Judge("{\"decision\":\"risk\"}"),
+        3,
+        "tool_input",
+    )
+    .await;
+    // USD source cost is still settled in CNY using an immutable rate version.
+    sqlx::query("UPDATE endpoints SET active=false")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (_, _, mut endpoint) = setup(&pool, "chat", &mock.url).await;
+    endpoint.id = Uuid::new_v4();
+    endpoint.tenant_id = who.tenant_id;
+    endpoint.currency = "USD".into();
+    store::add_endpoint(&pool, &endpoint).await.unwrap();
+    let fx = store::set_fx(
+        &pool,
+        who.tenant_id,
+        money::nonnegative("7.2").unwrap(),
+        chrono::Utc::now(),
+        "fixture",
+    )
+    .await
+    .unwrap();
+    let a = g.check(&who, semantic_action(turn, "first")).await.unwrap();
+    assert_eq!(a["state"], "waiting_approval");
+    assert_eq!(a["approval"]["guardrails"][0]["reason_code"], "judge_risk");
+    let (request,cost,snapshot):(Uuid,i64,Value)=sqlx::query_as("SELECT id,final_micros,price_snapshot FROM requests WHERE tenant_id=$1 AND guardrail_evaluation_id IS NOT NULL").bind(who.tenant_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(cost, 51);
+    assert_eq!(snapshot["fx_version"], fx);
+    assert!(matches!(
+        g.result(&who, request).await,
+        Err(Error::NotFound)
+    ));
+    assert_eq!(
+        g.request(&who, request).await.unwrap()["purpose"],
+        "guardrail"
+    );
+    assert!(
+        !g.logs(&who, None, 100)
+            .await
+            .unwrap()
+            .to_string()
+            .contains("sensitive fixture action")
+    );
+    assert_eq!(
+        g.check(&who, semantic_action(turn, "first")).await.unwrap()["approval"]["id"],
+        a["approval"]["id"]
+    );
+    assert_eq!(mock.count(), 1);
+    common::decide(
+        &pool,
+        "judge-user",
+        common::approval_id(&a),
+        common::approve(&["semantic"]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        g.check(&who, semantic_action(turn, "second"))
+            .await
+            .unwrap()["state"],
+        "ready"
+    );
+    assert_eq!(mock.count(), 1);
+    let next = common::turn(&pool, &who, "judge-user", 1).await;
+    assert_eq!(
+        g.check(&who, semantic_action(next, "third")).await.unwrap()["state"],
+        "waiting_approval"
+    );
+    assert_eq!(mock.count(), 2);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn semantic_model_pre_and_post_share_ledger_without_recursion(pool: PgPool) {
+    let (mock, who, g, turn) = semantic_setup(&pool, Reply::SmartJudge, 3, "pre").await;
+    common::guardrail(
+        &pool,
+        who.tenant_id,
+        "semantic-output",
+        1,
+        "post",
+        semantic_rule(),
+    )
+    .await;
+    let (id, value) = g
+        .execute_in_turn(&who, "business", chat(), "chat", Some(turn))
+        .await
+        .unwrap();
+    assert_eq!(
+        value.unwrap()["choices"][0]["message"]["content"],
+        "private answer"
+    );
+    assert_eq!(mock.count(), 3); // input judge + business + output judge, even at concurrency=1
+    g.result(&who, id).await.unwrap();
+    assert_eq!(mock.count(), 3);
+    let facts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*),sum(final_micros)::bigint,count(guardrail_evaluation_id) FROM requests",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(facts, (3, 21, 2));
+    assert!(
+        g.execute_in_turn(&who, "_br_guardrail:forged", chat(), "chat", Some(turn))
+            .await
+            .is_err()
+    );
+    let mut forged = chat();
+    forged["skip_guardrails"] = true.into();
+    assert!(
+        g.execute_in_turn(&who, "forged", forged, "chat", Some(turn))
+            .await
+            .is_err()
+    );
+    assert_eq!(mock.count(), 3);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn semantic_invalid_decision_is_paid_but_requires_user_review(pool: PgPool) {
+    let (mock, who, g, turn) = semantic_setup(
+        &pool,
+        Reply::Judge("{\"decision\":\"pass\",\"leak\":\"secret\"}"),
+        3,
+        "tool_input",
+    )
+    .await;
+    let a = g
+        .check(&who, semantic_action(turn, "invalid"))
+        .await
+        .unwrap();
+    assert_eq!(a["state"], "waiting_approval");
+    assert_eq!(
+        a["approval"]["guardrails"][0]["reason_code"],
+        "judge_invalid_decision"
+    );
+    assert!(!a.to_string().contains("secret"));
+    let spent: i64 = sqlx::query_scalar("SELECT spent_micros FROM tenants WHERE id=$1")
+        .bind(who.tenant_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(spent, 7);
+    assert_eq!(mock.count(), 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn semantic_timeout_keeps_reservation_and_never_resubmits(pool: PgPool) {
+    let (mock, who, g, turn) = semantic_setup(&pool, Reply::JudgeSlow, 1, "tool_input").await;
+    let a = g
+        .check(&who, semantic_action(turn, "timeout"))
+        .await
+        .unwrap();
+    assert_eq!(a["state"], "waiting_approval");
+    assert_eq!(
+        a["approval"]["guardrails"][0]["reason_code"],
+        "judge_outcome_unknown"
+    );
+    let (status,reserved,spent):(String,i64,i64)=sqlx::query_as("SELECT r.status,t.reserved_micros,t.spent_micros FROM requests r JOIN tenants t ON t.id=r.tenant_id").fetch_one(&pool).await.unwrap();
+    assert_eq!(status, "submission_unknown");
+    assert!(reserved > 0);
+    assert_eq!(spent, 0);
+    attempts::maintain(&pool).await.unwrap();
+    brokerrouter::governance::maintain(&pool).await.unwrap();
+    assert_eq!(
+        g.check(&who, semantic_action(turn, "timeout"))
+            .await
+            .unwrap()["approval"]["id"],
+        a["approval"]["id"]
+    );
+    assert_eq!(mock.count(), 1);
+    common::decide(
+        &pool,
+        "judge-user",
+        common::approval_id(&a),
+        common::approve(&["semantic"]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        g.check(&who, semantic_action(turn, "timeout"))
+            .await
+            .unwrap()["state"],
+        "ready"
+    );
+    let after: i64 = sqlx::query_scalar("SELECT reserved_micros FROM tenants WHERE id=$1")
+        .bind(who.tenant_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(after, reserved); // approval is not a refund or settlement
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn semantic_concurrent_checks_have_one_paid_dispatch(pool: PgPool) {
+    let (mock, who, g, turn) = semantic_setup(&pool, Reply::JudgeSlow, 4, "tool_input").await;
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let g = g.clone();
+        let who = who.clone();
+        tasks.push(tokio::spawn(async move {
+            g.check(&who, semantic_action(turn, "concurrent")).await
+        }));
+    }
+    for task in tasks {
+        let v = task.await.unwrap().unwrap();
+        assert!(matches!(v["state"].as_str(), Some("ready" | "checking")));
+    }
+    assert_eq!(
+        g.check(&who, semantic_action(turn, "concurrent"))
+            .await
+            .unwrap()["state"],
+        "ready"
+    );
+    assert_eq!(mock.count(), 1);
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM guardrail_evaluations),(SELECT count(*) FROM requests)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, (1, 1));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn semantic_admission_failures_are_reviewable_without_cost(pool: PgPool) {
+    let (mock, who, g, turn) = semantic_setup(
+        &pool,
+        Reply::Judge("{\"decision\":\"pass\"}"),
+        3,
+        "tool_input",
+    )
+    .await;
+    for (version, field, value) in [
+        (2, "maximum_cny", json!("0")),
+        (3, "max_input_bytes", json!(1)),
+        (4, "model", json!("missing/model")),
+    ] {
+        let mut rule = semantic_rule();
+        rule[field] = value;
+        common::guardrail(
+            &pool,
+            who.tenant_id,
+            "semantic",
+            version,
+            "tool_input",
+            rule,
+        )
+        .await;
+        let a = g
+            .check(&who, semantic_action(turn, &format!("limited-{version}")))
+            .await
+            .unwrap();
+        assert_eq!(a["state"], "waiting_approval");
+        assert_eq!(
+            a["approval"]["guardrails"][0]["evaluation_outcome"],
+            "failed"
+        );
+    }
+    common::guardrail(
+        &pool,
+        who.tenant_id,
+        "semantic",
+        5,
+        "tool_input",
+        semantic_rule(),
+    )
+    .await;
+    sqlx::query("UPDATE virtual_keys SET budget_micros=0 WHERE id=$1")
+        .bind(who.key_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let a = g
+        .check(&who, semantic_action(turn, "budget"))
+        .await
+        .unwrap();
+    assert_eq!(
+        a["approval"]["guardrails"][0]["reason_code"],
+        "judge_budget_exceeded"
+    );
+    assert_eq!(mock.count(), 0);
+    let requests: i64 = sqlx::query_scalar("SELECT count(*) FROM requests")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(requests, 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn semantic_crashed_owner_expires_with_event_without_new_dispatch(pool: PgPool) {
+    let (mock, who, g, turn) = semantic_setup(&pool, Reply::SmartJudge, 3, "tool_input").await;
+    let pending = brokerrouter::governance::check(
+        &pool,
+        &common::cipher(),
+        &who,
+        semantic_action(turn, "crashed"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(pending["state"], "checking");
+    let op: Uuid = serde_json::from_value(pending["id"].clone()).unwrap();
+    let row = brokerrouter::governance::operation(&pool, &common::cipher(), &who, op)
+        .await
+        .unwrap();
+    assert_eq!(row["state"], "checking");
+    let hash: String = sqlx::query_scalar(
+        "SELECT encode(payload_hash,'hex') FROM governance_operations WHERE id=$1",
+    )
+    .bind(op)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        brokerrouter::governance::claim(
+            &pool,
+            &common::cipher(),
+            &who,
+            op,
+            brokerrouter::governance::Claim {
+                token: "55".repeat(32),
+                payload_hash: hash
+            }
+        )
+        .await,
+        Err(Error::InProgress)
+    ));
+    // Crash after ownership was durably committed, before any request existed.
+    sqlx::query("UPDATE guardrail_evaluations SET state='running',deadline=clock_timestamp()-interval '1 second'").execute(&pool).await.unwrap();
+    brokerrouter::governance::maintain(&pool).await.unwrap();
+    let a = g
+        .check(&who, semantic_action(turn, "crashed"))
+        .await
+        .unwrap();
+    assert_eq!(a["state"], "waiting_approval");
+    assert_eq!(mock.count(), 0);
+    let events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM governance_events WHERE event_type='guardrail.finished'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(events, 1);
+    assert!(
+        sqlx::query(
+            "UPDATE guardrail_evaluations SET state='pending',reason_code=NULL,finished_at=NULL"
+        )
+        .execute(&pool)
+        .await
+        .is_err()
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn semantic_settlement_failure_does_not_repeat_paid_check(pool: PgPool) {
+    let (mock, who, g, turn) = semantic_setup(
+        &pool,
+        Reply::Judge("{\"decision\":\"pass\"}"),
+        3,
+        "tool_input",
+    )
+    .await;
+    sqlx::raw_sql("CREATE FUNCTION fail_judge_settlement() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.kind='finalize' THEN RAISE EXCEPTION 'fixture settlement failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER fixture_judge_settlement BEFORE INSERT ON ledger_entries FOR EACH ROW EXECUTE FUNCTION fail_judge_settlement();").execute(&pool).await.unwrap();
+    let a = g
+        .check(&who, semantic_action(turn, "commit-failure"))
+        .await
+        .unwrap();
+    assert_eq!(a["state"], "waiting_approval");
+    sqlx::query("DROP TRIGGER fixture_judge_settlement ON ledger_entries")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        g.check(&who, semantic_action(turn, "commit-failure"))
+            .await
+            .unwrap()["approval"]["id"],
+        a["approval"]["id"]
+    );
+    assert_eq!(mock.count(), 1);
+    let request: Uuid = sqlx::query_scalar("SELECT id FROM requests")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    attempts::reconcile(
+        &pool,
+        who.tenant_id,
+        request,
+        Some((3, 4)),
+        "fixture://verified-check-usage",
+    )
+    .await
+    .unwrap();
+    let money: (i64, i64) =
+        sqlx::query_as("SELECT spent_micros,reserved_micros FROM tenants WHERE id=$1")
+            .bind(who.tenant_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(money, (7, 0));
+    assert_eq!(
+        g.check(&who, semantic_action(turn, "commit-failure"))
+            .await
+            .unwrap()["state"],
+        "waiting_approval"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn semantic_runtime_role_can_evaluate_but_cannot_repurpose_or_approve(pool: PgPool) {
+    let (mock, who, _g, turn) = semantic_setup(
+        &pool,
+        Reply::Judge("{\"decision\":\"risk\"}"),
+        3,
+        "tool_input",
+    )
+    .await;
+    sqlx::raw_sql(include_str!("../deploy/permissions.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let runtime = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .after_connect(|c, _| {
+            Box::pin(async move {
+                sqlx::query("SET ROLE brokerrouter_runtime")
+                    .execute(c)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let g = Gateway::new(
+        runtime.clone(),
+        common::cipher(),
+        HashMap::from([("FIXTURE_PROVIDER_KEY".into(), "fake-provider-secret".into())]),
+        1,
+        3,
+        60,
+    )
+    .unwrap();
+    let a = g
+        .check(&who, semantic_action(turn, "restricted"))
+        .await
+        .unwrap();
+    assert_eq!(a["state"], "waiting_approval");
+    assert_eq!(mock.count(), 1);
+    assert!(
+        sqlx::query("UPDATE approvals SET state='approved'")
+            .execute(&runtime)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE requests SET guardrail_evaluation_id=NULL")
+            .execute(&runtime)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE requests SET guardrail_evaluation_id=NULL")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE guardrail_evaluations SET state='passed'")
+            .execute(&runtime)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("TRUNCATE guardrail_evaluations CASCADE")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    runtime.close().await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn semantic_inflight_policy_change_requires_new_version_evaluation(pool: PgPool) {
+    let (mock, who, g, turn) = semantic_setup(&pool, Reply::JudgeSlow, 4, "tool_input").await;
+    let worker = g.clone();
+    let identity = who.clone();
+    let task = tokio::spawn(async move {
+        worker
+            .check(&identity, semantic_action(turn, "policy-change"))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while mock.count() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // This must not wait on the slow network request: no transaction spans HTTP.
+    tokio::time::timeout(
+        Duration::from_millis(800),
+        common::guardrail(
+            &pool,
+            who.tenant_id,
+            "semantic",
+            2,
+            "tool_input",
+            semantic_rule(),
+        ),
+    )
+    .await
+    .unwrap();
+    let a = task.await.unwrap().unwrap();
+    assert_eq!(a["state"], "checking");
+    assert_eq!(mock.count(), 1);
+    assert_eq!(
+        g.check(&who, semantic_action(turn, "policy-change"))
+            .await
+            .unwrap()["state"],
+        "ready"
+    );
+    assert_eq!(mock.count(), 2);
+    let versions: Vec<(i32, String)> =
+        sqlx::query_as("SELECT version,state FROM guardrail_evaluations ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(versions, vec![(1, "passed".into()), (2, "passed".into())]);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn semantic_http_disconnect_does_not_cancel_owned_check(pool: PgPool) {
+    let (mock, who, g, turn) = semantic_setup(&pool, Reply::JudgeSlow, 4, "tool_input").await;
+    // Give a fresh bound key to a real HTTP handler rather than exposing fixture
+    // credentials through the semantic setup return value.
+    let (_, token) = store::create_key(
+        &pool,
+        who.tenant_id,
+        "http-judge",
+        10_000_000,
+        &["logical/model".into()],
+        None,
+    )
+    .await
+    .unwrap();
+    let other = store::authenticate(&pool, &token).await.unwrap();
+    common::provision(&pool, &other, "http-judge-user").await;
+    let other_turn = common::turn(&pool, &other, "http-judge-user", 0).await;
+    let app = api::gateway_router(g.clone());
+    let body = serde_json::to_value(semantic_action(other_turn, "disconnect-check")).unwrap();
+    let task = tokio::spawn(app.oneshot(request(&token, "unused", body, "/v1/governance/checks")));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while mock.count() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    g.drain().await;
+    let facts:(i64,String)=sqlx::query_as("SELECT r.final_micros,e.state FROM requests r JOIN guardrail_evaluations e ON e.tenant_id=r.tenant_id AND e.id=r.guardrail_evaluation_id").fetch_one(&pool).await.unwrap();
+    assert_eq!(facts, (7, "passed".into()));
+    assert_eq!(mock.count(), 1);
+    assert!(
+        g.logs(&who, None, 100).await.unwrap()["data"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let _ = turn;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn semantic_result_get_never_starts_new_paid_policy_check(pool: PgPool) {
+    let (mock, who, g, turn) = semantic_setup(&pool, Reply::SmartJudge, 4, "tool_input").await;
+    let (id, result) = g
+        .execute_in_turn(&who, "stored", chat(), "chat", Some(turn))
+        .await
+        .unwrap();
+    result.unwrap();
+    assert_eq!(mock.count(), 1);
+    common::guardrail(
+        &pool,
+        who.tenant_id,
+        "new-output",
+        1,
+        "post",
+        semantic_rule(),
+    )
+    .await;
+    for _ in 0..3 {
+        assert!(matches!(g.result(&who, id).await, Err(Error::InProgress)));
+    }
+    assert_eq!(mock.count(), 1);
+    let released = g.check_result(&who, id).await.unwrap();
+    assert_eq!(
+        released["choices"][0]["message"]["content"],
+        "private answer"
+    );
+    assert_eq!(mock.count(), 2);
+    g.check_result(&who, id).await.unwrap();
+    g.result(&who, id).await.unwrap();
+    assert_eq!(mock.count(), 2);
 }
 
 #[sqlx::test(migrations = "./migrations")]

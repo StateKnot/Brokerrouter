@@ -127,7 +127,7 @@ pub async fn complete(pool: &PgPool, who: &Identity, id: Uuid, c: Completion<'_>
             .map_err(|_| Error::Configuration)?;
     let route = routes.get(ordinal as usize).ok_or(Error::Configuration)?;
     let cost = route.price.breakdown(c.input, c.output)?;
-    accounting::finish_locked(&mut tx,who,&row,cost.cny_micros,Some(c.ciphertext),json!({"attempt_id":c.attempt,"price_snapshot":route.price,"cost":cost,"input_tokens":c.input,"output_tokens":c.output,"pricing_basis":"configured_endpoint_price"})).await?;
+    accounting::finish_locked(&mut tx,who,&row,cost.cny_micros,Some(c.ciphertext),json!({"attempt_id":c.attempt,"price_snapshot":route.price,"cost":cost,"input_tokens":c.input,"output_tokens":c.output,"pricing_basis":"configured_endpoint_price","purpose":if row.guardrail_evaluation_id.is_some(){"guardrail"}else{"model"},"guardrail_evaluation_id":row.guardrail_evaluation_id})).await?;
     sqlx::query("UPDATE attempts SET status='succeeded',usage=$2,cost_micros=$3,http_status=200,finished_at=now(),error_code=NULL WHERE id=$1").bind(c.attempt).bind(c.usage).bind(cost.cny_micros).execute(&mut *tx).await?;
     sqlx::query("UPDATE requests SET result_expires_at=now()+make_interval(secs=>$2) WHERE id=$1")
         .bind(id)
@@ -182,7 +182,7 @@ pub async fn reconcile(
             Err(Error::Conflict)
         };
     }
-    accounting::finish_locked(&mut tx,&who,&row,actual,None,json!({"attempt_id":attempt,"price_snapshot":route.price,"cost":cost,"reconciliation":"operator_verified","evidence_reference":evidence})).await?;
+    accounting::finish_locked(&mut tx,&who,&row,actual,None,json!({"attempt_id":attempt,"price_snapshot":route.price,"cost":cost,"reconciliation":"operator_verified","evidence_reference":evidence,"purpose":if row.guardrail_evaluation_id.is_some(){"guardrail"}else{"model"},"guardrail_evaluation_id":row.guardrail_evaluation_id})).await?;
     sqlx::query("UPDATE requests SET status='reconciled',error_code='reconciled_without_result' WHERE id=$1").bind(id).execute(&mut *tx).await?;
     sqlx::query(
         "UPDATE attempts SET status='reconciled',cost_micros=$2,finished_at=now() WHERE id=$1",

@@ -485,6 +485,11 @@ pub async fn bind_runtime(
     Ok(())
 }
 pub async fn publish_guardrail(pool: &PgPool, tenant: Uuid, rule: Guardrail) -> Result<()> {
+    if rule.stage == "artifact" && rule.rule["kind"] == "model_judge" {
+        return Err(Error::Invalid(
+            "text_json judge does not inspect binary artifacts; an asset-aware connector is required",
+        ));
+    }
     if !governance::valid_text(&rule.id, 100)
         || !governance::valid_text(&rule.name, 200)
         || rule.version < 1

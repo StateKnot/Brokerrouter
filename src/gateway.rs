@@ -34,6 +34,13 @@ struct RequestLog {
     created_at: chrono::DateTime<chrono::Utc>,
     final_micros: Option<i64>,
     reserve_micros: i64,
+    guardrail_evaluation_id: Option<Uuid>,
+}
+
+#[derive(Clone, Copy)]
+struct CallContext {
+    turn_id: Option<Uuid>,
+    judge: Option<(Uuid, i64)>,
 }
 
 fn reserved_cny(status: &str, maximum: i64) -> String {
@@ -58,6 +65,7 @@ pub struct Gateway {
     pub(crate) cipher: Arc<ResultCipher>,
     credentials: Arc<HashMap<String, String>>,
     capacity: Arc<Semaphore>,
+    judge_capacity: Arc<Semaphore>,
     timeout_seconds: i32,
     result_ttl_seconds: i32,
     pub(crate) tasks: tokio_util::task::TaskTracker,
@@ -82,6 +90,7 @@ impl Gateway {
             cipher: Arc::new(cipher),
             credentials: Arc::new(credentials),
             capacity: Arc::new(Semaphore::new(concurrency)),
+            judge_capacity: Arc::new(Semaphore::new((concurrency / 4).max(1))),
             timeout_seconds,
             result_ttl_seconds,
             tasks: tokio_util::task::TaskTracker::new(),
@@ -135,7 +144,74 @@ impl Gateway {
         operation: &'static str,
         turn_id: Option<Uuid>,
     ) -> Result<(Uuid, Result<Value>)> {
-        let _permit = self.capacity.try_acquire().map_err(|_| Error::Busy)?;
+        if idempotency.starts_with("_br_guardrail:") {
+            return Err(Error::Invalid("reserved idempotency namespace"));
+        }
+        self.execute_inner(
+            who,
+            idempotency,
+            body,
+            operation,
+            CallContext {
+                turn_id,
+                judge: None,
+            },
+        )
+        .await
+    }
+
+    pub(crate) fn judge_timeout_seconds(&self) -> i32 {
+        self.timeout_seconds
+    }
+
+    pub(crate) async fn execute_judge(
+        &self,
+        who: &Identity,
+        evaluation: Uuid,
+        turn: Uuid,
+        body: Value,
+        maximum: i64,
+    ) -> Result<Value> {
+        self.execute_inner(
+            who,
+            &format!("_br_guardrail:{evaluation}"),
+            body,
+            "chat",
+            CallContext {
+                turn_id: Some(turn),
+                judge: Some((evaluation, maximum)),
+            },
+        )
+        .await?
+        .1
+    }
+
+    /// Runs the selected server-side checks, then re-reads current policy before
+    /// permitting the original operation. The low-level check never calls HTTP.
+    pub async fn check(&self, who: &Identity, check: governance::Check) -> Result<Value> {
+        let first = governance::check(&self.pool, &self.cipher, who, check.clone()).await?;
+        if first["state"] != "checking" {
+            return Ok(first);
+        }
+        let ids: Vec<Uuid> = serde_json::from_value(first["evaluations"].clone())
+            .map_err(|_| Error::Configuration)?;
+        for id in ids {
+            crate::judge::evaluate(self, who, id).await?;
+        }
+        // Do not loop indefinitely on policy edits. A newly selected version is
+        // returned as checking and will be driven by the next identical check.
+        governance::check(&self.pool, &self.cipher, who, check).await
+    }
+
+    async fn execute_inner(
+        &self,
+        who: &Identity,
+        idempotency: &str,
+        body: Value,
+        operation: &'static str,
+        context: CallContext,
+    ) -> Result<(Uuid, Result<Value>)> {
+        let turn_id = context.turn_id;
         if idempotency.is_empty()
             || idempotency.len() > 200
             || !idempotency.bytes().all(|b| b.is_ascii_graphic())
@@ -151,6 +227,9 @@ impl Gateway {
         if let Some(id) = turn_id {
             envelope["turn_id"] = json!(id);
         }
+        if let Some((id, _)) = context.judge {
+            envelope["guardrail_evaluation_id"] = json!(id);
+        }
         let bytes = serde_json::to_vec(&envelope).map_err(|_| Error::Invalid("invalid JSON"))?;
         let digest = store::hash(&bytes);
         let existing = sqlx::query_as::<_, Reservation>(&format!(
@@ -162,13 +241,12 @@ impl Gateway {
         .bind(idempotency)
         .fetch_optional(&self.pool)
         .await?;
-        if existing.as_ref().is_none_or(|r| r.status == "reserved")
+        if context.judge.is_none()
+            && existing.as_ref().is_none_or(|r| r.status == "reserved")
             && let Some(turn_id) = turn_id
         {
             governance::require_ready(
-                governance::check(
-                    &self.pool,
-                    &self.cipher,
+                Box::pin(self.check(
                     who,
                     governance::Check {
                         turn_id,
@@ -178,12 +256,20 @@ impl Gateway {
                         tool_name: None,
                         payload: request.body.clone(),
                     },
-                )
+                ))
                 .await?,
             )?;
         }
+        let capacity = if context.judge.is_some() {
+            &self.judge_capacity
+        } else {
+            &self.capacity
+        };
+        let _permit = capacity.try_acquire().map_err(|_| Error::Busy)?;
         let row = if let Some(row) = existing {
-            if row.request_hash != digest {
+            if row.request_hash != digest
+                || row.guardrail_evaluation_id != context.judge.map(|(id, _)| id)
+            {
                 return Err(Error::Conflict);
             }
             row
@@ -208,6 +294,9 @@ impl Gateway {
                 };
                 let cost =
                     price.cost(request.maximum_input(&endpoint), request.max_output as u64)?;
+                if context.judge.is_some_and(|(_, cap)| cost > cap) {
+                    continue;
+                }
                 if bound.is_none() || cost > maximum {
                     maximum = cost;
                     bound = Some(price.clone());
@@ -224,22 +313,24 @@ impl Gateway {
                     Error::NoEndpoint
                 });
             }
-            accounting::reserve(
-                &self.pool,
-                Admission {
-                    identity: who,
-                    model: &request.model,
-                    idempotency_key: idempotency,
-                    request_hash: &digest,
-                    maximum_micros: maximum,
-                    snapshot: bound.ok_or(Error::NoEndpoint)?,
-                    routing: Some(serde_json::to_value(routes).map_err(|_| Error::Configuration)?),
-                    timeout_seconds: self.timeout_seconds,
-                    governance_turn_id: turn_id,
-                },
-            )
-            .await?
-            .0
+            let admission = Admission {
+                identity: who,
+                model: &request.model,
+                idempotency_key: idempotency,
+                request_hash: &digest,
+                maximum_micros: maximum,
+                snapshot: bound.ok_or(Error::NoEndpoint)?,
+                routing: Some(serde_json::to_value(routes).map_err(|_| Error::Configuration)?),
+                timeout_seconds: self.timeout_seconds,
+                governance_turn_id: turn_id,
+            };
+            if let Some((id, _)) = context.judge {
+                accounting::reserve_evaluation(&self.pool, admission, id)
+                    .await?
+                    .0
+            } else {
+                accounting::reserve(&self.pool, admission).await?.0
+            }
         };
         let result = self.run(who, &request, row.clone()).await;
         Ok((row.id, result))
@@ -252,7 +343,11 @@ impl Gateway {
         row: Reservation,
     ) -> Result<Value> {
         match row.status.as_str() {
-            "succeeded" => return self.result(who, row.id).await,
+            "succeeded" => {
+                return self
+                    .result_inner(who, row.id, row.guardrail_evaluation_id, true)
+                    .await;
+            }
             "failed" => return Err(Error::NotSubmitted),
             "reconciled" => return Err(Error::ResultUnavailable),
             "submission_unknown" => return Err(Error::UpstreamUnknown),
@@ -337,6 +432,7 @@ impl Gateway {
             let authority=async {
                 store::authorize_model(&self.pool,who,&row.model_id).await?;
                 governance::context(&self.pool,who,row.governance_turn_id,&row.model_id).await?;
+                if let Some(id)=row.guardrail_evaluation_id {crate::judge::authority(&self.pool,who,id).await?;}
                 let active:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM endpoints WHERE tenant_id=$1 AND id=$2 AND active)").bind(who.tenant_id).bind(route.endpoint.id).fetch_one(&self.pool).await?;
                 if active {Ok(())}else{Err(Error::Unauthorized)}
             }.await;
@@ -444,14 +540,31 @@ impl Gateway {
                 .await;
                 return Err(error);
             }
-            return self.result(who, row.id).await;
+            return self
+                .result_inner(who, row.id, row.guardrail_evaluation_id, true)
+                .await;
         }
         accounting::release_unsubmitted(&self.pool, who, row.id).await?;
         Err(Error::NotSubmitted)
     }
 
     pub async fn result(&self, who: &Identity, id: Uuid) -> Result<Value> {
+        self.result_inner(who, id, None, false).await
+    }
+    pub async fn check_result(&self, who: &Identity, id: Uuid) -> Result<Value> {
+        self.result_inner(who, id, None, true).await
+    }
+    async fn result_inner(
+        &self,
+        who: &Identity,
+        id: Uuid,
+        evaluation: Option<Uuid>,
+        run_checks: bool,
+    ) -> Result<Value> {
         let row = accounting::get(&self.pool, who, id).await?;
+        if row.guardrail_evaluation_id != evaluation {
+            return Err(Error::NotFound);
+        }
         store::authorize_model(&self.pool, who, &row.model_id).await?;
         governance::context(&self.pool, who, row.governance_turn_id, &row.model_id).await?;
         if row.status == "reconciled" {
@@ -477,23 +590,24 @@ impl Gateway {
                 .ok_or(Error::ResultUnavailable)?,
         )?;
         let value: Value = serde_json::from_slice(&bytes).map_err(|_| Error::ResultUnavailable)?;
-        if let Some(turn_id) = row.governance_turn_id {
-            governance::require_ready(
-                governance::check(
-                    &self.pool,
-                    &self.cipher,
-                    who,
-                    governance::Check {
-                        turn_id,
-                        operation_key: id.to_string(),
-                        stage: "post".into(),
-                        model_id: Some(row.model_id),
-                        tool_name: None,
-                        payload: value.clone(),
-                    },
-                )
-                .await?,
-            )?;
+        if evaluation.is_none()
+            && let Some(turn_id) = row.governance_turn_id
+        {
+            let check = governance::Check {
+                turn_id,
+                operation_key: id.to_string(),
+                stage: "post".into(),
+                model_id: Some(row.model_id),
+                tool_name: None,
+                payload: value.clone(),
+            };
+            let checked = if run_checks {
+                Box::pin(self.check(who, check)).await?
+            } else {
+                // GET may discover a newer policy, but never dispatch paid work.
+                governance::check(&self.pool, &self.cipher, who, check).await?
+            };
+            governance::require_ready(checked)?;
         }
         Ok(value)
     }
@@ -511,7 +625,7 @@ impl Gateway {
             &row.status
         };
         Ok(
-            json!({"id":id,"model":row.model_id,"status":state,"currency":"CNY","maximum_cny":money::format_micros(row.reserve_micros),"reserved_cny":reserved_cny(state,row.reserve_micros),"cost_cny":row.final_micros.map(money::format_micros),"error_code":row.error_code,"result_expires_at":row.result_expires_at,"attempts":attempts.into_iter().map(|(id,endpoint,ordinal,status,http,error,cost)|json!({"id":id,"endpoint_id":endpoint,"ordinal":ordinal,"status":status,"http_status":http,"error_code":error,"cost_cny":cost.map(money::format_micros)})).collect::<Vec<_>>()}),
+            json!({"id":id,"model":row.model_id,"purpose":if row.guardrail_evaluation_id.is_some(){"guardrail"}else{"model"},"guardrail_evaluation_id":row.guardrail_evaluation_id,"status":state,"currency":"CNY","maximum_cny":money::format_micros(row.reserve_micros),"reserved_cny":reserved_cny(state,row.reserve_micros),"cost_cny":row.final_micros.map(money::format_micros),"error_code":row.error_code,"result_expires_at":row.result_expires_at,"attempts":attempts.into_iter().map(|(id,endpoint,ordinal,status,http,error,cost)|json!({"id":id,"endpoint_id":endpoint,"ordinal":ordinal,"status":status,"http_status":http,"error_code":error,"cost_cny":cost.map(money::format_micros)})).collect::<Vec<_>>()}),
         )
     }
 
@@ -532,7 +646,7 @@ impl Gateway {
                 return Err(Error::NotFound);
             }
         }
-        let rows:Vec<RequestLog>=sqlx::query_as("SELECT r.id,r.model_id,r.status,r.created_at,r.final_micros,r.reserve_micros FROM requests r WHERE r.tenant_id=$1 AND r.key_id=$2 AND ($3::uuid IS NULL OR (r.created_at,r.id)<(SELECT created_at,id FROM requests WHERE tenant_id=$1 AND key_id=$2 AND id=$3)) AND EXISTS(SELECT 1 FROM key_models g JOIN models m ON m.tenant_id=g.tenant_id AND m.id=g.model_id WHERE g.tenant_id=r.tenant_id AND g.key_id=r.key_id AND g.model_id=r.model_id AND m.active) ORDER BY r.created_at DESC,r.id DESC LIMIT $4")
+        let rows:Vec<RequestLog>=sqlx::query_as("SELECT r.id,r.model_id,r.status,r.created_at,r.final_micros,r.reserve_micros,r.guardrail_evaluation_id FROM requests r WHERE r.tenant_id=$1 AND r.key_id=$2 AND ($3::uuid IS NULL OR (r.created_at,r.id)<(SELECT created_at,id FROM requests WHERE tenant_id=$1 AND key_id=$2 AND id=$3)) AND EXISTS(SELECT 1 FROM key_models g JOIN models m ON m.tenant_id=g.tenant_id AND m.id=g.model_id WHERE g.tenant_id=r.tenant_id AND g.key_id=r.key_id AND g.model_id=r.model_id AND m.active) ORDER BY r.created_at DESC,r.id DESC LIMIT $4")
             .bind(who.tenant_id).bind(who.key_id).bind(before).bind(limit).fetch_all(&self.pool).await?;
         let next = if rows.len() == limit as usize {
             rows.last().map(|r| r.id)
@@ -540,7 +654,7 @@ impl Gateway {
             None
         };
         Ok(
-            json!({"data":rows.into_iter().map(|r|json!({"id":r.id,"model":r.model_id,"status":r.status,"created_at":r.created_at,"currency":"CNY","cost_cny":r.final_micros.map(money::format_micros),"maximum_cny":money::format_micros(r.reserve_micros),"reserved_cny":reserved_cny(&r.status,r.reserve_micros)})).collect::<Vec<_>>(),"next_cursor":next}),
+            json!({"data":rows.into_iter().map(|r|json!({"id":r.id,"model":r.model_id,"purpose":if r.guardrail_evaluation_id.is_some(){"guardrail"}else{"model"},"guardrail_evaluation_id":r.guardrail_evaluation_id,"status":r.status,"created_at":r.created_at,"currency":"CNY","cost_cny":r.final_micros.map(money::format_micros),"maximum_cny":money::format_micros(r.reserve_micros),"reserved_cny":reserved_cny(&r.status,r.reserve_micros)})).collect::<Vec<_>>(),"next_cursor":next}),
         )
     }
 }

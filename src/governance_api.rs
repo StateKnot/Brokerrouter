@@ -45,9 +45,12 @@ async fn check(
         ));
     }
     let who = api::identity(&g.pool, &headers).await?;
-    Ok(Json(
-        governance::check(&g.pool, &g.cipher, &who, check).await?,
-    ))
+    // HTTP disconnect must not abandon an owned, potentially billable check.
+    let worker = g.clone();
+    let task = g
+        .tasks
+        .spawn(async move { worker.check(&who, check).await });
+    Ok(Json(task.await.map_err(|_| Error::Configuration)??))
 }
 async fn operation(
     State(g): State<Gateway>,

@@ -64,4 +64,7 @@ GRANT UPDATE(state,event_clock) ON governance_turns TO brokerrouter_governance_c
 GRANT UPDATE(state,decision_hash,decided_by,feedback_ciphertext,decided_at) ON approvals TO brokerrouter_governance_control;
 GRANT UPDATE(state,payload_ciphertext,receipt_hash,receipt_ciphertext) ON governance_operations TO brokerrouter_governance_control;
 GRANT UPDATE(result_ciphertext) ON requests TO brokerrouter_governance_control;
+GRANT SELECT ON guardrail_evaluations TO brokerrouter_runtime,brokerrouter_operator,brokerrouter_governance_control;
+GRANT INSERT ON guardrail_evaluations TO brokerrouter_runtime;
+GRANT UPDATE(state,reason_code,deadline,finished_at) ON guardrail_evaluations TO brokerrouter_runtime;
 COMMIT;

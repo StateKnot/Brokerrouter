@@ -8,6 +8,7 @@ pub mod gateway;
 pub mod governance;
 pub mod governance_api;
 pub mod human;
+mod judge;
 pub mod money;
 pub mod protocol;
 pub mod store;

@@ -157,6 +157,7 @@ pub fn validate_rule(rule: &Value) -> Result<()> {
             }
             Ok(())
         }
+        Some("model_judge") => crate::judge::Rule::parse(rule).map(|_| ()),
         _ => Err(Error::Invalid("unsupported guardrail rule")),
     }
 }
@@ -211,13 +212,19 @@ pub(crate) async fn event(tx: &mut Tx<'_>, turn: &Turn, kind: &str, data: Value)
     sqlx::query("INSERT INTO governance_events(tenant_id,turn_id,sequence,event_type,data) VALUES($1,$2,$3,$4,$5)").bind(turn.tenant_id).bind(turn.id).bind(seq).bind(kind).bind(data).execute(&mut **tx).await?;
     Ok(())
 }
+pub(crate) enum Gate {
+    Ready,
+    Approval(Value),
+    Checking(Vec<Uuid>),
+}
+
 pub(crate) async fn gate(
     tx: &mut Tx<'_>,
     who: &Identity,
     turn: &Turn,
     op: &Operation,
     payload: &Value,
-) -> Result<Option<Value>> {
+) -> Result<Gate> {
     if matches!(op.state.as_str(), "rejected" | "feedback") {
         return Err(Error::ActionRejected);
     }
@@ -234,21 +241,51 @@ pub(crate) async fn gate(
     strings(payload, &mut text);
     let mut needed = Vec::new();
     let mut evaluated = Vec::new();
+    let mut pending = Vec::new();
+    if rules
+        .iter()
+        .filter(|r| r.rule["kind"] == "model_judge")
+        .count()
+        > 8
+    {
+        return Err(Error::Configuration);
+    }
     for r in rules {
         let grant: Option<Uuid>=sqlx::query_scalar("SELECT approval_id FROM guardrail_grants WHERE tenant_id=$1 AND turn_id=$2 AND guardrail_id=$3 AND version=$4 AND expires_at>clock_timestamp()")
             .bind(who.tenant_id).bind(turn.id).bind(&r.id).bind(r.version).fetch_optional(&mut **tx).await?;
-        let outcome = if grant.is_some() {
-            "skipped_by_user_approval"
+        let (outcome, reason) = if grant.is_some() {
+            (
+                "skipped_by_user_approval".to_owned(),
+                "approved_current_turn".to_owned(),
+            )
+        } else if r.rule["kind"] == "model_judge" {
+            match crate::judge::observe(tx, who, op, &r).await? {
+                crate::judge::Observation::Pending(id) => {
+                    pending.push(id);
+                    continue;
+                }
+                crate::judge::Observation::Complete { outcome, reason } => (outcome, reason),
+            }
         } else if risk(&r.rule, &text)? {
-            "risk"
+            ("risk".to_owned(), "configured_rule_match".to_owned())
         } else {
-            "passed"
+            ("passed".to_owned(), "configured_rule_passed".to_owned())
         };
-        if outcome == "risk" {
-            needed.push(json!({"id":r.id,"version":r.version,"name":r.name,"stage":r.stage,"reason_code":"configured_rule_match"}));
+        if outcome == "risk" || outcome == "failed" {
+            // Preserve the original deterministic approval hash across upgrades.
+            let mut item = json!({"id":r.id,"version":r.version,"name":r.name,"stage":r.stage,"reason_code":reason});
+            if r.rule["kind"] == "model_judge" {
+                item["evaluation_outcome"] = json!(outcome);
+            }
+            needed.push(item);
         }
         evaluated
             .push(json!({"id":r.id,"version":r.version,"outcome":outcome,"approval_id":grant}));
+    }
+    if !pending.is_empty() {
+        sqlx::query("UPDATE governance_operations SET state='checking' WHERE tenant_id=$1 AND id=$2 AND state IN ('ready','checking','waiting_approval')")
+            .bind(who.tenant_id).bind(op.id).execute(&mut **tx).await?;
+        return Ok(Gate::Checking(pending));
     }
     if needed.is_empty() {
         if !evaluated.is_empty() {
@@ -260,7 +297,7 @@ pub(crate) async fn gate(
             )
             .await?;
         }
-        if op.state == "waiting_approval" {
+        if matches!(op.state.as_str(), "waiting_approval" | "checking") {
             sqlx::query(
                 "UPDATE governance_operations SET state='ready' WHERE tenant_id=$1 AND id=$2",
             )
@@ -269,7 +306,7 @@ pub(crate) async fn gate(
             .execute(&mut **tx)
             .await?;
         }
-        return Ok(None);
+        return Ok(Gate::Ready);
     }
     let hash = digest(&json!({"policy":snapshot,"needed":needed}))?;
     let expires = if op.stage == "post" {
@@ -297,8 +334,8 @@ pub(crate) async fn gate(
     if inserted.rows_affected() == 1 {
         event(tx,turn,"approval.required",json!({"approval_id":approval.id,"operation_id":op.id,"guardrails":approval.guardrails,"evaluations":evaluated})).await?;
     }
-    sqlx::query("UPDATE governance_operations SET state='waiting_approval' WHERE tenant_id=$1 AND id=$2 AND state IN ('ready','waiting_approval')").bind(who.tenant_id).bind(op.id).execute(&mut **tx).await?;
-    Ok(Some(approval_view(&approval)))
+    sqlx::query("UPDATE governance_operations SET state='waiting_approval' WHERE tenant_id=$1 AND id=$2 AND state IN ('ready','checking','waiting_approval')").bind(who.tenant_id).bind(op.id).execute(&mut **tx).await?;
+    Ok(Gate::Approval(approval_view(&approval)))
 }
 pub(crate) fn approval_view(a: &Approval) -> Value {
     json!({"id":a.id,"operation_id":a.operation_id,"turn_id":a.turn_id,"state":a.state,"guardrails":a.guardrails,"summary":a.summary,"expires_at":a.expires_at,"scope":"current_turn_only","resume_requires_recheck":true,"scope_notice":"继续本轮后，该轮后续动作也会跳过所选护栏；不扩大工具权限，不适用于新轮次。","options":["continue_this_turn","reject","feedback"]})
@@ -353,10 +390,16 @@ pub async fn check(
     }
     let waiting = gate(&mut tx, who, &turn, &op, &check.payload).await?;
     tx.commit().await?;
-    Ok(if let Some(approval) = waiting {
-        json!({"id":op.id,"state":"waiting_approval","approval":approval})
-    } else {
-        json!({"id":op.id,"state":"ready","turn_id":turn.id,"payload_hash":hex(&hash)})
+    Ok(match waiting {
+        Gate::Approval(approval) => {
+            json!({"id":op.id,"state":"waiting_approval","approval":approval})
+        }
+        Gate::Checking(evaluations) => {
+            json!({"id":op.id,"state":"checking","evaluations":evaluations,"turn_id":turn.id})
+        }
+        Gate::Ready => {
+            json!({"id":op.id,"state":"ready","turn_id":turn.id,"payload_hash":hex(&hash)})
+        }
     })
 }
 pub fn require_ready(value: Value) -> Result<()> {
@@ -536,9 +579,16 @@ pub async fn claim(
         )?,
     )
     .map_err(|_| Error::ResultUnavailable)?;
-    if let Some(a) = gate(&mut tx, who, &turn, &op, &payload).await? {
-        tx.commit().await?;
-        return Err(Error::ApprovalRequired(a));
+    match gate(&mut tx, who, &turn, &op, &payload).await? {
+        Gate::Approval(a) => {
+            tx.commit().await?;
+            return Err(Error::ApprovalRequired(a));
+        }
+        Gate::Checking(_) => {
+            tx.commit().await?;
+            return Err(Error::InProgress);
+        }
+        Gate::Ready => {}
     }
     let deadline: DateTime<Utc>=sqlx::query_scalar("UPDATE governance_operations SET state='executing',claim_hash=$3,execution_deadline=LEAST($4,clock_timestamp()+interval '60 seconds') WHERE tenant_id=$1 AND id=$2 RETURNING execution_deadline").bind(who.tenant_id).bind(id).bind(token_hash).bind(turn.expires_at).fetch_one(&mut *tx).await?;
     event(
@@ -619,6 +669,7 @@ pub async fn receipt(
     Ok(value)
 }
 pub async fn maintain(pool: &PgPool) -> Result<()> {
+    crate::judge::maintain(pool).await?;
     sqlx::query("WITH batch AS (SELECT tenant_id,id FROM governance_operations WHERE state='executing' AND execution_deadline<=clock_timestamp() ORDER BY execution_deadline LIMIT 100 FOR UPDATE SKIP LOCKED) UPDATE governance_operations o SET state='execution_unknown' FROM batch b WHERE o.tenant_id=b.tenant_id AND o.id=b.id").execute(pool).await?;
     sqlx::query("WITH batch AS (SELECT o.tenant_id,o.id FROM governance_operations o JOIN governance_turns t ON o.tenant_id=t.tenant_id AND o.turn_id=t.id WHERE (t.state<>'active' OR t.expires_at<=clock_timestamp()) AND (o.payload_ciphertext IS NOT NULL OR o.receipt_ciphertext IS NOT NULL) ORDER BY t.expires_at,o.id LIMIT 100 FOR UPDATE OF o SKIP LOCKED) UPDATE governance_operations o SET payload_ciphertext=NULL,receipt_ciphertext=NULL FROM batch b WHERE o.tenant_id=b.tenant_id AND o.id=b.id").execute(pool).await?;
     sqlx::query("WITH batch AS (SELECT r.id FROM requests r JOIN governance_turns t ON r.tenant_id=t.tenant_id AND r.governance_turn_id=t.id WHERE (t.state<>'active' OR t.expires_at<=clock_timestamp()) AND r.result_ciphertext IS NOT NULL ORDER BY t.expires_at,r.id LIMIT 100 FOR UPDATE OF r SKIP LOCKED) UPDATE requests r SET result_ciphertext=NULL FROM batch b WHERE r.id=b.id").execute(pool).await?;
