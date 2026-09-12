@@ -30,4 +30,22 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      - name: Start isolated S3 fixture
+        run: |
+          docker compose -f compose.test.yaml --profile assets up -d minio
+          curl --fail --silent --show-error --retry 15 --retry-connrefused --retry-delay 1 --max-time 30 http://127.0.0.1:59000/minio/health/live
+          curl --fail --silent --show-error --max-time 10 --aws-sigv4 'aws:amz:us-east-1:s3' --user 'brokerrouter-test-only:brokerrouter-local-only-not-production' -X PUT http://127.0.0.1:59000/brokerrouter-test-assets
+      - name: S3 conditional write and cleanup contract
+        env:
+          BROKERROUTER_ASSET_S3_ENDPOINT: http://127.0.0.1:59000
+          BROKERROUTER_ASSET_S3_BUCKET: brokerrouter-test-assets
+          BROKERROUTER_ASSET_S3_REGION: us-east-1
+          BROKERROUTER_ASSET_S3_ACCESS_KEY_ID: brokerrouter-test-only
+          BROKERROUTER_ASSET_S3_SECRET_ACCESS_KEY: brokerrouter-local-only-not-production
+          BROKERROUTER_ASSET_ALLOW_HTTP: "true"
+          BROKERROUTER_ACTIVE_RESULT_KEY: test-v1
+          BROKERROUTER_RESULT_KEYS: '{"test-v1":"1212121212121212121212121212121212121212121212121212121212121212"}'
+        run: cargo test --locked --test assets s3_conditional_write -- --ignored
       - run: cargo build --release --locked
+      - if: always()
+        run: docker compose -f compose.test.yaml --profile assets rm -sf minio

@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use rust_decimal::{Decimal, RoundingStrategy, prelude::ToPrimitive};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
@@ -24,12 +24,50 @@ pub fn cny_micros(value: &str) -> Result<i64> {
 }
 
 fn to_micros(cny: Decimal) -> Result<i64> {
-    cny.checked_mul(Decimal::from(1_000_000))
-        .and_then(|v| {
-            v.round_dp_with_strategy(0, RoundingStrategy::ToPositiveInfinity)
-                .to_i64()
-        })
+    let cny = cny.normalize();
+    let n = cny.mantissa();
+    if n < 0 {
+        return Err(Error::Invalid("negative cost"));
+    }
+    let rounded = if cny.scale() <= 6 {
+        n.checked_mul(10i128.pow(6 - cny.scale()))
+    } else {
+        let divisor = 10i128.pow(cny.scale() - 6);
+        n.checked_add(divisor - 1).map(|n| n / divisor)
+    };
+    rounded
+        .and_then(|n| i64::try_from(n).ok())
         .ok_or(Error::Invalid("amount exceeds supported range"))
+}
+
+// Decimal checked arithmetic may reduce scale to fit 96 bits. Money must reject
+// that loss, not round before FX and final CNY micro-unit settlement.
+fn exact_parts(mut mantissa: i128, mut scale: u32) -> Result<Decimal> {
+    while scale > 0 && mantissa % 10 == 0 {
+        mantissa /= 10;
+        scale -= 1;
+    }
+    Decimal::try_from_i128_with_scale(mantissa, scale)
+        .map_err(|_| Error::Invalid("exact price precision exceeds supported range"))
+}
+fn exact_mul(a: Decimal, b: Decimal) -> Result<Decimal> {
+    let (a, b) = (a.normalize(), b.normalize());
+    let n = a
+        .mantissa()
+        .checked_mul(b.mantissa())
+        .ok_or(Error::Invalid("price calculation overflow"))?;
+    exact_parts(n, a.scale() + b.scale())
+}
+fn exact_add(a: Decimal, b: Decimal) -> Result<Decimal> {
+    let (a, b) = (a.normalize(), b.normalize());
+    let scale = a.scale().max(b.scale());
+    let n = a
+        .mantissa()
+        .checked_mul(10i128.pow(scale - a.scale()))
+        .zip(b.mantissa().checked_mul(10i128.pow(scale - b.scale())))
+        .and_then(|(a, b)| a.checked_add(b))
+        .ok_or(Error::Invalid("price calculation overflow"))?;
+    exact_parts(n, scale)
 }
 
 pub fn format_micros(micros: i64) -> String {
@@ -52,46 +90,143 @@ impl PriceSnapshot {
     pub fn validate(&self) -> Result<()> {
         nonnegative(&self.input_per_million.to_string())?;
         nonnegative(&self.output_per_million.to_string())?;
-        match self.currency.as_str() {
-            "CNY" if self.cny_per_unit == Decimal::ONE && self.fx_version.is_none() => Ok(()),
-            "USD"
-                if self.cny_per_unit > Decimal::ZERO
-                    && self.cny_per_unit <= Decimal::from(1_000_000)
-                    && self.cny_per_unit.scale() <= 10
-                    && self.fx_version.is_some_and(|id| id > 0) =>
-            {
-                Ok(())
-            }
-            _ => Err(Error::Invalid("invalid currency or exchange-rate snapshot")),
-        }
+        validate_currency(&self.currency, self.cny_per_unit, self.fx_version)
     }
 
     pub fn breakdown(&self, input_tokens: u64, output_tokens: u64) -> Result<CostBreakdown> {
         self.validate()?;
-        let input = self
-            .input_per_million
-            .checked_mul(Decimal::from(input_tokens));
-        let output = self
-            .output_per_million
-            .checked_mul(Decimal::from(output_tokens));
-        let original_amount = input
-            .zip(output)
-            .and_then(|(a, b)| a.checked_add(b))
-            .and_then(|v| v.checked_div(Decimal::from(1_000_000)))
-            .ok_or(Error::Invalid("price calculation overflow"))?;
-        let cny_exact = original_amount
-            .checked_mul(self.cny_per_unit)
-            .ok_or(Error::Invalid("price calculation overflow"))?;
-        Ok(CostBreakdown {
-            original_currency: self.currency.clone(),
-            original_amount,
-            cny_exact,
-            cny_micros: to_micros(cny_exact)?,
-        })
+        let input = exact_mul(self.input_per_million, Decimal::from(input_tokens))?;
+        let output = exact_mul(self.output_per_million, Decimal::from(output_tokens))?;
+        let sum = exact_add(input, output)?;
+        let original_amount = exact_parts(sum.mantissa(), sum.scale() + 6)?;
+        breakdown(&self.currency, original_amount, self.cny_per_unit)
     }
 
     pub fn cost(&self, input_tokens: u64, output_tokens: u64) -> Result<i64> {
         Ok(self.breakdown(input_tokens, output_tokens)?.cny_micros)
+    }
+}
+
+fn validate_currency(currency: &str, cny_per_unit: Decimal, fx_version: Option<i64>) -> Result<()> {
+    match currency {
+        "CNY" if cny_per_unit == Decimal::ONE && fx_version.is_none() => Ok(()),
+        "USD"
+            if cny_per_unit > Decimal::ZERO
+                && cny_per_unit <= Decimal::from(1_000_000)
+                && cny_per_unit.scale() <= 10
+                && fx_version.is_some_and(|id| id > 0) =>
+        {
+            Ok(())
+        }
+        _ => Err(Error::Invalid("invalid currency or exchange-rate snapshot")),
+    }
+}
+
+fn breakdown(
+    currency: &str,
+    original_amount: Decimal,
+    cny_per_unit: Decimal,
+) -> Result<CostBreakdown> {
+    let cny_exact = exact_mul(original_amount, cny_per_unit)?;
+    Ok(CostBreakdown {
+        original_currency: currency.into(),
+        original_amount,
+        cny_exact,
+        cny_micros: to_micros(cny_exact)?,
+    })
+}
+
+/// A frozen non-token quote. Unit labels must include variant distinctions such as
+/// resolution when they affect price; they are never inferred from a model name.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnitPriceSnapshot {
+    pub schema: String,
+    pub price_version: uuid::Uuid,
+    pub currency: String,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub cny_per_unit: Decimal,
+    pub fx_version: Option<i64>,
+    pub rates: Vec<UnitRate>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnitRate {
+    pub unit: String,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub price_per_unit: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub maximum_quantity: Decimal,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnitUsage {
+    pub unit: String,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub quantity: Decimal,
+}
+impl UnitPriceSnapshot {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != "units-v1"
+            || self.price_version.is_nil()
+            || !(1..=16).contains(&self.rates.len())
+        {
+            return Err(Error::Invalid("invalid unit pricing schema"));
+        }
+        validate_currency(&self.currency, self.cny_per_unit, self.fx_version)?;
+        let mut seen = std::collections::HashSet::new();
+        for rate in &self.rates {
+            if rate.unit.is_empty()
+                || rate.unit.len() > 64
+                || !rate
+                    .unit
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"_-.".contains(&c))
+                || !seen.insert(&rate.unit)
+                || rate.maximum_quantity <= Decimal::ZERO
+            {
+                return Err(Error::Invalid("invalid or duplicate billing unit"));
+            }
+            nonnegative(&rate.price_per_unit.to_string())?;
+            nonnegative(&rate.maximum_quantity.to_string())?;
+        }
+        Ok(())
+    }
+    pub fn maximum_cost(&self) -> Result<i64> {
+        let usage: Vec<_> = self
+            .rates
+            .iter()
+            .map(|r| UnitUsage {
+                unit: r.unit.clone(),
+                quantity: r.maximum_quantity,
+            })
+            .collect();
+        Ok(self.breakdown(&usage)?.cny_micros)
+    }
+    pub fn breakdown(&self, usage: &[UnitUsage]) -> Result<CostBreakdown> {
+        self.validate()?;
+        // Every quoted dimension is explicit, including zero use. A missing provider
+        // usage field is not silently converted to a free generation.
+        if usage.len() != self.rates.len() {
+            return Err(Error::Invalid("all quoted usage dimensions are required"));
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut amount = Decimal::ZERO;
+        for used in usage {
+            let rate = self
+                .rates
+                .iter()
+                .find(|r| r.unit == used.unit)
+                .ok_or(Error::Invalid("unquoted billing unit"))?;
+            nonnegative(&used.quantity.to_string())?;
+            if !seen.insert(&used.unit) || used.quantity > rate.maximum_quantity {
+                return Err(Error::Invalid(
+                    "usage exceeds quote or repeats a unit; reconciliation required",
+                ));
+            }
+            amount = exact_add(amount, exact_mul(rate.price_per_unit, used.quantity)?)?;
+        }
+        breakdown(&self.currency, amount, self.cny_per_unit)
     }
 }
 

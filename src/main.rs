@@ -16,6 +16,18 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Migrate,
+    ServeAssets {
+        #[arg(long, default_value = "127.0.0.1:8082")]
+        bind: SocketAddr,
+    },
+    AssetQuotaSet {
+        #[arg(long)]
+        tenant: Uuid,
+        #[arg(long)]
+        key: Option<Uuid>,
+        #[arg(long)]
+        bytes: i64,
+    },
     ServeControl {
         #[arg(long, default_value = "127.0.0.1:8081")]
         bind: SocketAddr,
@@ -257,6 +269,30 @@ async fn main() -> anyhow::Result<()> {
         Command::Migrate => {
             migrate(&pool).await?;
             println!("Migrations applied");
+        }
+        Command::AssetQuotaSet { tenant, key, bytes } => {
+            brokerrouter::assets::set_quota(&pool, tenant, key, bytes).await?;
+        }
+        Command::ServeAssets { bind } => {
+            brokerrouter::check_schema(&pool).await?;
+            let assets = brokerrouter::assets::Assets::from_env(pool.clone())?;
+            let worker = assets.clone();
+            let maintenance = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    if worker.maintain().await.is_err() {
+                        tracing::error!("asset maintenance failed");
+                    }
+                }
+            });
+            let listener = tokio::net::TcpListener::bind(bind).await?;
+            tracing::info!(address=%bind,"brokerrouter assets listening");
+            axum::serve(listener, brokerrouter::asset_api::router(assets.clone()))
+                .with_graceful_shutdown(shutdown())
+                .await?;
+            assets.drain().await;
+            maintenance.abort();
         }
         Command::Serve { bind } => {
             brokerrouter::check_schema(&pool).await?;

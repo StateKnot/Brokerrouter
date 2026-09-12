@@ -14,6 +14,9 @@ DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_governance_control') THEN
         CREATE ROLE brokerrouter_governance_control NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_assets') THEN
+        CREATE ROLE brokerrouter_assets NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
 END $$;
 
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
@@ -67,4 +70,13 @@ GRANT UPDATE(result_ciphertext) ON requests TO brokerrouter_governance_control;
 GRANT SELECT ON guardrail_evaluations TO brokerrouter_runtime,brokerrouter_operator,brokerrouter_governance_control;
 GRANT INSERT ON guardrail_evaluations TO brokerrouter_runtime;
 GRANT UPDATE(state,reason_code,deadline,finished_at) ON guardrail_evaluations TO brokerrouter_runtime;
+GRANT USAGE ON SCHEMA public TO brokerrouter_assets;
+GRANT SELECT ON _sqlx_migrations,tenants,virtual_keys,assets,asset_chunks TO brokerrouter_assets;
+GRANT SELECT ON assets,asset_chunks TO brokerrouter_operator;
+GRANT INSERT ON assets,asset_chunks,audit_events TO brokerrouter_assets;
+GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_assets;
+GRANT UPDATE(asset_used_bytes) ON tenants,virtual_keys TO brokerrouter_assets;
+GRANT UPDATE(asset_quota_bytes) ON tenants,virtual_keys TO brokerrouter_operator;
+GRANT UPDATE(state,completed_at,deleted_at,gc_after,gc_checked_at,gc_cursor) ON assets TO brokerrouter_assets;
+GRANT UPDATE(state) ON asset_chunks TO brokerrouter_assets;
 COMMIT;

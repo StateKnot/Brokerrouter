@@ -35,6 +35,10 @@ pub enum Error {
     ResultUnavailable,
     #[error("gateway concurrency capacity is full")]
     Busy,
+    #[error("private asset storage is unavailable; retry the same immutable operation")]
+    Storage,
+    #[error("private asset storage quota exhausted")]
+    AssetQuota,
     #[error("a trusted current-turn context is required")]
     GovernanceContext,
     #[error("human approval is required before continuing")]
@@ -68,6 +72,8 @@ impl IntoResponse for Error {
             Self::Configuration => (StatusCode::SERVICE_UNAVAILABLE, "configuration_error"),
             Self::ResultUnavailable => (StatusCode::GONE, "result_unavailable"),
             Self::Busy => (StatusCode::SERVICE_UNAVAILABLE, "gateway_busy"),
+            Self::Storage => (StatusCode::SERVICE_UNAVAILABLE, "asset_storage_unavailable"),
+            Self::AssetQuota => (StatusCode::TOO_MANY_REQUESTS, "asset_quota_exceeded"),
             Self::GovernanceContext => (StatusCode::BAD_REQUEST, "governance_context_required"),
             Self::ApprovalRequired(_) => (StatusCode::CONFLICT, "approval_required"),
             Self::TurnClosed => (StatusCode::GONE, "turn_closed"),

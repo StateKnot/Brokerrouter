@@ -57,3 +57,5 @@ cargo run -- fx-history --tenant <TENANT_UUID> --limit 20
 收费 POST 还需 `Idempotency-Key`。完整支持字段、明确拒绝能力、恢复方式、费用核对与密钥配置见 [M2 调用契约](docs/m2-text-gateway.md)。
 
 M3 已增加确定性/文本语义护栏、模型输入/输出审批、当前 turn 豁免、独立真人控制面与工具执行恢复契约，见 [M3 治理协议](docs/m3-governance.md) 与 [语义护栏及人民币费用契约](docs/m3-semantic-guardrails.md)。受管调用必须携带服务端登记的 `X-Brokerrouter-Turn-Id`。`serve-control` 使用独立数据库角色和用户 BFF 公钥，不能与 Agent 凭据混用。真实 BFF/Runtime、供应商、SDK 与检测质量认证仍在 [验收待办](docs/acceptance-backlog.md)；不宣称普通 SDK 已能弹窗、多模态内容审核已接入或整个平台生产认证完成。
+
+M4.1 已增加 [私有输入资产与非 Token 人民币计费](docs/m4-assets-pricing.md)：`serve-assets` 提供 `/v1/assets` 分块上传、校验、私有下载和过期清理；`asset-quota-set` 显式配置租户/Key 字节配额。S3 兼容存储中的资产分块经应用加密，内容安全状态单独记录。按张/秒/次等单位计价的 Rust 库已接入统一人民币预留和账本，但生成作业、输出转存与审批交付尚在后续 M4 范围；不能把输入上传完成视为审核通过。

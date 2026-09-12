@@ -1,6 +1,6 @@
 use crate::{
     error::{Error, Result},
-    money::PriceSnapshot,
+    money::{PriceSnapshot, UnitPriceSnapshot, UnitUsage},
     store::Identity,
 };
 use serde::Serialize;
@@ -30,16 +30,31 @@ pub struct Reservation {
     pub guardrail_evaluation_id: Option<Uuid>,
 }
 
-pub struct Admission<'a> {
+pub struct Admission<'a, P = PriceSnapshot> {
     pub identity: &'a Identity,
     pub model: &'a str,
     pub idempotency_key: &'a str,
     pub request_hash: &'a [u8],
     pub maximum_micros: i64,
-    pub snapshot: PriceSnapshot,
+    pub snapshot: P,
     pub routing: Option<Value>,
     pub timeout_seconds: i32,
     pub governance_turn_id: Option<Uuid>,
+}
+impl<'a, P: Serialize> Admission<'a, P> {
+    fn encoded(self) -> Result<Admission<'a, Value>> {
+        Ok(Admission {
+            identity: self.identity,
+            model: self.model,
+            idempotency_key: self.idempotency_key,
+            request_hash: self.request_hash,
+            maximum_micros: self.maximum_micros,
+            snapshot: serde_json::to_value(self.snapshot).map_err(|_| Error::Configuration)?,
+            routing: self.routing,
+            timeout_seconds: self.timeout_seconds,
+            governance_turn_id: self.governance_turn_id,
+        })
+    }
 }
 
 pub(crate) const COLUMNS: &str = "id,tenant_id,key_id,model_id,status,reserve_micros,final_micros,price_snapshot,request_hash,result_ciphertext,error_code,routing_snapshot,dispatch_deadline,result_expires_at,governance_turn_id,guardrail_evaluation_id";
@@ -70,7 +85,22 @@ pub(crate) async fn lock_accounts(
 }
 
 pub async fn reserve(pool: &PgPool, a: Admission<'_>) -> Result<(Reservation, bool)> {
-    reserve_inner(pool, a, None).await
+    a.snapshot.validate()?;
+    let fx = (a.snapshot.fx_version, a.snapshot.cny_per_unit);
+    reserve_inner(pool, a.encoded()?, None, fx).await
+}
+
+pub async fn reserve_units(
+    pool: &PgPool,
+    a: Admission<'_, UnitPriceSnapshot>,
+) -> Result<(Reservation, bool)> {
+    if a.maximum_micros != a.snapshot.maximum_cost()? {
+        return Err(Error::Invalid(
+            "unit reservation must equal the maximum frozen quote",
+        ));
+    }
+    let fx = (a.snapshot.fx_version, a.snapshot.cny_per_unit);
+    reserve_inner(pool, a.encoded()?, None, fx).await
 }
 
 pub(crate) async fn reserve_evaluation(
@@ -78,15 +108,17 @@ pub(crate) async fn reserve_evaluation(
     a: Admission<'_>,
     evaluation: Uuid,
 ) -> Result<(Reservation, bool)> {
-    reserve_inner(pool, a, Some(evaluation)).await
+    a.snapshot.validate()?;
+    let fx = (a.snapshot.fx_version, a.snapshot.cny_per_unit);
+    reserve_inner(pool, a.encoded()?, Some(evaluation), fx).await
 }
 
 async fn reserve_inner(
     pool: &PgPool,
-    a: Admission<'_>,
+    a: Admission<'_, Value>,
     evaluation: Option<Uuid>,
+    fx: (Option<i64>, rust_decimal::Decimal),
 ) -> Result<(Reservation, bool)> {
-    a.snapshot.validate()?;
     if a.maximum_micros < 0
         || !(1..=600).contains(&a.timeout_seconds)
         || a.idempotency_key.is_empty()
@@ -126,15 +158,16 @@ async fn reserve_inner(
         if existing.request_hash != a.request_hash
             || existing.model_id != a.model
             || existing.guardrail_evaluation_id != evaluation
+            || existing.price_snapshot.get("schema") != a.snapshot.get("schema")
         {
             return Err(Error::Conflict);
         }
         tx.commit().await?;
         return Ok((existing, false));
     }
-    if let Some(version) = a.snapshot.fx_version {
+    if let Some(version) = fx.0 {
         let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM fx_rates WHERE tenant_id=$1 AND id=$2 AND usd_cny=$3 AND effective_at<=now())")
-            .bind(who.tenant_id).bind(version).bind(a.snapshot.cny_per_unit).fetch_one(&mut *tx).await?;
+            .bind(who.tenant_id).bind(version).bind(fx.1).fetch_one(&mut *tx).await?;
         if !valid {
             return Err(Error::Invalid(
                 "exchange-rate snapshot is not an effective tenant version",
@@ -270,6 +303,47 @@ pub async fn settle_usage(
         }),
     )
     .await
+}
+
+pub async fn settle_units(
+    pool: &PgPool,
+    who: &Identity,
+    id: Uuid,
+    usage: &[UnitUsage],
+) -> Result<()> {
+    let request = get(pool, who, id).await?;
+    let snapshot: UnitPriceSnapshot =
+        serde_json::from_value(request.price_snapshot).map_err(|_| {
+            Error::Invalid("invalid persisted unit price snapshot; reconciliation required")
+        })?;
+    let cost = snapshot.breakdown(usage)?;
+    let mut canonical_usage = usage.to_vec();
+    for used in &mut canonical_usage {
+        used.quantity = used.quantity.normalize();
+    }
+    canonical_usage.sort_by(|a, b| a.unit.cmp(&b.unit));
+    let details = json!({"usage_units":canonical_usage,"cost":cost,"price_version":snapshot.price_version,"pricing_basis":"configured_unit_price"});
+    // Compare the immutable usage evidence as well as the rounded amount on replay.
+    let mut tx = pool.begin().await?;
+    lock_accounts(&mut tx, who).await?;
+    let row = sqlx::query_as::<_, Reservation>(&format!(
+        "SELECT {COLUMNS} FROM requests WHERE tenant_id=$1 AND key_id=$2 AND id=$3 FOR UPDATE"
+    ))
+    .bind(who.tenant_id)
+    .bind(who.key_id)
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if row.status == "succeeded" {
+        let previous: Value = sqlx::query_scalar("SELECT details FROM ledger_entries WHERE tenant_id=$1 AND request_id=$2 AND kind='finalize'")
+            .bind(who.tenant_id).bind(id).fetch_one(&mut *tx).await?;
+        if previous != details {
+            return Err(Error::Conflict);
+        }
+    }
+    finish_locked(&mut tx, who, &row, cost.cny_micros, None, details).await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 pub async fn release_unsubmitted(pool: &PgPool, who: &Identity, id: Uuid) -> Result<()> {
