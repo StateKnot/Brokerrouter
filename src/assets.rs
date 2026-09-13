@@ -444,6 +444,17 @@ impl Assets {
         tx.commit().await?;
         Ok(data)
     }
+    // Callers must enforce their own scanner/reviewer/delivery authority before and after I/O.
+    // Never exposed by the generic input asset routes.
+    pub(crate) async fn quarantined_chunk(
+        &self,
+        who: &Identity,
+        id: Uuid,
+        ordinal: i32,
+    ) -> Result<Bytes> {
+        let c:Chunk=sqlx::query_as("SELECT c.* FROM asset_chunks c JOIN assets a ON a.tenant_id=c.tenant_id AND a.id=c.asset_id WHERE a.tenant_id=$1 AND a.key_id=$2 AND a.id=$3 AND a.kind='output' AND a.state='available' AND a.expires_at>clock_timestamp() AND c.ordinal=$4").bind(who.tenant_id).bind(who.key_id).bind(id).bind(ordinal).fetch_optional(&self.pool).await?.ok_or(Error::NotFound)?;
+        self.read_chunk(&c).await
+    }
     pub async fn delete(&self, who: &Identity, id: Uuid) -> Result<Value> {
         let mut tx = self.pool.begin().await?;
         authorize(&mut tx, who).await?;

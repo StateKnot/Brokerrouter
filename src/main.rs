@@ -16,6 +16,36 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Migrate,
+    ServeOutputScans {
+        #[arg(long, default_value = "127.0.0.1:8084")]
+        bind: SocketAddr,
+    },
+    OutputScanProfilePublish {
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+    OutputScanProfileDisable {
+        #[arg(long)]
+        tenant: Uuid,
+        #[arg(long)]
+        id: Uuid,
+    },
+    OutputScannerTokenCreate {
+        #[arg(long)]
+        tenant: Uuid,
+        #[arg(long)]
+        profile: Uuid,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        expires_at: DateTime<Utc>,
+    },
+    OutputScannerTokenRevoke {
+        #[arg(long)]
+        tenant: Uuid,
+        #[arg(long)]
+        id: Uuid,
+    },
     ServeMedia {
         #[arg(long, default_value = "127.0.0.1:8083")]
         bind: SocketAddr,
@@ -229,6 +259,55 @@ async fn main() -> anyhow::Result<()> {
         anyhow::anyhow!("database connection failed; verify DATABASE_URL and network")
     })?;
     match cli.command {
+        Command::OutputScanProfilePublish { file } => {
+            brokerrouter::output_scans::publish(
+                &pool,
+                serde_json::from_str(&std::fs::read_to_string(file)?)?,
+            )
+            .await?
+        }
+        Command::OutputScanProfileDisable { tenant, id } => {
+            brokerrouter::output_scans::disable(&pool, tenant, id).await?
+        }
+        Command::OutputScannerTokenCreate {
+            tenant,
+            profile,
+            name,
+            expires_at,
+        } => {
+            let (id, token) =
+                brokerrouter::output_scans::create_token(&pool, tenant, profile, &name, expires_at)
+                    .await?;
+            println!(
+                "{}",
+                serde_json::json!({"id":id,"token":token,"notice":"Shown once. Store only in the isolated scanner secret store, never in an Agent environment."})
+            );
+        }
+        Command::OutputScannerTokenRevoke { tenant, id } => {
+            brokerrouter::output_scans::revoke_token(&pool, tenant, id).await?
+        }
+        Command::ServeOutputScans { bind } => {
+            brokerrouter::check_schema(&pool).await?;
+            let scans = brokerrouter::output_scans::Scans::new(
+                brokerrouter::assets::Assets::from_env(pool.clone())?,
+            );
+            let worker = scans.clone();
+            let maintenance = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    if worker.maintain().await.is_err() {
+                        tracing::error!("output scan maintenance failed");
+                    }
+                }
+            });
+            let listener = tokio::net::TcpListener::bind(bind).await?;
+            tracing::info!(address=%bind,"isolated scanner evidence API listening; never expose credentials to Agents");
+            axum::serve(listener, brokerrouter::output_scan_api::router(scans))
+                .with_graceful_shutdown(shutdown())
+                .await?;
+            maintenance.abort();
+        }
         Command::ServeControl { bind } => {
             brokerrouter::check_schema(&pool).await?;
             let control = brokerrouter::governance_api::Control {

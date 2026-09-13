@@ -51,6 +51,10 @@ pub enum Error {
     PolicyChanged,
     #[error("valid request-bound human attestation required")]
     HumanUnauthorized,
+    #[error("active purpose-scoped scanner credential required")]
+    ScannerUnauthorized,
+    #[error("scan lease expired, superseded or closed")]
+    ScanLeaseEnded,
     #[error("internal persistence failure")]
     Database(#[from] sqlx::Error),
 }
@@ -80,6 +84,8 @@ impl IntoResponse for Error {
             Self::ActionRejected => (StatusCode::CONFLICT, "action_rejected"),
             Self::PolicyChanged => (StatusCode::CONFLICT, "policy_changed"),
             Self::HumanUnauthorized => (StatusCode::UNAUTHORIZED, "invalid_human_attestation"),
+            Self::ScannerUnauthorized => (StatusCode::UNAUTHORIZED, "invalid_scanner_credential"),
+            Self::ScanLeaseEnded => (StatusCode::CONFLICT, "scan_lease_ended"),
             Self::Database(_) => (StatusCode::SERVICE_UNAVAILABLE, "persistence_unavailable"),
         };
         // Database errors can include sensitive query data. Log only the category.

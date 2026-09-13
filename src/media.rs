@@ -169,6 +169,10 @@ impl Media {
         if let Some((state, maximum, bytes, error)) = output {
             v["output_storage"] = json!({"state":state,"maximum_bytes":maximum,"byte_length":bytes,"error_code":error,"content_safety":"not_evaluated","delivery":"not_released"});
         }
+        let scan:Option<(i32,Option<String>,Option<Value>)>=sqlx::query_as("SELECT p.version,CASE WHEN x.expires_at<=clock_timestamp() THEN 'expired' ELSE x.state END,x.report FROM output_scan_profiles p JOIN requests r ON r.tenant_id=p.tenant_id AND r.model_id=p.model_id LEFT JOIN output_scans x ON x.tenant_id=r.tenant_id AND x.job_id=r.id AND x.profile_id=p.id WHERE r.tenant_id=$1 AND r.id=$2 AND p.active").bind(who.tenant_id).bind(id).fetch_optional(&mut *tx).await?;
+        if let Some((version, state, report)) = scan {
+            v["output_scan"] = json!({"profile_version":version,"state":state.unwrap_or_else(||"not_started".into()),"technical":report.as_ref().and_then(|r|r.get("technical")),"content":report.as_ref().and_then(|r|r.get("content")),"delivery":"not_released","approval":"not_granted"});
+        }
         let approval:Option<governance::Approval>=sqlx::query_as("SELECT a.* FROM approvals a JOIN governance_operations o ON o.tenant_id=a.tenant_id AND o.id=a.operation_id WHERE o.tenant_id=$1 AND o.key_id=$2 AND o.operation_key=$3 AND a.state='pending' ORDER BY a.expires_at DESC LIMIT 1")
             .bind(who.tenant_id).bind(who.key_id).bind(format!("media:{id}")).fetch_optional(&mut *tx).await?;
         if let Some(approval) = approval {

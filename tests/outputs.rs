@@ -723,6 +723,22 @@ async fn s3_output_import_quarantine_and_cleanup(pool: PgPool) {
     let o = Outputs::new(Assets::from_env(pool.clone()).unwrap(), common::cipher());
     o.tick().await.unwrap();
     assert_eq!(state(&pool, job).await, "quarantined");
+    let (_, scanner, _) = scanner(&pool, &f, 1).await;
+    let scans = Scans::new(o.assets.clone());
+    let task = scans
+        .claim(&scanner, Uuid::new_v4())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut data = Vec::new();
+    for n in 0..task["chunk_count"].as_i64().unwrap() as i32 {
+        data.extend_from_slice(&scans.chunk(&scanner, attempt_id(&task), n).await.unwrap());
+    }
+    assert_eq!(data.as_slice(), f.r.data.as_ref());
+    scans
+        .report(&scanner, attempt_id(&task), scan_report(&task))
+        .await
+        .unwrap();
     f.m.cancel(&f.who, job).await.unwrap();
     o.maintain().await.unwrap();
     let id = asset_id(&pool, job).await;
@@ -759,4 +775,517 @@ async fn output_origin_is_exact_and_frozen_endpoint_config_cannot_be_mutated(poo
     invalid.maximum_output_bytes = 0;
     assert!(invalid.validate_output_contract().is_err());
     assert!(sqlx::query("UPDATE media_endpoints SET config=jsonb_set(config,'{output_origins}','[\"https://attacker.example\"]')").execute(&pool).await.is_err());
+}
+
+use brokerrouter::output_scans::{self as scan, Report, Scanner, Scans};
+async fn scanner(pool: &PgPool, f: &Fixture, version: i32) -> (scan::Profile, Scanner, String) {
+    let profile = scan::Profile {
+        tenant_id: f.who.tenant_id,
+        id: Uuid::new_v4(),
+        model_id: f.e.model_id.clone(),
+        version,
+        engine_revision: common::hex(&store::hash(
+            format!("fixture-contract-v{version}").as_bytes(),
+        )),
+    };
+    scan::publish(pool, profile.clone()).await.unwrap();
+    let (_, token) = scan::create_token(
+        pool,
+        f.who.tenant_id,
+        profile.id,
+        "isolated fixture",
+        chrono::Utc::now() + chrono::Duration::hours(1),
+    )
+    .await
+    .unwrap();
+    let who = scan::authenticate(pool, &token).await.unwrap();
+    (profile, who, token)
+}
+fn scan_report(v: &Value) -> Report {
+    // Synthetic attestations exercise the gateway contract, not malware/format detection quality.
+    serde_json::from_value(json!({"sha256":v["sha256"],"byte_length":v["byte_length"],"profile_version":v["profile_version"],"engine_revision":v["engine_revision"],"technical":"clean","content":"risk","media_type":"video/mp4","reason_codes":["fixture_risk"],"evidence_sha256":"a".repeat(64),"scanned_at":chrono::Utc::now()})).unwrap()
+}
+fn attempt_id(v: &Value) -> Uuid {
+    serde_json::from_value(v["attempt_id"].clone()).unwrap()
+}
+async fn expire_scan_attempt(pool: &PgPool, id: Uuid) {
+    // Time travel only in this isolated test database; production cannot rewrite attempt facts.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("ALTER TABLE output_scan_attempts DISABLE TRIGGER output_scan_attempt_immutable")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE output_scan_attempts SET created_at=clock_timestamp()-interval '10 minutes',lease_until=clock_timestamp()-interval '1 second',deadline=clock_timestamp()+interval '10 minutes' WHERE id=$1").bind(id).execute(&mut *tx).await.unwrap();
+    sqlx::query("ALTER TABLE output_scan_attempts ENABLE TRIGGER output_scan_attempt_immutable")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn scanner_claim_read_receipt_is_durable_and_never_grants_delivery(pool: PgPool) {
+    let f = setup(&pool).await;
+    let job = generate(&f, &pool, None).await;
+    f.o.tick().await.unwrap();
+    let (_, who, _) = scanner(&pool, &f, 1).await;
+    let s = Scans::new(f.o.assets.clone());
+    let claim = Uuid::new_v4();
+    let v = s.claim(&who, claim).await.unwrap().unwrap();
+    let id = attempt_id(&v);
+    assert_eq!(s.claim(&who, claim).await.unwrap().unwrap(), v);
+    let mut bytes = Vec::new();
+    for n in 0..v["chunk_count"].as_i64().unwrap() as i32 {
+        bytes.extend_from_slice(&s.chunk(&who, id, n).await.unwrap());
+    }
+    assert_eq!(bytes.as_slice(), f.r.data.as_ref());
+    assert_eq!(common::hex(&store::hash(&bytes)), v["sha256"]);
+    let report = scan_report(&v);
+    let done = s.report(&who, id, report.clone()).await.unwrap();
+    assert_eq!(done["state"], "complete");
+    assert_eq!(done["delivery"], "not_released");
+    assert_eq!(done["approval"], "not_granted");
+    assert_eq!(s.report(&who, id, report).await.unwrap(), done);
+    assert!(s.chunk(&who, id, 0).await.is_err());
+    assert!(s.renew(&who, id).await.is_err());
+    let status = f.m.get(&f.who, job).await.unwrap();
+    assert_eq!(status["output_scan"]["content"], "risk");
+    assert_eq!(status["artifacts"], json!([]));
+    assert_eq!(status["state"], "output_pending");
+    assert!(
+        f.o.assets
+            .content_chunk(&f.who, asset_id(&pool, job).await, 0)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM guardrail_grants")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM audit_events WHERE action='output_scan.report_recorded'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(balances(&pool, &f.who).await.0, 500000);
+    assert_eq!(f.r.posts.load(Ordering::SeqCst), 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn scanner_concurrent_claims_have_one_persistent_owner(pool: PgPool) {
+    let f = setup(&pool).await;
+    generate(&f, &pool, None).await;
+    f.o.tick().await.unwrap();
+    let (_, who, _) = scanner(&pool, &f, 1).await;
+    let s = Scans::new(f.o.assets.clone());
+    let key = Uuid::new_v4();
+    let (a, b) = tokio::join!(s.claim(&who, key), s.claim(&who, key));
+    assert_eq!(a.unwrap(), b.unwrap());
+    assert!(s.claim(&who, Uuid::new_v4()).await.unwrap().is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM output_scan_attempts")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>("SELECT attempts FROM output_scans")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn scanner_stale_owner_cannot_read_renew_or_publish_and_retries_are_bounded(pool: PgPool) {
+    let f = setup(&pool).await;
+    generate(&f, &pool, None).await;
+    f.o.tick().await.unwrap();
+    let (_, who, _) = scanner(&pool, &f, 1).await;
+    let s = Scans::new(f.o.assets.clone());
+    let old_claim = Uuid::new_v4();
+    let first = s.claim(&who, old_claim).await.unwrap().unwrap();
+    let old = attempt_id(&first);
+    expire_scan_attempt(&pool, old).await;
+    assert!(s.claim(&who, old_claim).await.is_err());
+    let second = s.claim(&who, Uuid::new_v4()).await.unwrap().unwrap();
+    assert_ne!(attempt_id(&second), old);
+    assert_eq!(second["scan_id"], first["scan_id"]);
+    assert!(s.chunk(&who, old, 0).await.is_err());
+    assert!(s.renew(&who, old).await.is_err());
+    assert!(s.report(&who, old, scan_report(&first)).await.is_err());
+    expire_scan_attempt(&pool, attempt_id(&second)).await;
+    let third = s.claim(&who, Uuid::new_v4()).await.unwrap().unwrap();
+    expire_scan_attempt(&pool, attempt_id(&third)).await;
+    assert!(s.claim(&who, Uuid::new_v4()).await.unwrap().is_none());
+    s.maintain().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM output_scans")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "closed"
+    );
+    assert_eq!(f.r.posts.load(Ordering::SeqCst), 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn scanner_receipt_must_bind_exact_bytes_profile_revision_and_strict_outcomes(pool: PgPool) {
+    let f = setup(&pool).await;
+    generate(&f, &pool, None).await;
+    f.o.tick().await.unwrap();
+    let (_, who, _) = scanner(&pool, &f, 1).await;
+    let s = Scans::new(f.o.assets.clone());
+    let v = s.claim(&who, Uuid::new_v4()).await.unwrap().unwrap();
+    let id = attempt_id(&v);
+    for (field, value) in [
+        ("sha256", json!("0".repeat(64))),
+        ("byte_length", json!(1)),
+        ("profile_version", json!(2)),
+        ("engine_revision", json!("unknown")),
+        ("evidence_sha256", json!("https://private.example")),
+        ("media_type", json!("text/html")),
+        ("reason_codes", json!(["untrusted text, not code"])),
+        ("scanned_at", json!("2000-01-01T00:00:00Z")),
+    ] {
+        let mut data = serde_json::to_value(scan_report(&v)).unwrap();
+        data[field] = value;
+        assert!(
+            s.report(&who, id, serde_json::from_value(data).unwrap())
+                .await
+                .is_err(),
+            "{field}"
+        );
+    }
+    let mut r = scan_report(&v);
+    r.technical = scan::Technical::Unsafe;
+    assert!(s.report(&who, id, r.clone()).await.is_err());
+    r.content = scan::Content::Unknown;
+    r.media_type = None;
+    let done = s.report(&who, id, r.clone()).await.unwrap();
+    assert_eq!(done["report"]["technical"], "unsafe");
+    r.reason_codes = vec!["other".into()];
+    assert!(matches!(s.report(&who, id, r).await, Err(Error::Conflict)));
+    let mut bad = serde_json::to_value(scan_report(&v)).unwrap();
+    bad["approved"] = json!(true);
+    assert!(serde_json::from_value::<Report>(bad).is_err());
+    assert!(
+        sqlx::query("UPDATE output_scans SET report='{}'")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn scanner_credential_rotation_and_profile_upgrade_fence_prior_work(pool: PgPool) {
+    let f = setup(&pool).await;
+    generate(&f, &pool, None).await;
+    f.o.tick().await.unwrap();
+    let (p, who, token) = scanner(&pool, &f, 1).await;
+    let s = Scans::new(f.o.assets.clone());
+    let old = s.claim(&who, Uuid::new_v4()).await.unwrap().unwrap();
+    let renewed = s.renew(&who, attempt_id(&old)).await.unwrap();
+    assert_eq!(renewed["deadline"], old["deadline"]);
+    let (_, peer_token) = scan::create_token(
+        &pool,
+        f.who.tenant_id,
+        p.id,
+        "peer",
+        chrono::Utc::now() + chrono::Duration::hours(1),
+    )
+    .await
+    .unwrap();
+    let peer = scan::authenticate(&pool, &peer_token).await.unwrap();
+    assert!(s.chunk(&peer, attempt_id(&old), 0).await.is_err());
+    assert!(s.claim(&peer, Uuid::new_v4()).await.unwrap().is_none());
+    let id: Uuid = sqlx::query_scalar("SELECT id FROM output_scanner_tokens WHERE token_hash=$1")
+        .bind(store::hash(token.as_bytes()))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    scan::revoke_token(&pool, f.who.tenant_id, id)
+        .await
+        .unwrap();
+    assert!(scan::authenticate(&pool, &token).await.is_err());
+    assert!(s.chunk(&who, attempt_id(&old), 0).await.is_err());
+    let (_, new_token) = scan::create_token(
+        &pool,
+        f.who.tenant_id,
+        p.id,
+        "rotated",
+        chrono::Utc::now() + chrono::Duration::hours(1),
+    )
+    .await
+    .unwrap();
+    let who2 = scan::authenticate(&pool, &new_token).await.unwrap();
+    let new = s.claim(&who2, Uuid::new_v4()).await.unwrap().unwrap();
+    assert_eq!(new["scan_id"], old["scan_id"]);
+    let (_, who3, _) = scanner(&pool, &f, 2).await;
+    assert!(s.chunk(&who2, attempt_id(&new), 0).await.is_err());
+    let latest = s.claim(&who3, Uuid::new_v4()).await.unwrap().unwrap();
+    assert_eq!(latest["profile_version"], 2);
+    assert_ne!(latest["scan_id"], new["scan_id"]);
+    assert!(
+        s.report(&who3, attempt_id(&latest), scan_report(&new))
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE output_scan_profiles SET active=true WHERE id=$1")
+            .bind(p.id)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn scanner_cancellation_key_and_turn_revocation_stop_reads_and_keep_model_cost(pool: PgPool) {
+    for mode in 0..3 {
+        let f = setup(&pool).await;
+        let turn = if mode == 2 {
+            common::provision(&pool, &f.who, "scan-user").await;
+            Some(common::turn(&pool, &f.who, "scan-user", 0).await)
+        } else {
+            None
+        };
+        let job = generate(&f, &pool, turn).await;
+        f.o.tick().await.unwrap();
+        let (_, who, _) = scanner(&pool, &f, 1).await;
+        let s = Scans::new(f.o.assets.clone());
+        let v = s.claim(&who, Uuid::new_v4()).await.unwrap().unwrap();
+        let id = attempt_id(&v);
+        assert_eq!(s.chunk(&who, id, 0).await.unwrap().len(), CHUNK_BYTES);
+        match mode {
+            0 => {
+                f.m.cancel(&f.who, job).await.unwrap();
+            }
+            1 => {
+                store::revoke_key(&pool, f.who.tenant_id, f.who.key_id)
+                    .await
+                    .unwrap();
+            }
+            _ => {
+                brokerrouter::governance::close_runtime(&pool, &f.who, turn.unwrap(), "completed")
+                    .await
+                    .unwrap();
+            }
+        }
+        assert!(s.chunk(&who, id, 1).await.is_err());
+        assert!(s.report(&who, id, scan_report(&v)).await.is_err());
+        s.maintain().await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT state FROM output_scans WHERE id=$1")
+                .bind(serde_json::from_value::<Uuid>(v["scan_id"].clone()).unwrap())
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            "closed"
+        );
+        assert_eq!(balances(&pool, &f.who).await.0, 500000);
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn scanner_report_transaction_failure_recovers_without_new_generation(pool: PgPool) {
+    let f = setup(&pool).await;
+    generate(&f, &pool, None).await;
+    f.o.tick().await.unwrap();
+    let (_, who, _) = scanner(&pool, &f, 1).await;
+    let s = Scans::new(f.o.assets.clone());
+    let v = s.claim(&who, Uuid::new_v4()).await.unwrap().unwrap();
+    let r = scan_report(&v);
+    sqlx::raw_sql("CREATE FUNCTION fail_scan_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action='output_scan.report_recorded' THEN RAISE EXCEPTION 'injected'; END IF; RETURN NEW; END; $$; CREATE TRIGGER injected_scan BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION fail_scan_audit();").execute(&pool).await.unwrap();
+    assert!(s.report(&who, attempt_id(&v), r.clone()).await.is_err());
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM output_scans")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "scanning"
+    );
+    sqlx::query("DROP TRIGGER injected_scan ON audit_events")
+        .execute(&pool)
+        .await
+        .unwrap();
+    s.report(&who, attempt_id(&v), r).await.unwrap();
+    assert_eq!(f.r.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM output_scan_attempts")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn scanner_actual_database_role_cannot_read_inputs_change_money_or_approve(pool: PgPool) {
+    let f = setup(&pool).await;
+    generate(&f, &pool, None).await;
+    f.o.tick().await.unwrap();
+    let (_, who, _) = scanner(&pool, &f, 1).await;
+    let input =
+        f.o.assets
+            .create(
+                &f.who,
+                "scan-hidden-input",
+                assets::CreateAsset {
+                    byte_length: 1,
+                    sha256: common::hex(&store::hash(b"a")),
+                    media_type: "application/octet-stream".into(),
+                    ttl_seconds: 60,
+                },
+            )
+            .await
+            .unwrap();
+    sqlx::raw_sql(include_str!("../deploy/permissions.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let p = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(3)
+        .after_connect(|c, _| {
+            Box::pin(async move {
+                sqlx::query("SET SESSION AUTHORIZATION brokerrouter_output_scan")
+                    .execute(c)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let s = Scans::new(Assets::new(p.clone(), f.objects.clone(), common::cipher(), 2).unwrap());
+    let v = s.claim(&who, Uuid::new_v4()).await.unwrap().unwrap();
+    s.chunk(&who, attempt_id(&v), 0).await.unwrap();
+    s.renew(&who, attempt_id(&v)).await.unwrap();
+    s.report(&who, attempt_id(&v), scan_report(&v))
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM assets WHERE id=$1")
+            .bind(serde_json::from_value::<Uuid>(input["id"].clone()).unwrap())
+            .fetch_one(&p)
+            .await
+            .unwrap(),
+        0
+    );
+    for q in [
+        "UPDATE tenants SET spent_micros=0",
+        "UPDATE tenants SET asset_used_bytes=0",
+        "UPDATE virtual_keys SET budget_micros=0",
+        "UPDATE approvals SET state='approved'",
+        "UPDATE media_jobs SET cancel_requested=true",
+        "UPDATE assets SET state='deleted'",
+        "UPDATE output_scan_profiles SET active=false",
+        "UPDATE output_scanner_tokens SET revoked_at=NULL",
+        "SET ROLE brokerrouter_assets",
+        "SET ROLE brokerrouter_media_outputs",
+        "SET ROLE brokerrouter_runtime",
+        "SET ROLE brokerrouter_governance_control",
+    ] {
+        assert!(sqlx::query(q).execute(&p).await.is_err(), "{q}");
+    }
+    s.maintain().await.unwrap();
+    p.close().await;
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn scanner_http_auth_scope_and_binary_boundary_are_enforced(pool: PgPool) {
+    let f = setup(&pool).await;
+    let job = generate(&f, &pool, None).await;
+    f.o.tick().await.unwrap();
+    let (_, who, token) = scanner(&pool, &f, 1).await;
+    let other = setup(&pool).await;
+    let (_, who2, token2) = scanner(&pool, &other, 1).await;
+    let s = Scans::new(f.o.assets.clone());
+    assert!(s.claim(&who2, Uuid::new_v4()).await.unwrap().is_none());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let root = format!("http://{}", listener.local_addr().unwrap());
+    let app = brokerrouter::output_scan_api::router(s.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    for credential in [&f.key, "not-a-credential"] {
+        assert_eq!(
+            client
+                .post(format!("{root}/v1/output-scans/claim"))
+                .bearer_auth(credential)
+                .json(&json!({"claim_id":Uuid::new_v4()}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert!(store::authenticate(&pool, &token).await.is_err());
+    let v: Value = client
+        .post(format!("{root}/v1/output-scans/claim"))
+        .bearer_auth(&token)
+        .json(&json!({"claim_id":Uuid::new_v4()}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = attempt_id(&v);
+    let url = format!("{root}/v1/output-scans/attempts/{id}/chunks/0");
+    assert_eq!(
+        client
+            .get(&url)
+            .bearer_auth(&token2)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        client
+            .get(&url)
+            .bearer_auth(&token)
+            .header("range", "bytes=0-1")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let r = client.get(&url).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.headers()["content-type"], "application/octet-stream");
+    assert_eq!(r.headers()["cache-control"], "private, no-store");
+    assert_eq!(r.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(r.bytes().await.unwrap(), f.r.data.slice(..CHUNK_BYTES));
+    assert!(s.chunk(&who, id, -1).await.is_err());
+    assert!(s.chunk(&who, id, 999).await.is_err());
+    let mut r = serde_json::to_value(scan_report(&v)).unwrap();
+    r["approved"] = json!(true);
+    assert_eq!(
+        client
+            .post(format!("{root}/v1/output-scans/attempts/{id}/report"))
+            .bearer_auth(&token)
+            .json(&r)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(f.m.get(&f.who, job).await.unwrap()["artifacts"], json!([]));
+    server.abort();
 }

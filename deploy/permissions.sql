@@ -119,4 +119,22 @@ DROP POLICY IF EXISTS brokerrouter_chunk_purpose ON asset_chunks;
 CREATE POLICY brokerrouter_chunk_purpose ON asset_chunks AS RESTRICTIVE TO brokerrouter_assets,brokerrouter_media_outputs
     USING(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id AND a.id=asset_chunks.asset_id))
     WITH CHECK(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id AND a.id=asset_chunks.asset_id));
+DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_output_scan') THEN CREATE ROLE brokerrouter_output_scan NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION; END IF; END $$;
+GRANT USAGE ON SCHEMA public TO brokerrouter_output_scan;
+GRANT SELECT ON output_scan_profiles,output_scanner_tokens,output_scans,output_scan_attempts TO brokerrouter_output_scan,brokerrouter_operator;
+GRANT SELECT ON output_scan_profiles,output_scans TO brokerrouter_runtime;
+GRANT INSERT ON output_scan_profiles,output_scanner_tokens TO brokerrouter_operator;
+GRANT UPDATE(active) ON output_scan_profiles TO brokerrouter_operator;
+GRANT UPDATE(revoked_at) ON output_scanner_tokens TO brokerrouter_operator;
+GRANT SELECT ON _sqlx_migrations,tenants,virtual_keys,models,key_models,requests,media_jobs,media_output_imports,assets,asset_chunks,governance_turns,runtime_bindings,governance_users TO brokerrouter_output_scan;
+GRANT UPDATE(governance_lock) ON tenants TO brokerrouter_output_scan;
+GRANT INSERT ON output_scans,output_scan_attempts,audit_events TO brokerrouter_output_scan;
+GRANT UPDATE(state,current_attempt,attempts,report,report_hash,finished_at) ON output_scans TO brokerrouter_output_scan;
+GRANT UPDATE(lease_until) ON output_scan_attempts TO brokerrouter_output_scan;
+GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_output_scan;
+DROP POLICY IF EXISTS brokerrouter_scan_asset_read ON assets;
+CREATE POLICY brokerrouter_scan_asset_read ON assets FOR SELECT TO brokerrouter_output_scan USING(kind='output');
+DROP POLICY IF EXISTS brokerrouter_scan_chunk_read ON asset_chunks;
+CREATE POLICY brokerrouter_scan_chunk_read ON asset_chunks FOR SELECT TO brokerrouter_output_scan
+    USING(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id AND a.id=asset_chunks.asset_id AND a.kind='output'));
 COMMIT;
