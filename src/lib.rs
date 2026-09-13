@@ -19,6 +19,8 @@ pub mod output_scan_api;
 pub mod output_scans;
 pub mod outputs;
 pub mod protocol;
+pub mod scanner_engine;
+pub mod scanner_worker;
 pub mod store;
 
 use sqlx::{PgPool, postgres::PgPoolOptions};

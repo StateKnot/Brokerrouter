@@ -1,4 +1,5 @@
 mod common;
+mod detector;
 use axum::{
     Json, Router,
     body::Body,
@@ -149,6 +150,9 @@ fn media_service(pool: &PgPool) -> Media {
     .unwrap()
 }
 async fn setup(pool: &PgPool) -> Fixture {
+    setup_data(pool, Bytes::from(vec![63; CHUNK_BYTES + 173])).await
+}
+async fn setup_data(pool: &PgPool, data: Bytes) -> Fixture {
     let tenant = store::create_tenant(pool, "output", 100_000_000)
         .await
         .unwrap();
@@ -179,7 +183,7 @@ async fn setup(pool: &PgPool) -> Fixture {
     let root = format!("http://{}", listener.local_addr().unwrap());
     let r = Remote {
         root: root.clone(),
-        data: Bytes::from(vec![63; CHUNK_BYTES + 173]),
+        data,
         gets: Arc::new(AtomicUsize::new(0)),
         posts: Arc::new(AtomicUsize::new(0)),
         mode: Arc::new(AtomicUsize::new(0)),
@@ -1288,4 +1292,192 @@ async fn scanner_http_auth_scope_and_binary_boundary_are_enforced(pool: PgPool) 
     );
     assert_eq!(f.m.get(&f.who, job).await.unwrap()["artifacts"], json!([]));
     server.abort();
+}
+
+async fn worker_setup(
+    pool: &PgPool,
+    f: &Fixture,
+    local: &mut detector::Local,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let p = scan::Profile {
+        tenant_id: f.who.tenant_id,
+        id: Uuid::new_v4(),
+        model_id: "video/output".into(),
+        version: 1,
+        engine_revision: local.config.manifest.revision().unwrap(),
+    };
+    scan::publish(pool, p.clone()).await.unwrap();
+    let (_, token) = scan::create_token(
+        pool,
+        p.tenant_id,
+        p.id,
+        "worker fixture",
+        chrono::Utc::now() + chrono::Duration::days(1),
+    )
+    .await
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    local.config.api_origin = format!("http://{}/", listener.local_addr().unwrap());
+    let app = brokerrouter::output_scan_api::router(Scans::new(f.o.assets.clone()));
+    (
+        token,
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+    )
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn detector_worker_durable_receipt_survives_report_failure_without_rescanning(pool: PgPool) {
+    use brokerrouter::scanner_worker::Worker;
+    let f = setup(&pool).await;
+    let job = generate(&f, &pool, None).await;
+    f.o.tick().await.unwrap();
+    let mut local = detector::Local::new("http://127.0.0.1/".into(), false);
+    let (token, server) = worker_setup(&pool, &f, &mut local).await;
+    let worker = Worker::new(local.config.clone(), token.clone()).unwrap();
+    worker.preflight().await.unwrap();
+    assert!(Worker::new(local.config.clone(), token.clone()).is_err());
+    sqlx::raw_sql("CREATE FUNCTION reject_worker_report() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.state='complete' THEN RAISE EXCEPTION 'fixture commit failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER reject_worker_report BEFORE UPDATE ON output_scans FOR EACH ROW EXECUTE FUNCTION reject_worker_report();").execute(&pool).await.unwrap();
+    assert!(worker.once().await.is_err());
+    assert_eq!(local.executions(), 3);
+    assert!(!local.config.work_dir.join("input").exists());
+    assert!(local.config.work_dir.join("active.json").exists());
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM output_scans WHERE state='complete'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    drop(worker);
+    sqlx::raw_sql("DROP TRIGGER reject_worker_report ON output_scans")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let restarted = Worker::new(local.config.clone(), token).unwrap();
+    assert_eq!(restarted.once().await.unwrap()["state"], "complete");
+    assert_eq!(
+        local.executions(),
+        3,
+        "receipt retry must not repeat decoder/AV work"
+    );
+    assert!(!local.config.work_dir.join("active.json").exists());
+    let report: Value = sqlx::query_scalar("SELECT report FROM output_scans WHERE job_id=$1")
+        .bind(job)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(report["technical"], "clean"); // Synthetic process fixture, not the real engine test.
+    assert_eq!(report["content"], "unknown");
+    assert_eq!(report["reason_codes"], json!(["semantic_not_run"]));
+    assert_eq!(f.m.get(&f.who, job).await.unwrap()["artifacts"], json!([]));
+    assert_eq!(f.r.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(restarted.once().await.unwrap()["state"], "idle");
+    server.abort();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn detector_worker_rejects_manifest_drift_revocation_and_nonprivate_storage(pool: PgPool) {
+    use brokerrouter::scanner_worker::Worker;
+    use std::os::unix::fs::PermissionsExt;
+    let f = setup(&pool).await;
+    generate(&f, &pool, None).await;
+    f.o.tick().await.unwrap();
+    let mut local = detector::Local::new("http://127.0.0.1/".into(), false);
+    let (token, server) = worker_setup(&pool, &f, &mut local).await;
+    let mut altered = local.config.clone();
+    altered.manifest.expires_at += chrono::Duration::seconds(1);
+    let worker = Worker::new(altered, token.clone()).unwrap();
+    assert!(worker.once().await.is_err());
+    assert_eq!(local.executions(), 0);
+    assert!(!local.config.work_dir.join("input").exists());
+    drop(worker);
+    store::revoke_key(&pool, f.who.tenant_id, f.who.key_id)
+        .await
+        .unwrap();
+    let worker = Worker::new(local.config.clone(), token.clone()).unwrap();
+    assert_eq!(worker.once().await.unwrap()["state"], "attempt_closed");
+    assert_eq!(local.executions(), 0);
+    drop(worker);
+    let mut c = local.config.clone();
+    c.api_origin = "http://example.org/".into();
+    assert!(Worker::new(c, token.clone()).is_err());
+    assert!(Worker::new(local.config.clone(), f.key.clone()).is_err());
+    std::fs::set_permissions(
+        &local.config.work_dir,
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    assert!(Worker::new(local.config.clone(), token).is_err());
+    server.abort();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "requires pinned local ClamAV/FFmpeg detector image; CI explicitly runs this"]
+async fn isolated_detector_real_engines_scan_valid_video_and_keep_output_quarantined(pool: PgPool) {
+    use brokerrouter::scanner_worker::Worker;
+    let mut local = detector::Local::new("http://127.0.0.1/".into(), true);
+    local.engine().preflight().await.unwrap();
+    let video = local.video().await;
+    let f = setup_data(&pool, Bytes::from(video)).await;
+    let job = generate(&f, &pool, None).await;
+    f.o.tick().await.unwrap();
+    let (token, server) = worker_setup(&pool, &f, &mut local).await;
+    let worker = Worker::new(local.config.clone(), token).unwrap();
+    let result = worker.once().await.unwrap();
+    assert_eq!(result["technical"], "clean", "{result}");
+    assert_eq!(result["content"], "unknown");
+    assert_eq!(result["delivery"], "not_released");
+    let report: Value = sqlx::query_scalar("SELECT report FROM output_scans WHERE job_id=$1")
+        .bind(job)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let evidence = std::fs::read(local.config.work_dir.join(format!(
+        "evidence-{}.json",
+        report["evidence_sha256"].as_str().unwrap()
+    )))
+    .unwrap();
+    let evidence: Value = serde_json::from_slice(&evidence).unwrap();
+    assert_eq!(evidence["steps"].as_array().unwrap().len(), 3);
+    assert_eq!(f.m.get(&f.who, job).await.unwrap()["artifacts"], json!([]));
+    assert_eq!(f.r.posts.load(Ordering::SeqCst), 1);
+    assert!(!local.config.work_dir.join("input").exists());
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires pinned local ClamAV/FFmpeg detector image; CI explicitly runs this"]
+async fn isolated_detector_real_antivirus_and_malformed_media_are_not_clean() {
+    use std::os::unix::fs::PermissionsExt;
+    let local = detector::Local::new("http://127.0.0.1/".into(), true);
+    let input = local.config.work_dir.join("input");
+    std::fs::create_dir(&input).unwrap();
+    std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(input.join("asset"), b"BROKERROUTER-HARMLESS-AV-TEST-MARKER").unwrap();
+    std::fs::set_permissions(input.join("asset"), std::fs::Permissions::from_mode(0o444)).unwrap();
+    let engine = local.engine();
+    let av = engine
+        .step(Uuid::new_v4(), &input, "antivirus")
+        .await
+        .unwrap();
+    assert_eq!(av["outcome"], "unsafe", "{av}");
+    assert!(
+        brokerrouter::scanner_engine::finding(&[av])
+            .unwrap()
+            .technical
+            == scan::Technical::Unsafe
+    );
+    std::fs::remove_file(input.join("asset")).unwrap();
+    std::fs::write(
+        input.join("asset"),
+        b"not an MP4, despite any filename or claimed MIME",
+    )
+    .unwrap();
+    std::fs::set_permissions(input.join("asset"), std::fs::Permissions::from_mode(0o444)).unwrap();
+    let probe = engine.step(Uuid::new_v4(), &input, "probe").await.unwrap();
+    assert_eq!(probe["outcome"], "unsupported", "{probe}");
+    let video = local.video().await;
+    std::fs::remove_file(input.join("asset")).unwrap();
+    std::fs::write(input.join("asset"), &video[..video.len() / 2]).unwrap();
+    std::fs::set_permissions(input.join("asset"), std::fs::Permissions::from_mode(0o444)).unwrap();
+    let corrupt = engine.step(Uuid::new_v4(), &input, "decode").await.unwrap();
+    assert_ne!(corrupt["outcome"], "passed", "{corrupt}");
 }

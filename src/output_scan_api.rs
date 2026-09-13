@@ -116,6 +116,7 @@ async fn chunk(
         .try_acquire_owned()
         .map_err(|_| Error::Busy)?;
     let bytes = s.chunk(&who, id, n).await?;
+    let length = bytes.len().to_string();
     // Hold bounded capacity until the response body is consumed or disconnected.
     let stream =
         futures_util::stream::try_unfold((Some(bytes), permit), |(bytes, permit)| async move {
@@ -123,8 +124,9 @@ async fn chunk(
         });
     Ok((
         [
-            ("content-type", "application/octet-stream"),
-            ("content-disposition", "attachment"),
+            ("content-type", "application/octet-stream".to_owned()),
+            ("content-disposition", "attachment".to_owned()),
+            ("content-length", length),
         ],
         Body::from_stream(stream),
     )

@@ -65,3 +65,5 @@ M4.2 已增加 [持久媒体作业](docs/m4-media-jobs.md)：`serve-media` 提�
 M4.3a 增加 [输出隔离转存](docs/m4-output-quarantine.md)：生成前原子预留存储容量、独立 `output-worker`、精确来源/强 ETag 校验、持久加密分块与取消清理，并用数据库 RLS 阻断旧输入资产接口读取输出。**转存成功仍不等于审核或交付**；二进制护栏与真人批准后下载继续在 M4.3b 实现。
 
 M4.3b 第一包增加 [扫描作业与证据链](docs/m4-output-scan-evidence.md)：独立 `serve-output-scans`、版本化检测清单摘要、租户/profile 专属扫描凭据、分块读取、持久租约与不可变回执。**完成回执不是人工批准，也不开放产物下载**；真实检测引擎适配、资产感知策略和真人审批交付仍待后续完成。
+
+M4.3b 第二包接入 [实际隔离技术检测器](docs/m4-isolated-detector.md)：独立 Rust `brokerrouter-scanner` 通过无网络、只读、有限资源的固定摘要镜像执行 ClamAV、FFprobe 与 FFmpeg 全流解码，持久化证据并支持失败恢复。**技术检测不替代语义合规**：`content` 始终为 unknown，产物仍不交付；资产策略、真人审阅与同轮审批交付继续开发，生产检测质量和部署认证仍是发布闸门。
