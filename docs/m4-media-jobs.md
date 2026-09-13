@@ -23,6 +23,8 @@
   "allow_private": false,
   "currency": "CNY",
   "priority": 10,
+  "maximum_output_bytes": 134217728,
+  "output_origins": ["https://provider-output.example"],
   "profiles": [
     {"resolution":"720P","aspect_ratio":"16:9","durations":[5,10],"price_per_second":"0.10"}
   ]
@@ -30,6 +32,8 @@
 ```
 
 每逻辑模型最多 100 个活跃媒体端点。按 priority 升序、UUID 稳定顺序选择首个完整满足参数组合的端点；弱端点不收窄其他端点的能力。整个作业固定端点、价格和 FX，不因重启或配置变化重新路由。版本不可修改/删除；更新需新增版本，并用 `media-endpoint-disable --tenant ... --id ...` 停用旧版本。已提交作业继续使用原版本查询。
+
+M4.3a 起，新准入同时要求输出容量和 origin 合同，上面的输出域名是待替换占位值；缺少输出合同的旧端点不参与新路由，旧已提交任务仍可核对费用。私有转存与专用 worker、数据库 RLS、升级顺序见 [输出隔离合同](m4-output-quarantine.md)。
 
 凭据只保存环境变量名称，不写入端点配置、事件或响应。新增凭据名称/轮换 Secret 后需滚动重启 worker，查询期限内保留原账号的查询能力。公开生产端点禁止 `allow_private=true`；该开关仅供经过审核的私网部署或隔离 fixture。请求逐次解析并固定 DNS IP，拒绝未允许私网、代理、重定向和客户端隐式重试。
 

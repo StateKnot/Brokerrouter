@@ -84,4 +84,39 @@ GRANT INSERT ON media_endpoints TO brokerrouter_operator;
 GRANT UPDATE(active) ON media_endpoints TO brokerrouter_operator;
 GRANT INSERT ON media_jobs,media_events TO brokerrouter_runtime;
 GRANT UPDATE(state,input_ciphertext,output_ciphertext,output_expires_at,provider_task_id,provider_status,cancel_requested,next_poll_at,lease_token,lease_until,event_clock,error_code) ON media_jobs TO brokerrouter_runtime;
+DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_media_outputs') THEN CREATE ROLE brokerrouter_media_outputs NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION; END IF; END $$;
+-- Separate purpose roles: inherited input membership would allow SET ROLE to bypass purpose RLS.
+REVOKE brokerrouter_assets FROM brokerrouter_media_outputs;
+GRANT USAGE ON SCHEMA public TO brokerrouter_media_outputs;
+GRANT SELECT ON _sqlx_migrations,tenants,virtual_keys,assets,asset_chunks TO brokerrouter_media_outputs;
+GRANT INSERT ON assets,asset_chunks,audit_events TO brokerrouter_media_outputs;
+GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_media_outputs;
+GRANT UPDATE(asset_used_bytes) ON tenants,virtual_keys TO brokerrouter_media_outputs;
+GRANT UPDATE(state,completed_at,deleted_at,gc_after,gc_checked_at,gc_cursor) ON assets TO brokerrouter_media_outputs;
+GRANT UPDATE(state) ON asset_chunks TO brokerrouter_media_outputs;
+GRANT SELECT ON media_output_imports TO brokerrouter_runtime,brokerrouter_operator,brokerrouter_media_outputs;
+GRANT SELECT ON assets TO brokerrouter_runtime;
+GRANT INSERT ON media_output_imports TO brokerrouter_runtime;
+GRANT UPDATE(reserved_bytes,state,error_code) ON media_output_imports TO brokerrouter_runtime;
+GRANT UPDATE(asset_used_bytes) ON tenants,virtual_keys TO brokerrouter_runtime;
+GRANT SELECT ON media_jobs,requests,governance_turns,runtime_bindings,governance_users TO brokerrouter_media_outputs;
+GRANT UPDATE(output_ciphertext) ON media_jobs TO brokerrouter_media_outputs;
+GRANT UPDATE(reserved_bytes,asset_id,source_etag,source_hash,state,error_code,lease_token,lease_until,next_attempt_at) ON media_output_imports TO brokerrouter_media_outputs;
+GRANT UPDATE(sha256) ON assets TO brokerrouter_media_outputs;
+DROP POLICY IF EXISTS brokerrouter_asset_metadata ON assets;
+CREATE POLICY brokerrouter_asset_metadata ON assets FOR SELECT TO brokerrouter_runtime,brokerrouter_operator USING(true);
+DROP POLICY IF EXISTS brokerrouter_asset_storage ON assets;
+CREATE POLICY brokerrouter_asset_storage ON assets TO brokerrouter_assets,brokerrouter_media_outputs USING(true) WITH CHECK(true);
+DROP POLICY IF EXISTS brokerrouter_asset_purpose ON assets;
+CREATE POLICY brokerrouter_asset_purpose ON assets AS RESTRICTIVE TO brokerrouter_assets,brokerrouter_media_outputs
+    USING(kind=CASE WHEN pg_has_role(current_user,'brokerrouter_media_outputs','MEMBER') THEN 'output' ELSE 'input' END)
+    WITH CHECK(kind=CASE WHEN pg_has_role(current_user,'brokerrouter_media_outputs','MEMBER') THEN 'output' ELSE 'input' END);
+DROP POLICY IF EXISTS brokerrouter_chunk_metadata ON asset_chunks;
+CREATE POLICY brokerrouter_chunk_metadata ON asset_chunks FOR SELECT TO brokerrouter_operator USING(true);
+DROP POLICY IF EXISTS brokerrouter_chunk_storage ON asset_chunks;
+CREATE POLICY brokerrouter_chunk_storage ON asset_chunks TO brokerrouter_assets,brokerrouter_media_outputs USING(true) WITH CHECK(true);
+DROP POLICY IF EXISTS brokerrouter_chunk_purpose ON asset_chunks;
+CREATE POLICY brokerrouter_chunk_purpose ON asset_chunks AS RESTRICTIVE TO brokerrouter_assets,brokerrouter_media_outputs
+    USING(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id AND a.id=asset_chunks.asset_id))
+    WITH CHECK(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id AND a.id=asset_chunks.asset_id));
 COMMIT;

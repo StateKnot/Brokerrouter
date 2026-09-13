@@ -24,6 +24,10 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         concurrency: usize,
     },
+    OutputWorker {
+        #[arg(long, default_value_t = 2)]
+        concurrency: usize,
+    },
     MediaEndpointAdd {
         #[arg(long)]
         file: std::path::PathBuf,
@@ -352,6 +356,45 @@ async fn main() -> anyhow::Result<()> {
             axum::serve(listener, brokerrouter::media_api::router(m))
                 .with_graceful_shutdown(shutdown())
                 .await?;
+        }
+        Command::OutputWorker { concurrency } => {
+            if !(1..=8).contains(&concurrency) {
+                anyhow::bail!("output concurrency must be 1..8");
+            }
+            brokerrouter::check_schema(&pool).await?;
+            let outputs = brokerrouter::outputs::Outputs::from_env(pool.clone())?;
+            let stop = tokio_util::sync::CancellationToken::new();
+            let mut workers = tokio::task::JoinSet::new();
+            for _ in 0..concurrency {
+                let (worker, stop) = (outputs.clone(), stop.clone());
+                workers.spawn(async move {
+                    while !stop.is_cancelled() {
+                        if !matches!(
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(630),
+                                worker.tick()
+                            )
+                            .await,
+                            Ok(Ok(_))
+                        ) {
+                            tracing::error!("output import pass failed; durable state retained");
+                        }
+                        tokio::select! {
+                            _ = stop.cancelled() => break,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                        }
+                    }
+                });
+            }
+            let failed = tokio::select! {
+                _ = shutdown() => false,
+                _ = workers.join_next() => true,
+            };
+            stop.cancel();
+            while workers.join_next().await.is_some() {}
+            if failed {
+                anyhow::bail!("output worker exited unexpectedly; restart with durable leases");
+            }
         }
         Command::MediaWorker { concurrency } => {
             if !(1..=16).contains(&concurrency) {

@@ -24,6 +24,8 @@ jobs:
           --health-retries 30
     env:
       DATABASE_URL: postgres://brokerrouter:test-only@localhost:5432/brokerrouter
+      # Each test retains its own explicit concurrent clients/workers; limit unrelated DB fixtures.
+      RUST_TEST_THREADS: "2"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
@@ -45,7 +47,9 @@ jobs:
           BROKERROUTER_ASSET_ALLOW_HTTP: "true"
           BROKERROUTER_ACTIVE_RESULT_KEY: test-v1
           BROKERROUTER_RESULT_KEYS: '{"test-v1":"1212121212121212121212121212121212121212121212121212121212121212"}'
-        run: cargo test --locked --test assets s3_conditional_write -- --ignored
+        run: |
+          cargo test --locked --test assets s3_conditional_write -- --ignored
+          cargo test --locked --test outputs s3_output_import -- --ignored
       - run: cargo build --release --locked
       - if: always()
         run: docker compose -f compose.test.yaml --profile assets rm -sf minio

@@ -1,4 +1,4 @@
-//! Immutable, chunk-encrypted private input assets. No provider URLs or public ACLs.
+//! Immutable, chunk-encrypted assets. Public APIs are input-only; outputs remain quarantined.
 use crate::{
     accounting,
     cipher::ResultCipher,
@@ -28,7 +28,8 @@ struct Asset {
     id: Uuid,
     key_id: Uuid,
     request_hash: Vec<u8>,
-    sha256: Vec<u8>,
+    sha256: Option<Vec<u8>>,
+    kind: String,
     byte_length: i64,
     declared_media_type: String,
     chunk_count: i32,
@@ -163,6 +164,7 @@ impl Assets {
     }
     pub async fn create(&self, who: &Identity, idem: &str, body: CreateAsset) -> Result<Value> {
         if !governance::valid_text(idem, 200)
+            || idem.starts_with("_br_output:")
             || !(1..=MAX_ASSET_BYTES).contains(&body.byte_length)
             || !(60..=2592000).contains(&body.ttl_seconds)
             || !valid_media_type(&body.media_type)
@@ -182,6 +184,7 @@ impl Assets {
         .fetch_optional(&mut *tx)
         .await?
         {
+            input_only(&a)?;
             if a.request_hash != hash {
                 return Err(Error::Conflict);
             }
@@ -212,6 +215,7 @@ impl Assets {
         let mut tx = self.pool.begin().await?;
         authorize(&mut tx, who).await?;
         let a = asset(&mut tx, who, id).await?;
+        input_only(&a)?;
         let chunks:Vec<(i32,String)>=sqlx::query_as("SELECT ordinal,state FROM asset_chunks WHERE tenant_id=$1 AND asset_id=$2 ORDER BY ordinal").bind(who.tenant_id).bind(id).fetch_all(&mut *tx).await?;
         let mut v = view(&a);
         v["chunks"] = json!(
@@ -230,6 +234,27 @@ impl Assets {
         ordinal: i32,
         bytes: Bytes,
     ) -> Result<Value> {
+        self.put_chunk_inner(who, id, ordinal, bytes, None).await
+    }
+    pub(crate) async fn put_generated_chunk(
+        &self,
+        who: &Identity,
+        id: Uuid,
+        ordinal: i32,
+        bytes: Bytes,
+        owner: Uuid,
+    ) -> Result<Value> {
+        self.put_chunk_inner(who, id, ordinal, bytes, Some(owner))
+            .await
+    }
+    async fn put_chunk_inner(
+        &self,
+        who: &Identity,
+        id: Uuid,
+        ordinal: i32,
+        bytes: Bytes,
+        owner: Option<Uuid>,
+    ) -> Result<Value> {
         if bytes.is_empty() || bytes.len() > CHUNK_BYTES {
             return Err(Error::Invalid("invalid asset chunk size"));
         }
@@ -237,6 +262,7 @@ impl Assets {
         let mut tx = self.pool.begin().await?;
         authorize(&mut tx, who).await?;
         let a = asset(&mut tx, who, id).await?;
+        write_authority(&mut tx, who, &a, owner).await?;
         writable(&a)?;
         if ordinal < 0
             || ordinal >= a.chunk_count
@@ -280,6 +306,7 @@ impl Assets {
         let mut tx = self.pool.begin().await?;
         authorize(&mut tx, who).await?;
         let current = asset(&mut tx, who, id).await?;
+        write_authority(&mut tx, who, &current, owner).await?;
         writable(&current)?;
         sqlx::query("UPDATE asset_chunks SET state='stored' WHERE tenant_id=$1 AND asset_id=$2 AND ordinal=$3").bind(who.tenant_id).bind(id).bind(ordinal).execute(&mut *tx).await?;
         tx.commit().await?;
@@ -319,9 +346,21 @@ impl Assets {
         Ok(clear.into())
     }
     pub async fn complete(&self, who: &Identity, id: Uuid) -> Result<Value> {
+        self.complete_inner(who, id, None).await
+    }
+    pub(crate) async fn complete_generated(
+        &self,
+        who: &Identity,
+        id: Uuid,
+        owner: Uuid,
+    ) -> Result<Value> {
+        self.complete_inner(who, id, Some(owner)).await
+    }
+    async fn complete_inner(&self, who: &Identity, id: Uuid, owner: Option<Uuid>) -> Result<Value> {
         let mut tx = self.pool.begin().await?;
         authorize(&mut tx, who).await?;
         let a = asset(&mut tx, who, id).await?;
+        write_authority(&mut tx, who, &a, owner).await?;
         if a.state == "available" && a.expires_at > Utc::now() {
             tx.commit().await?;
             return Ok(view(&a));
@@ -345,7 +384,13 @@ impl Assets {
             length += data.len() as i64;
             sha.update(&data);
         }
-        if length != a.byte_length || sha.finalize().as_slice() != a.sha256 {
+        let digest = sha.finalize().to_vec();
+        if length != a.byte_length
+            || a.sha256
+                .as_ref()
+                .is_some_and(|expected| expected != &digest)
+            || (a.kind == "input" && a.sha256.is_none())
+        {
             return Err(Error::Invalid(
                 "complete asset SHA-256 does not match manifest",
             ));
@@ -353,12 +398,17 @@ impl Assets {
         let mut tx = self.pool.begin().await?;
         authorize(&mut tx, who).await?;
         let a = asset(&mut tx, who, id).await?;
+        write_authority(&mut tx, who, &a, owner).await?;
         if a.state == "available" && a.expires_at > Utc::now() {
             tx.commit().await?;
             return Ok(view(&a));
         }
         writable(&a)?;
-        let a:Asset=sqlx::query_as("UPDATE assets SET state='available',completed_at=clock_timestamp() WHERE tenant_id=$1 AND id=$2 RETURNING *").bind(who.tenant_id).bind(id).fetch_one(&mut *tx).await?;
+        let a: Asset = if owner.is_some() {
+            sqlx::query_as("UPDATE assets SET state='available',sha256=$3,completed_at=clock_timestamp() WHERE tenant_id=$1 AND id=$2 RETURNING *").bind(who.tenant_id).bind(id).bind(digest).fetch_one(&mut *tx).await?
+        } else {
+            sqlx::query_as("UPDATE assets SET state='available',completed_at=clock_timestamp() WHERE tenant_id=$1 AND id=$2 RETURNING *").bind(who.tenant_id).bind(id).fetch_one(&mut *tx).await?
+        };
         audit(
             &mut tx,
             who,
@@ -374,6 +424,7 @@ impl Assets {
         let mut tx = self.pool.begin().await?;
         authorize(&mut tx, who).await?;
         let a = asset(&mut tx, who, id).await?;
+        input_only(&a)?;
         readable(&a)?;
         let c = chunk(&mut tx, who.tenant_id, id, ordinal).await?;
         audit(
@@ -397,6 +448,7 @@ impl Assets {
         let mut tx = self.pool.begin().await?;
         authorize(&mut tx, who).await?;
         let a = asset(&mut tx, who, id).await?;
+        input_only(&a)?;
         tombstone(&mut tx, &a).await?;
         tx.commit().await?;
         Ok(json!({"id":id,"state":"deleted","physical_cleanup":"asynchronous"}))
@@ -452,6 +504,35 @@ impl Assets {
     }
 }
 
+fn input_only(a: &Asset) -> Result<()> {
+    if a.kind == "input" {
+        Ok(())
+    } else {
+        Err(Error::NotFound)
+    }
+}
+async fn write_authority(
+    tx: &mut Tx<'_>,
+    who: &Identity,
+    a: &Asset,
+    owner: Option<Uuid>,
+) -> Result<()> {
+    match owner {
+        None => input_only(a),
+        Some(token) if a.kind == "output" => {
+            crate::outputs::write_authority(tx, who, a.id, token).await
+        }
+        Some(_) => Err(Error::NotFound),
+    }
+}
+pub(crate) async fn tombstone_output(tx: &mut Tx<'_>, who: &Identity, id: Uuid) -> Result<()> {
+    let a = asset(tx, who, id).await?;
+    if a.kind != "output" {
+        return Err(Error::NotFound);
+    }
+    tombstone(tx, &a).await
+}
+
 async fn authorize(tx: &mut Tx<'_>, who: &Identity) -> Result<()> {
     accounting::lock_accounts(tx, who).await?;
     let allowed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tenants t JOIN virtual_keys k ON k.tenant_id=t.id WHERE t.id=$1 AND k.id=$2 AND t.active AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>clock_timestamp()))").bind(who.tenant_id).bind(who.key_id).fetch_one(&mut **tx).await?;
@@ -504,7 +585,7 @@ fn view(a: &Asset) -> Value {
     } else {
         &a.state
     };
-    json!({"id":a.id,"kind":"input","state":state,"byte_length":a.byte_length,"sha256":governance::hex(&a.sha256),"declared_media_type":a.declared_media_type,"content_safety":"not_evaluated","chunk_bytes":CHUNK_BYTES,"chunk_count":a.chunk_count,"upload_expires_at":a.upload_expires_at,"expires_at":a.expires_at})
+    json!({"id":a.id,"kind":a.kind,"state":state,"byte_length":a.byte_length,"sha256":a.sha256.as_ref().map(|h|governance::hex(h)),"declared_media_type":a.declared_media_type,"content_safety":"not_evaluated","chunk_bytes":CHUNK_BYTES,"chunk_count":a.chunk_count,"upload_expires_at":a.upload_expires_at,"expires_at":a.expires_at})
 }
 fn decode_hash(s: &str) -> Result<Vec<u8>> {
     if s.len() != 64

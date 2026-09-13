@@ -112,6 +112,12 @@ async fn setup(pool: &PgPool, currency: &str) -> Fixture {
         tenant_id: tenant,
         key_id,
     };
+    brokerrouter::assets::set_quota(pool, tenant, None, 100_000_000)
+        .await
+        .unwrap();
+    brokerrouter::assets::set_quota(pool, tenant, Some(key_id), 100_000_000)
+        .await
+        .unwrap();
     if currency == "USD" {
         store::set_fx(
             pool,
@@ -152,6 +158,8 @@ async fn setup(pool: &PgPool, currency: &str) -> Fixture {
             durations: vec![5],
             price_per_second: money::nonnegative("0.1").unwrap(),
         }],
+        maximum_output_bytes: 10_000_000,
+        output_origins: vec!["https://private-result.example".into()],
     };
     media::put_endpoint(pool, e.clone()).await.unwrap();
     let m = service(pool);
@@ -716,7 +724,7 @@ async fn runtime_can_process_jobs_but_cannot_reconcile_or_rewrite_admission(pool
 fn strict_media_protocol_never_guesses_unknown_status_usage_or_task_identity() {
     let r = body();
     assert!(matches!(
-        media_protocol::poll(&completed(), "task-123", &r).unwrap(),
+        media_protocol::poll(&completed(), "task-123", &r, false).unwrap(),
         media_protocol::Poll::Complete { .. }
     ));
     for field in [
@@ -728,16 +736,16 @@ fn strict_media_protocol_never_guesses_unknown_status_usage_or_task_identity() {
     ] {
         let mut v = completed();
         *v.pointer_mut(field).unwrap() = Value::Null;
-        assert!(media_protocol::poll(&v, "task-123", &r).is_err());
+        assert!(media_protocol::poll(&v, "task-123", &r, false).is_err());
     }
     let mut v = completed();
     v["output"]["task_status"] = json!("UNKNOWN");
     assert!(matches!(
-        media_protocol::poll(&v, "task-123", &r).unwrap(),
+        media_protocol::poll(&v, "task-123", &r, false).unwrap(),
         media_protocol::Poll::Review(_)
     ));
     v = completed();
     v["output"]["video_url"] = json!("http://127.0.0.1/unsafe");
-    assert!(media_protocol::poll(&v, "task-123", &r).is_err());
+    assert!(media_protocol::poll(&v, "task-123", &r, false).is_err());
     assert!(!media_protocol::task_id("../steal?key=x"));
 }

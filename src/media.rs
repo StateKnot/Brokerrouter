@@ -71,7 +71,11 @@ impl Media {
         for config in configs {
             let e: Endpoint = serde_json::from_value(config).map_err(|_| Error::Configuration)?;
             e.validate()?;
-            endpoints.push(json!({"id":e.id,"name":e.name,"protocol":e.protocol,"currency":e.currency,"priority":e.priority,"profiles":e.profiles}));
+            if e.maximum_output_bytes == 0 && e.output_origins.is_empty() {
+                continue;
+            }
+            e.validate_output_contract()?;
+            endpoints.push(json!({"id":e.id,"name":e.name,"protocol":e.protocol,"currency":e.currency,"priority":e.priority,"profiles":e.profiles,"maximum_output_bytes":e.maximum_output_bytes}));
         }
         Ok(
             json!({"model":model,"task":"video.generate","protocol_version":"media-jobs-v1","endpoints":endpoints,"delivery":"not_released"}),
@@ -113,12 +117,17 @@ impl Media {
         for v in configs {
             let e: Endpoint = serde_json::from_value(v).map_err(|_| Error::Configuration)?;
             e.validate()?;
+            if e.maximum_output_bytes == 0 && e.output_origins.is_empty() {
+                continue;
+            }
+            e.validate_output_contract()?;
             if e.profile(&body).is_some() {
                 selected = Some(e);
                 break;
             }
         }
         let endpoint = selected.ok_or(Error::NoEndpoint)?;
+        endpoint.validate_output_contract()?;
         let fx:Option<(i64,rust_decimal::Decimal)>=sqlx::query_as("SELECT id,usd_cny FROM fx_rates WHERE tenant_id=$1 AND effective_at<=now() ORDER BY effective_at DESC LIMIT 1").bind(who.tenant_id).fetch_optional(&mut *tx).await?;
         let snapshot = endpoint.snapshot(&body, fx)?;
         let maximum = snapshot.maximum_cost()?;
@@ -146,6 +155,7 @@ impl Media {
             &serde_json::to_vec(&body).map_err(|_| Error::Configuration)?,
         )?;
         sqlx::query("INSERT INTO media_jobs(tenant_id,id,key_id,endpoint_id,input_ciphertext) VALUES($1,$2,$3,$4,$5)").bind(who.tenant_id).bind(request.id).bind(who.key_id).bind(endpoint.id).bind(encrypted).execute(&mut *tx).await?;
+        crate::outputs::reserve(&mut tx, who, request.id, endpoint.maximum_output_bytes).await?;
         event(&mut tx, who.tenant_id, request.id, "queued", None).await?;
         tx.commit().await?;
         self.get(who, request.id).await
@@ -155,6 +165,10 @@ impl Media {
         let (r, j) = locked(&mut tx, who, id).await?;
         live(&mut tx, who).await?;
         let mut v = view(&r, &j);
+        let output:Option<(String,i64,Option<i64>,Option<String>)>=sqlx::query_as("SELECT i.state,i.maximum_bytes,a.byte_length,i.error_code FROM media_output_imports i LEFT JOIN assets a ON a.tenant_id=i.tenant_id AND a.id=i.asset_id WHERE i.tenant_id=$1 AND i.job_id=$2").bind(who.tenant_id).bind(id).fetch_optional(&mut *tx).await?;
+        if let Some((state, maximum, bytes, error)) = output {
+            v["output_storage"] = json!({"state":state,"maximum_bytes":maximum,"byte_length":bytes,"error_code":error,"content_safety":"not_evaluated","delivery":"not_released"});
+        }
         let approval:Option<governance::Approval>=sqlx::query_as("SELECT a.* FROM approvals a JOIN governance_operations o ON o.tenant_id=a.tenant_id AND o.id=a.operation_id WHERE o.tenant_id=$1 AND o.key_id=$2 AND o.operation_key=$3 AND a.state='pending' ORDER BY a.expires_at DESC LIMIT 1")
             .bind(who.tenant_id).bind(who.key_id).bind(format!("media:{id}")).fetch_optional(&mut *tx).await?;
         if let Some(approval) = approval {
@@ -179,6 +193,7 @@ impl Media {
         live(&mut tx, who).await?;
         if matches!(j.state.as_str(), "queued" | "waiting_approval") {
             accounting::release_locked(&mut tx, who, &r).await?;
+            crate::outputs::release_unmaterialized(&mut tx, who, id).await?;
             transition(
                 &mut tx,
                 &j,
@@ -476,7 +491,7 @@ impl Media {
             bounded_json(client.get(url).bearer_auth(key).send().await).await
         }
         .await;
-        let result = result.and_then(|v| protocol::poll(&v, task, &body));
+        let result = result.and_then(|v| protocol::poll(&v, task, &body, e.allow_private));
         match result {
             Ok(Poll::Running) => {
                 self.defer(who, j.id, token, "running", "provider_running")
@@ -525,6 +540,7 @@ impl Media {
         let (r, j) = locked(&mut tx, who, id).await?;
         owned(&j, token)?;
         accounting::release_locked(&mut tx, who, &r).await?;
+        crate::outputs::release_unmaterialized(&mut tx, who, id).await?;
         transition(&mut tx, &j, "cancelled", Some(code)).await?;
         sqlx::query("UPDATE media_jobs SET input_ciphertext=NULL WHERE tenant_id=$1 AND id=$2")
             .bind(who.tenant_id)
@@ -558,6 +574,7 @@ impl Media {
 
 pub async fn put_endpoint(pool: &PgPool, e: Endpoint) -> Result<()> {
     e.validate()?;
+    e.validate_output_contract()?;
     let mut tx = pool.begin().await?;
     governance::tenant_lock(&mut tx, e.tenant_id).await?;
     let count: i64 = sqlx::query_scalar(
@@ -682,6 +699,7 @@ pub async fn reconcile(
         return Err(Error::InProgress);
     }
     accounting::finish_locked(&mut tx, &who, &r, actual, None, details).await?;
+    crate::outputs::release_unmaterialized(&mut tx, &who, id).await?;
     transition(&mut tx, &j, "reconciled", Some("operator_verified_charge")).await?;
     sqlx::query("UPDATE requests SET status='reconciled' WHERE tenant_id=$1 AND id=$2")
         .bind(tenant)

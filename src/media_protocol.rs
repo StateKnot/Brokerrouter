@@ -22,6 +22,11 @@ pub struct Endpoint {
     pub currency: String,
     pub priority: i32,
     pub profiles: Vec<Profile>,
+    // Defaults decode previously submitted M4.2 routing snapshots. New admission requires a contract.
+    #[serde(default)]
+    pub maximum_output_bytes: i64,
+    #[serde(default)]
+    pub output_origins: Vec<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,6 +79,33 @@ impl CreateJob {
     }
 }
 impl Endpoint {
+    pub fn validate_output_contract(&self) -> Result<()> {
+        if !(1..=crate::assets::MAX_ASSET_BYTES).contains(&self.maximum_output_bytes)
+            || self.output_origins.is_empty()
+            || self.output_origins.len() > 16
+        {
+            return Err(Error::Invalid(
+                "bounded output storage and allowed output origins are required",
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for origin in &self.output_origins {
+            let u = url::Url::parse(origin).map_err(|_| Error::Configuration)?;
+            if origin.len() > 512
+                || !u.username().is_empty()
+                || u.password().is_some()
+                || u.host_str().is_none()
+                || u.query().is_some()
+                || u.fragment().is_some()
+                || u.path() != "/"
+                || !(u.scheme() == "https" || (self.allow_private && u.scheme() == "http"))
+                || !seen.insert(u.origin().ascii_serialization())
+            {
+                return Err(Error::Configuration);
+            }
+        }
+        Ok(())
+    }
     pub fn validate(&self) -> Result<()> {
         let u = url::Url::parse(&self.origin).map_err(|_| Error::Configuration)?;
         if self.id.is_nil()
@@ -179,7 +211,7 @@ pub enum Poll {
     },
     Review(&'static str),
 }
-pub fn poll(v: &Value, id: &str, r: &CreateJob) -> Result<Poll> {
+pub fn poll(v: &Value, id: &str, r: &CreateJob, allow_private: bool) -> Result<Poll> {
     if accepted(v)? != id {
         return Err(Error::UpstreamUnknown);
     }
@@ -215,7 +247,7 @@ pub fn poll(v: &Value, id: &str, r: &CreateJob) -> Result<Poll> {
                 .filter(|s| s.len() <= 8192)
                 .ok_or(Error::UpstreamUnknown)?;
             let url = url::Url::parse(raw).map_err(|_| Error::UpstreamUnknown)?;
-            if url.scheme() != "https"
+            if !(url.scheme() == "https" || (allow_private && url.scheme() == "http"))
                 || url.host_str().is_none()
                 || !url.username().is_empty()
                 || url.password().is_some()

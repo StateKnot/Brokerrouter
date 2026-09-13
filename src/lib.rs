@@ -15,6 +15,7 @@ pub mod media;
 pub mod media_api;
 pub mod media_protocol;
 pub mod money;
+pub mod outputs;
 pub mod protocol;
 pub mod store;
 
