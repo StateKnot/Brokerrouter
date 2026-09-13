@@ -98,7 +98,7 @@ brokerrouter asset-quota-set --tenant <TENANT_UUID> --key <KEY_UUID> --bytes 536
 
 ```sh
 docker compose -f compose.test.yaml --profile assets up -d minio
-curl --fail --silent --show-error --retry 15 --retry-connrefused --retry-delay 1 --max-time 30 http://127.0.0.1:59000/minio/health/live
+curl --fail --silent --show-error --retry 15 --retry-all-errors --retry-delay 1 --retry-max-time 30 --max-time 2 http://127.0.0.1:59000/minio/health/live
 curl --fail --silent --show-error --max-time 10 --aws-sigv4 'aws:amz:us-east-1:s3' --user 'brokerrouter-test-only:brokerrouter-local-only-not-production' -X PUT http://127.0.0.1:59000/brokerrouter-test-assets
 # Use the fake fixture-only environment values from .github/workflows/ci.yml.
 cargo test --locked --test assets s3_conditional_write -- --ignored

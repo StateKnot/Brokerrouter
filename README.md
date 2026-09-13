@@ -58,4 +58,6 @@ cargo run -- fx-history --tenant <TENANT_UUID> --limit 20
 
 M3 已增加确定性/文本语义护栏、模型输入/输出审批、当前 turn 豁免、独立真人控制面与工具执行恢复契约，见 [M3 治理协议](docs/m3-governance.md) 与 [语义护栏及人民币费用契约](docs/m3-semantic-guardrails.md)。受管调用必须携带服务端登记的 `X-Brokerrouter-Turn-Id`。`serve-control` 使用独立数据库角色和用户 BFF 公钥，不能与 Agent 凭据混用。真实 BFF/Runtime、供应商、SDK 与检测质量认证仍在 [验收待办](docs/acceptance-backlog.md)；不宣称普通 SDK 已能弹窗、多模态内容审核已接入或整个平台生产认证完成。
 
-M4.1 已增加 [私有输入资产与非 Token 人民币计费](docs/m4-assets-pricing.md)：`serve-assets` 提供 `/v1/assets` 分块上传、校验、私有下载和过期清理；`asset-quota-set` 显式配置租户/Key 字节配额。S3 兼容存储中的资产分块经应用加密，内容安全状态单独记录。按张/秒/次等单位计价的 Rust 库已接入统一人民币预留和账本，但生成作业、输出转存与审批交付尚在后续 M4 范围；不能把输入上传完成视为审核通过。
+M4.1 已增加 [私有输入资产与非 Token 人民币计费](docs/m4-assets-pricing.md)：`serve-assets` 提供 `/v1/assets` 分块上传、校验、私有下载和过期清理；`asset-quota-set` 显式配置租户/Key 字节配额。S3 兼容存储中的资产分块经应用加密，内容安全状态单独记录；不能把输入上传完成视为审核通过。
+
+M4.2 已增加 [持久媒体作业](docs/m4-media-jobs.md)：`serve-media` 提供动态能力、作业创建/状态/事件/取消，`media-worker` 独立执行。首个连接器为百炼 Wan2.7 文生视频，支持多端点能力匹配、输入真人审批、不确定受理不重发、恢复查询及冻结价格/汇率的人民币结算。**生成成功仍停在隔离的 `output_pending`；转存、二进制护栏和批准后下载属于下一包 M4.3，当前不交付视频文件**。真实供应商认证尚未执行。

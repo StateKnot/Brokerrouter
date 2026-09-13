@@ -198,7 +198,7 @@ pub async fn identity(pool: &PgPool, headers: &HeaderMap) -> Result<store::Ident
 
 async fn models(State(pool): State<PgPool>, headers: HeaderMap) -> Result<Json<Value>> {
     let who = identity(&pool, &headers).await?;
-    let models:Vec<String>=sqlx::query_scalar("SELECT m.id FROM models m JOIN key_models k ON k.tenant_id=m.tenant_id AND k.model_id=m.id WHERE k.tenant_id=$1 AND k.key_id=$2 AND m.active AND EXISTS (SELECT 1 FROM endpoints e WHERE e.tenant_id=m.tenant_id AND e.model_id=m.id AND e.active) ORDER BY m.id").bind(who.tenant_id).bind(who.key_id).fetch_all(&pool).await?;
+    let models:Vec<String>=sqlx::query_scalar("SELECT m.id FROM models m JOIN key_models k ON k.tenant_id=m.tenant_id AND k.model_id=m.id WHERE k.tenant_id=$1 AND k.key_id=$2 AND m.active AND (EXISTS (SELECT 1 FROM endpoints e WHERE e.tenant_id=m.tenant_id AND e.model_id=m.id AND e.active) OR EXISTS(SELECT 1 FROM media_endpoints e WHERE e.tenant_id=m.tenant_id AND e.model_id=m.id AND e.active)) ORDER BY m.id").bind(who.tenant_id).bind(who.key_id).fetch_all(&pool).await?;
     Ok(Json(
         json!({"object":"list","data":models.into_iter().map(|id|json!({"id":id,"object":"model","owned_by":"brokerrouter"})).collect::<Vec<_>>()}),
     ))

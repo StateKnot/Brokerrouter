@@ -16,6 +16,44 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Migrate,
+    ServeMedia {
+        #[arg(long, default_value = "127.0.0.1:8083")]
+        bind: SocketAddr,
+    },
+    MediaWorker {
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
+    },
+    MediaEndpointAdd {
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+    MediaEndpointDisable {
+        #[arg(long)]
+        tenant: Uuid,
+        #[arg(long)]
+        id: Uuid,
+    },
+    MediaAttachTask {
+        #[arg(long)]
+        tenant: Uuid,
+        #[arg(long)]
+        id: Uuid,
+        #[arg(long)]
+        provider_task_id: String,
+        #[arg(long)]
+        evidence: String,
+    },
+    MediaReconcile {
+        #[arg(long)]
+        tenant: Uuid,
+        #[arg(long)]
+        id: Uuid,
+        #[arg(long)]
+        usage_file: std::path::PathBuf,
+        #[arg(long)]
+        evidence: String,
+    },
     ServeAssets {
         #[arg(long, default_value = "127.0.0.1:8082")]
         bind: SocketAddr,
@@ -269,6 +307,90 @@ async fn main() -> anyhow::Result<()> {
         Command::Migrate => {
             migrate(&pool).await?;
             println!("Migrations applied");
+        }
+        Command::MediaEndpointAdd { file } => {
+            brokerrouter::media::put_endpoint(
+                &pool,
+                serde_json::from_str(&std::fs::read_to_string(file)?)?,
+            )
+            .await?
+        }
+        Command::MediaEndpointDisable { tenant, id } => {
+            brokerrouter::media::disable_endpoint(&pool, tenant, id).await?
+        }
+        Command::MediaAttachTask {
+            tenant,
+            id,
+            provider_task_id,
+            evidence,
+        } => {
+            brokerrouter::media::attach_task(&pool, tenant, id, &provider_task_id, &evidence)
+                .await?
+        }
+        Command::MediaReconcile {
+            tenant,
+            id,
+            usage_file,
+            evidence,
+        } => {
+            brokerrouter::media::reconcile(
+                &pool,
+                tenant,
+                id,
+                &serde_json::from_str::<Vec<money::UnitUsage>>(&std::fs::read_to_string(
+                    usage_file,
+                )?)?,
+                &evidence,
+            )
+            .await?
+        }
+        Command::ServeMedia { bind } => {
+            brokerrouter::check_schema(&pool).await?;
+            let m = brokerrouter::media::Media::from_env(pool.clone()).await?;
+            let listener = tokio::net::TcpListener::bind(bind).await?;
+            tracing::info!(address=%bind,"brokerrouter media API listening; worker runs separately");
+            axum::serve(listener, brokerrouter::media_api::router(m))
+                .with_graceful_shutdown(shutdown())
+                .await?;
+        }
+        Command::MediaWorker { concurrency } => {
+            if !(1..=16).contains(&concurrency) {
+                anyhow::bail!("media concurrency must be 1..16");
+            }
+            brokerrouter::check_schema(&pool).await?;
+            let m = brokerrouter::media::Media::from_env(pool.clone()).await?;
+            let stop = tokio_util::sync::CancellationToken::new();
+            let mut workers = tokio::task::JoinSet::new();
+            for _ in 0..concurrency {
+                let (worker, stop) = (m.clone(), stop.clone());
+                workers.spawn(async move {
+                    while !stop.is_cancelled() {
+                        if !matches!(
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(840),
+                                worker.tick()
+                            )
+                            .await,
+                            Ok(Ok(_))
+                        ) {
+                            tracing::error!("media worker pass failed; durable lease will recover");
+                        }
+                        tokio::select! {
+                            _ = stop.cancelled() => break,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                        }
+                    }
+                });
+            }
+            let failed = tokio::select! {
+                _ = shutdown() => false,
+                _ = workers.join_next() => true,
+            };
+            stop.cancel();
+            while workers.join_next().await.is_some() {}
+            if failed {
+                anyhow::bail!("media worker exited unexpectedly; restart with durable leases");
+            }
         }
         Command::AssetQuotaSet { tenant, key, bytes } => {
             brokerrouter::assets::set_quota(&pool, tenant, key, bytes).await?;

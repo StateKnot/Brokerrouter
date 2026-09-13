@@ -199,12 +199,12 @@ pub async fn reconcile(
 pub async fn maintain(pool: &PgPool) -> Result<()> {
     // Never restart a POST after a process/connection loss. Only change its visibility.
     let mut tx = pool.begin().await?;
-    let expired:Vec<Uuid>=sqlx::query_scalar("WITH batch AS (SELECT id FROM requests WHERE status='submitting' AND dispatch_deadline<now() ORDER BY dispatch_deadline LIMIT 100 FOR UPDATE SKIP LOCKED) UPDATE requests r SET status='submission_unknown',error_code='dispatch_deadline_elapsed',updated_at=now() FROM batch WHERE r.id=batch.id RETURNING r.id").fetch_all(&mut *tx).await?;
+    let expired:Vec<Uuid>=sqlx::query_scalar("WITH batch AS (SELECT id FROM requests WHERE status='submitting' AND dispatch_deadline<now() AND NOT EXISTS(SELECT 1 FROM media_jobs j WHERE j.tenant_id=requests.tenant_id AND j.id=requests.id) ORDER BY dispatch_deadline LIMIT 100 FOR UPDATE SKIP LOCKED) UPDATE requests r SET status='submission_unknown',error_code='dispatch_deadline_elapsed',updated_at=now() FROM batch WHERE r.id=batch.id RETURNING r.id").fetch_all(&mut *tx).await?;
     sqlx::query("UPDATE attempts SET status='submission_unknown',error_code='dispatch_deadline_elapsed',finished_at=now() WHERE request_id=ANY($1) AND status='submitting'").bind(expired).execute(&mut *tx).await?;
     sqlx::query("WITH batch AS (SELECT id FROM requests WHERE result_expires_at<now() AND result_ciphertext IS NOT NULL ORDER BY result_expires_at LIMIT 100 FOR UPDATE SKIP LOCKED) UPDATE requests r SET result_ciphertext=NULL FROM batch WHERE r.id=batch.id").execute(&mut *tx).await?;
     tx.commit().await?;
     // An abandoned pre-dispatch reservation has no external side effects and can be released.
-    let rows:Vec<(Uuid,Uuid,Uuid)>=sqlx::query_as("SELECT tenant_id,key_id,id FROM requests WHERE status='reserved' AND dispatch_deadline<now() LIMIT 100").fetch_all(pool).await?;
+    let rows:Vec<(Uuid,Uuid,Uuid)>=sqlx::query_as("SELECT tenant_id,key_id,id FROM requests WHERE status='reserved' AND dispatch_deadline<now() AND NOT EXISTS(SELECT 1 FROM media_jobs j WHERE j.tenant_id=requests.tenant_id AND j.id=requests.id) LIMIT 100").fetch_all(pool).await?;
     for (tenant_id, key_id, id) in rows {
         match accounting::release_unsubmitted(pool, &Identity { tenant_id, key_id }, id).await {
             Ok(()) | Err(Error::InProgress) => {}

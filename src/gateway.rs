@@ -144,7 +144,7 @@ impl Gateway {
         operation: &'static str,
         turn_id: Option<Uuid>,
     ) -> Result<(Uuid, Result<Value>)> {
-        if idempotency.starts_with("_br_guardrail:") {
+        if idempotency.starts_with("_br_guardrail:") || idempotency.starts_with("_br_media:") {
             return Err(Error::Invalid("reserved idempotency namespace"));
         }
         self.execute_inner(

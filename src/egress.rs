@@ -45,6 +45,15 @@ pub async fn client(e: &Endpoint, timeout: Duration) -> Result<(Client, url::Url
     };
     let url = url::Url::parse(&format!("{}/{path}", e.base_url.trim_end_matches('/')))
         .map_err(|_| Error::Configuration)?;
+    let client = pinned_client(&url, e.allow_private, timeout).await?;
+    Ok((client, url))
+}
+
+pub(crate) async fn pinned_client(
+    url: &url::Url,
+    allow_private: bool,
+    timeout: Duration,
+) -> Result<Client> {
     let host = url.host_str().ok_or(Error::Configuration)?;
     let port = url.port_or_known_default().ok_or(Error::Configuration)?;
     let addrs: Vec<SocketAddr> = match url.host().ok_or(Error::Configuration)? {
@@ -63,7 +72,7 @@ pub async fn client(e: &Endpoint, timeout: Duration) -> Result<(Client, url::Url
     if addrs.is_empty() {
         return Err(Error::NotSubmitted);
     }
-    if !e.allow_private && addrs.iter().any(|a| !public_ip(a.ip())) {
+    if !allow_private && addrs.iter().any(|a| !public_ip(a.ip())) {
         return Err(Error::Invalid("endpoint resolves to a prohibited network"));
     }
     // Resolve once, validate, then pin these addresses. No redirects or implicit retries/proxies.
@@ -81,7 +90,7 @@ pub async fn client(e: &Endpoint, timeout: Duration) -> Result<(Client, url::Url
         .resolve_to_addrs(host, &addrs)
         .build()
         .map_err(|_| Error::Configuration)?;
-    Ok((client, url))
+    Ok(client)
 }
 
 #[cfg(test)]
