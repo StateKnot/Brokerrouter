@@ -17,11 +17,11 @@
 | LIVE-11 | M4 | 真实产物 origin/TLS/强 ETag/Content-Length/If-Match、源站流量费用、输出 worker 恢复窗口、最大对象/吞吐、混合版本部署与 RLS、转存身份与加密密钥轮换 | 固定供应商产物、独立预生产存储与最小权限登录、容量/SLO/恢复演练、人民币联调上限 | 待部署/供应商认证，发布阻断 |
 | LIVE-12 | M4 | 生产 ClamAV 签名库/供应链、媒体及恶意样本覆盖/误报漏报、隔离/资源/终止恢复、Scanner TLS/IAM/凭据隔离、证据保存/容量告警/清单轮换；内容语义检测仍需另行实现 | 固定检测镜像与 worker 摘要、生产签名库、预生产样本和网络/容量约束；本地测试规则不能充当生产特征库 | 技术检测器已接入，生产质量及部署认证待完成，发布阻断 |
 | LIVE-13 | M4/M5/M6 | 独立预览源/播放器与 BFF 请求证明、用户风险提示和当前轮范围展示、审批后 Runtime 下载/整文件校验/关轮顺序、GetObject-only IAM、撤销多副本/慢客户端/审计留存/容量与回滚 | 真实 BFF、Hermes/OpenClaw 固定版本、隔离 UI 与预生产 S3/TLS/DB 角色；不先索取模型凭据 | 服务端已实现，UI/适配与部署认证待完成，发布阻断 |
-| LIVE-14 | M5 | 控制台 BFF/OIDC 登录、成员/角色映射、CSRF、证明密钥隔离与轮换；真实数据规模查询计划/超时/并发、DDL 维护窗口、UTC/北京时间账本对数、浏览器精度和分页 | 真实 IdP 的 issuer/client/固定 callback、机构停用同步方案、专用 BFF/console DB 登录与 TLS/网络、生产等价规模及 SLO、受控前端 | [只读报表](m5-console-reporting.md)与[OIDC BFF](m5-oidc-bff.md)已实现并补本地协议/DB/HTTP 集成；TypeScript 页面、真实 IdP/浏览器/MFA/多副本轮换和部署认证待完成，发布阻断 |
+| LIVE-14 | M5 | 真实浏览器→OIDC→BFF→报表整链路、成员/角色映射、CSRF/Secure/SameSite、MFA/停用同步、证明隔离/轮换/多副本撤销；实际 LB/WAF/TLS/日志、数据规模/查询计划/SLO、DDL 窗口、UTC/北京时间对数、浏览器支持矩阵/后退缓存与人工无障碍 | 真实 IdP 的 issuer/client/固定 callback、机构停用同步方案、专用 BFF/console DB 登录与 TLS/网络、生产等价规模及 SLO | [只读报表](m5-console-reporting.md)、[OIDC BFF](m5-oidc-bff.md)与[TypeScript 页面](m5-console-ui.md)已实现；本地 DB/HTTP、双浏览器 38 项与真实 Nginx 合约通过，但浏览器 API/edge 上游仍是测试夹具；真实 IdP/MFA/整链路/轮换与部署认证未完成，发布阻断 |
 
 记录格式：测试 ID、代码提交、供应商/Runtime/SDK 版本、配置版本、输入样本引用（不提交敏感正文）、脱敏证据、人民币实际费用、通过/失败、问题单。真实密钥不得进入本文或仓库。
 
-SSE、Responses、多模态和 Web 控制台是后续能力开发范围，不混记为已实现能力的“待测”；各能力在实现后另加对应验收闸门。
+SSE、Responses、图片/3D/其他多模态连接器及控制台剩余配置/审批/治理页面仍属后续开发，不混记为已实现能力的“待测”；已实现范围以里程碑总表为准，各能力实现后另加对应验收闸门。
 
 ## M3 新增待办与明确未开放能力
 

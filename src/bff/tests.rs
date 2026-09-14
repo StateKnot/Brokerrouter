@@ -243,6 +243,60 @@ fn query_body() -> Vec<u8> {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn browser_callback_errors_have_fixed_safe_landing_and_boundary_headers(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let (base, task) = serve(router(f.bff.clone())).await;
+    let _abort = Task(task);
+    let client = http_client().unwrap();
+    for suffix in [
+        "?state=test&error=access_denied",
+        "?code=not-a-real-code",
+        "?state=test&state=duplicate",
+    ] {
+        let response = client
+            .get(format!("{base}/bff/v1/callback{suffix}"))
+            .header("accept", "text/html,application/xhtml+xml")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 303);
+        assert_eq!(response.headers()["location"], "/?login=failed");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+        assert!(
+            response.headers()["set-cookie"]
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0")
+        );
+        assert!(!response.text().await.unwrap().contains("not-a-real-code"));
+    }
+    let response = client
+        .get(format!("{base}/bff/v1/callback?state=test"))
+        .header("accept", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+    assert!(!response.headers().contains_key("location"));
+    let response = client
+        .get(format!("{base}/bff/v1/callback?state={}", "a".repeat(8200)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM bff_sessions")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn real_http_oidc_pkce_to_console_and_logout(pool: PgPool) {
     let f = fixture(&pool).await;
     let (base, task) = serve(router(f.bff.clone())).await;

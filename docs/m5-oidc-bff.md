@@ -1,6 +1,6 @@
 # M5.2a：真实 OIDC 协议与控制台 BFF
 
-本包交付 `oidc-console-bff-v1`：Rust BFF、持久登录事务/会话、预登记身份、报表代理和退出撤销。它对接标准 OIDC，不提供测试密码或“管理员万能 Token”生产入口。TypeScript 登录/报表页面仍是下一包；本地协议测试 IdP **不等于真实用户系统或浏览器认证**。当前不能宣称整个控制台已上线。
+本包交付 `oidc-console-bff-v1`：Rust BFF、持久登录事务/会话、预登记身份、报表代理和退出撤销。它对接标准 OIDC，不提供测试密码或“管理员万能 Token”生产入口。后续 [M5.2b](m5-console-ui.md) 已接入 TypeScript 登录/只读页面和同源 HTTPS edge；本地协议测试 IdP **不等于真实用户系统或整链路浏览器认证**。当前不能宣称整个控制台已上线。
 
 ## 身份链路与授权边界
 
@@ -24,6 +24,8 @@
 - 回调事务先删除再交换：网络中断、进程终止、兑换成功后数据库失败都要求重新登录，禁止重放原 code。失败不会提交新会话或伪造成功审计。
 
 标准依据：[OpenID Connect Core 1.0](https://openid.net/specs/openid-connect-core-1_0.html)；库接口与不跟随重定向的要求见 [openidconnect 4.0.1](https://docs.rs/openidconnect/4.0.1/openidconnect/)。库有意不默认校验 `azp`，本项目在应用层补充了上述固定 client 合同，并以错误 azp 用例验证。
+
+M5.2b 补充浏览器错误落点：回调 `Accept: text/html` 的失败统一 303 到 `/?login=failed`，包括查询解析错误，并清除登录 Cookie；不把上游错误、code/state 放进重定向地址。非 HTML 请求仍保留 JSON 错误合同。登录安全校验与会话事务不变，新增 PostgreSQL/HTTP 回归覆盖此边界。
 
 ## Cookie、会话与恢复
 

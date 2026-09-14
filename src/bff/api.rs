@@ -34,13 +34,13 @@ pub fn router(service: Arc<Bff>) -> Router {
         .layer(middleware::from_fn(boundary))
 }
 async fn boundary(request: axum::extract::Request, next: middleware::Next) -> Response {
-    if request.uri().to_string().len() > 8192 {
-        return Error::Invalid("URI too long").into_response();
-    }
-    let mut response = match tokio::time::timeout(Duration::from_secs(40), next.run(request)).await
-    {
-        Ok(v) => v,
-        Err(_) => Error::BffUpstream.into_response(),
+    let mut response = if request.uri().to_string().len() > 8192 {
+        Error::Invalid("URI too long").into_response()
+    } else {
+        match tokio::time::timeout(Duration::from_secs(40), next.run(request)).await {
+            Ok(v) => v,
+            Err(_) => Error::BffUpstream.into_response(),
+        }
     };
     for (name, value) in [
         ("cache-control", "no-store"),
@@ -150,9 +150,21 @@ struct Callback {
 async fn callback(
     State(b): State<Arc<Bff>>,
     headers: HeaderMap,
-    Query(input): Query<Callback>,
+    input: std::result::Result<Query<Callback>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
+    // This changes presentation only, never authentication or the redirect destination.
+    let browser = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(',').any(|part| {
+                part.split(';')
+                    .next()
+                    .is_some_and(|mime| mime.trim() == "text/html")
+            })
+        });
     let result = async {
+        let Query(input) = input.map_err(|_| Error::Invalid("invalid OIDC callback"))?;
         let token = cookie(&headers, LOGIN)?.ok_or(Error::SessionUnauthorized)?;
         let code = if input.error.is_some()
             || input
@@ -181,6 +193,11 @@ async fn callback(
             set_cookie(&mut response, CSRF, &csrf, seconds, false);
             response
         }
+        Err(_) if browser => (
+            StatusCode::SEE_OTHER,
+            [(header::LOCATION, "/?login=failed")],
+        )
+            .into_response(),
         Err(error) => error.into_response(),
     };
     set_cookie(&mut response, LOGIN, "", 0, true);

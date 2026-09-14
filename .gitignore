@@ -5,3 +5,7 @@
 .DS_Store
 *.log
 /coverage/
+/console/node_modules/
+/console/dist/
+/console/test-results/
+/console/playwright-report/
