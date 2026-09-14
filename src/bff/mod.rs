@@ -29,12 +29,19 @@ struct Config {
     audience: String,
     kid: String,
 }
+struct CatalogTarget {
+    origin: String,
+    audience: String,
+    kid: String,
+    signer: EncodingKey,
+}
 pub struct Bff {
     pool: PgPool,
     config: Config,
     config_hash: Vec<u8>,
     cipher: ResultCipher,
     signer: EncodingKey,
+    catalog: Option<CatalogTarget>,
     http: reqwest::Client,
 }
 impl Bff {
@@ -78,21 +85,54 @@ impl Bff {
         }
         let pem = get("BROKERROUTER_BFF_SIGNING_PRIVATE_KEY")?;
         let signer = signing_key(&pem)?;
+        let catalog_names = [
+            "BROKERROUTER_BFF_CATALOG_ORIGIN",
+            "BROKERROUTER_CATALOG_AUDIENCE",
+            "BROKERROUTER_BFF_CATALOG_SIGNING_KID",
+            "BROKERROUTER_BFF_CATALOG_SIGNING_PRIVATE_KEY",
+        ];
+        let catalog = if catalog_names
+            .iter()
+            .all(|name| std::env::var_os(name).is_none())
+        {
+            None
+        } else {
+            let origin = get(catalog_names[0])?;
+            https_origin(&origin)?;
+            let audience = get(catalog_names[1])?;
+            let kid = get(catalog_names[2])?;
+            let catalog_pem = get(catalog_names[3])?;
+            if !governance::valid_text(&audience, 200)
+                || !governance::valid_text(&kid, 100)
+                || audience == config.audience
+                || private_key(&catalog_pem)?.n() == private_key(&pem)?.n()
+            {
+                return Err(Error::Configuration);
+            }
+            Some(CatalogTarget {
+                origin,
+                audience,
+                kid,
+                signer: signing_key(&catalog_pem)?,
+            })
+        };
         let cipher = ResultCipher::new(
             get("BROKERROUTER_BFF_ACTIVE_KEY")?,
             serde_json::from_str(&get("BROKERROUTER_BFF_KEYS")?)
                 .map_err(|_| Error::Configuration)?,
         )?;
-        let config_hash =
-            governance::digest(&json!({"origin":config.origin,"issuer":config.oidc_issuer,
+        let config_hash = governance::digest(
+            &json!({"origin":config.origin,"issuer":config.oidc_issuer,
             "origins":config.oidc_origins,"client":config.client_id,"console":config.console_origin,
-            "audience":config.audience,"kid":config.kid}))?;
+            "audience":config.audience,"kid":config.kid,"catalog":catalog.as_ref().map(|c|json!({"origin":c.origin,"audience":c.audience,"kid":c.kid}))}),
+        )?;
         Ok(Arc::new(Self {
             pool,
             config,
             config_hash,
             cipher,
             signer,
+            catalog,
             http: http_client()?,
         }))
     }
@@ -241,22 +281,36 @@ impl Bff {
         path: &str,
         body: &[u8],
     ) -> Result<(axum::http::StatusCode, Vec<u8>)> {
-        if !matches!(
+        let (origin, audience, kid, signer, token_type) = if matches!(
+            path,
+            "/catalog/v1/models/query" | "/catalog/v1/endpoints/query" | "/catalog/v1/apply"
+        ) {
+            let c = self.catalog.as_ref().ok_or(Error::Configuration)?;
+            (&c.origin, &c.audience, &c.kid, &c.signer, "br-catalog+jwt")
+        } else if matches!(
             path,
             "/console/v1/usage/query"
                 | "/console/v1/usage/groups/query"
                 | "/console/v1/requests/query"
                 | "/console/v1/audit/query"
         ) {
+            (
+                &self.config.console_origin,
+                &self.config.audience,
+                &self.config.kid,
+                &self.signer,
+                "br-console+jwt",
+            )
+        } else {
             return Err(Error::NotFound);
-        }
+        };
         let session = self.session(token, Some(csrf)).await?;
         let now = Utc::now().timestamp();
         let claims = human::Claims {
             tenant_id: session.tenant_id,
             iss: self.config.origin.clone(),
             sub: session.subject,
-            aud: self.config.audience.clone(),
+            aud: audience.clone(),
             exp: (now + 30).min(session.expires_at.timestamp()),
             nbf: now,
             iat: now,
@@ -268,13 +322,13 @@ impl Bff {
             interactive: true,
         };
         let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(self.config.kid.clone());
-        header.typ = Some("br-console+jwt".into());
-        let proof = jsonwebtoken::encode(&header, &claims, &self.signer)
-            .map_err(|_| Error::Configuration)?;
+        header.kid = Some(kid.clone());
+        header.typ = Some(token_type.into());
+        let proof =
+            jsonwebtoken::encode(&header, &claims, signer).map_err(|_| Error::Configuration)?;
         let response = self
             .http
-            .post(format!("{}{path}", self.config.console_origin))
+            .post(format!("{origin}{path}"))
             .bearer_auth(proof)
             .header("content-type", "application/json")
             .body(body.to_vec())
@@ -321,6 +375,10 @@ fn https_url(value: &str) -> Result<Url> {
     Ok(url)
 }
 fn signing_key(pem: &str) -> Result<EncodingKey> {
+    private_key(pem)?;
+    EncodingKey::from_rsa_pem(pem.as_bytes()).map_err(|_| Error::Configuration)
+}
+fn private_key(pem: &str) -> Result<rsa::RsaPrivateKey> {
     if pem.len() > 16384 {
         return Err(Error::Configuration);
     }
@@ -330,7 +388,7 @@ fn signing_key(pem: &str) -> Result<EncodingKey> {
     if !(2048..=8192).contains(&key.n().bits()) || key.validate().is_err() {
         return Err(Error::Configuration);
     }
-    EncodingKey::from_rsa_pem(pem.as_bytes()).map_err(|_| Error::Configuration)
+    Ok(key)
 }
 fn https_origin(value: &str) -> Result<()> {
     if https_url(value)?.origin().ascii_serialization() != value {

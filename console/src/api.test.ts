@@ -88,7 +88,7 @@ describe("browser trust boundary", () => {
       await request("session", z.object({}));
       throw new Error("unexpected success");
     } catch (error) {
-      expect(errorMessage(error)).toContain("没有此项读取权限");
+      expect(errorMessage(error)).toContain("没有此项权限");
       expect(errorMessage(error)).not.toContain("secret");
     }
   });

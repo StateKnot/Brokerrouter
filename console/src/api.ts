@@ -6,7 +6,11 @@ type Path =
   | "logout"
   | "usage/query"
   | "usage/groups/query"
-  | "requests/query";
+  | "requests/query"
+  | "audit/query"
+  | "catalog/models/query"
+  | "catalog/endpoints/query"
+  | "catalog/apply";
 export class ApiError extends Error {
   constructor(
     public readonly status: number,
@@ -129,7 +133,11 @@ export function errorMessage(error: unknown): string {
   if (error.code === "csrf_rejected")
     return "安全校验未通过，请重新登录后重试。";
   if (error.status === 403)
-    return "当前账号没有此项读取权限，请联系组织管理员授权。";
+    return "当前账号没有此项权限，请联系组织管理员授权。";
+  if (error.code === "configuration_conflict")
+    return "配置已被其他人修改，请重新加载并核对后再提交。";
+  if (error.code === "idempotency_conflict")
+    return "操作编号已用于其他内容，已拒绝提交。请核对审计记录。";
   if (error.status === 401)
     return "服务身份校验失败，请联系管理员检查 BFF 信任配置。";
   if (error.status === 400 || error.status === 422)

@@ -188,6 +188,7 @@ async fn fixture(pool: &PgPool) -> Fixture {
         .await;
     // Only this private cfg(test) fixture permits loopback HTTP. from_env has no insecure switch.
     let bff = Arc::new(Bff {
+        catalog: None,
         pool: pool.clone(),
         config: Config {
             origin,
@@ -618,6 +619,109 @@ async fn csrf_cookies_and_arbitrary_proxy_paths_are_rejected(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(response.status(), 413);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn catalog_bff_uses_separate_signer_csrf_whitelist_and_idempotent_mutations(pool: PgPool) {
+    let mut f = fixture(&pool).await;
+    let (token, csrf) = logged_in(&f).await;
+    assert!(matches!(
+        f.bff
+            .query(
+                &token,
+                &csrf,
+                "/catalog/v1/models/query",
+                br#"{"limit":20}"#
+            )
+            .await,
+        Err(Error::Configuration)
+    ));
+    let private = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let verifier = human::Verifier::new_catalog(
+        &f.bff.config.origin,
+        "catalog-test",
+        HashMap::from([(
+            "catalog-fixture".into(),
+            private
+                .to_public_key()
+                .to_public_key_pem(LineEnding::LF)
+                .unwrap(),
+        )]),
+    )
+    .unwrap();
+    let (origin, task) = serve(crate::catalog_api::router(crate::catalog_api::Catalog {
+        pool: pool.clone(),
+        verifier: Arc::new(verifier),
+        connections: Arc::new(vec![]),
+    }))
+    .await;
+    let _abort = Task(task);
+    Arc::get_mut(&mut f.bff).unwrap().catalog = Some(CatalogTarget {
+        origin,
+        audience: "catalog-test".into(),
+        kid: "catalog-fixture".into(),
+        signer: EncodingKey::from_rsa_pem(private.to_pkcs8_pem(LineEnding::LF).unwrap().as_bytes())
+            .unwrap(),
+    });
+    for permission in [
+        crate::console::Permission::CatalogRead,
+        crate::console::Permission::CatalogWrite,
+    ] {
+        crate::console::set_permission(&pool, f.tenant, f.user, permission, true, "test catalog")
+            .await
+            .unwrap();
+    }
+    let (base, task) = serve(router(f.bff.clone())).await;
+    let _bff = Task(task);
+    let client = http_client().unwrap();
+    let body = json!({"operation_id":Uuid::new_v4(),"reason":"OIDC configuration test","change":{"kind":"model_create","id":"catalog/model","name":"Catalog model"}});
+    let cookie = format!("__Host-br-session={token}; __Host-br-csrf={csrf}");
+    for path in ["/bff/v1/catalog/models/query", "/bff/v1/catalog/apply"] {
+        let response = client
+            .post(format!("{base}{path}"))
+            .header("origin", "https://evil.example")
+            .header("cookie", &cookie)
+            .header("x-br-csrf", &csrf)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+    }
+    let mut receipts = vec![];
+    for _ in 0..2 {
+        let response = client
+            .post(format!("{base}/bff/v1/catalog/apply"))
+            .header("origin", &f.bff.config.origin)
+            .header("cookie", &cookie)
+            .header("x-br-csrf", &csrf)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        receipts.push(response.json::<Value>().await.unwrap());
+    }
+    assert_eq!(receipts[0], receipts[1]);
+    assert!(
+        f.bff
+            .query(&token, &csrf, "/catalog/v1/permissions/apply", b"{}")
+            .await
+            .is_err()
+    );
+    f.bff.logout(&token, &csrf).await.unwrap();
+    assert!(
+        f.bff
+            .query(
+                &token,
+                &csrf,
+                "/catalog/v1/apply",
+                &serde_json::to_vec(&body).unwrap()
+            )
+            .await
+            .is_err()
+    );
 }
 #[sqlx::test(migrations = "./migrations")]
 async fn login_and_logout_audit_failures_are_atomic(pool: PgPool) {

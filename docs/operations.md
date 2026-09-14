@@ -28,6 +28,8 @@ M5.2a 迁移至 `0012` 后新增专用 `brokerrouter_bff` 登录运行 `serve-bf
 
 ## 健康与迁移
 
+M5.3a 迁移 `0013` 后重新应用权限脚本，新增专用 `brokerrouter_catalog` 登录与 `serve-catalog`。BFF 配置代理默认关闭，启用需独立签名 key/audience；配置服务只读运维预登记连接，不持有真实供应商 Key。版本冲突、幂等回执、默认停用与发布窗口见 [配置管理契约](m5-catalog-management.md)。本版 BFF 指纹扩展会要求重新登录，不回退会话或审计事实。
+
 `/health/live` 只证明进程能响应；`/health/ready` 校验全部已应用迁移的版本、成功状态和 checksum 与二进制一致。数据库失联、迁移缺失、checksum 不同或有未知迁移均不就绪。服务启动同样校验，不会在普通运行身份下自行迁移。
 
 数据库连接池获取超时 5 秒；连接未配置非零限时时，应用默认设置 SQL `statement_timeout=15s`、`lock_timeout=3s`。运维通过实际登录角色或连接参数配置的非零上限会保留；涉及大表的迁移要使用独立迁移身份和显式更长的有限超时，不在生产服务连接中取消限时。

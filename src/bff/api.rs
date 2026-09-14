@@ -24,6 +24,9 @@ pub fn router(service: Arc<Bff>) -> Router {
         .route("/bff/v1/usage/groups/query", post(query))
         .route("/bff/v1/requests/query", post(query))
         .route("/bff/v1/audit/query", post(query))
+        .route("/bff/v1/catalog/models/query", post(query))
+        .route("/bff/v1/catalog/endpoints/query", post(query))
+        .route("/bff/v1/catalog/apply", post(query))
         .fallback(|| async { Error::NotFound })
         .with_state(service)
         .layer(axum::extract::DefaultBodyLimit::max(16384))
@@ -234,7 +237,11 @@ async fn query(
         return Err(Error::Invalid("query string is not supported"));
     }
     let (token, csrf) = auth(&headers)?;
-    let path = uri.path().replacen("/bff/", "/console/", 1);
+    let path = if let Some(suffix) = uri.path().strip_prefix("/bff/v1/catalog/") {
+        format!("/catalog/v1/{suffix}")
+    } else {
+        uri.path().replacen("/bff/", "/console/", 1)
+    };
     let (status, bytes) = b.query(&token, &csrf, &path, &body).await?;
     Ok((
         status,

@@ -16,12 +16,16 @@ use uuid::Uuid;
 pub enum Permission {
     UsageRead,
     AuditRead,
+    CatalogRead,
+    CatalogWrite,
 }
 impl Permission {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::UsageRead => "usage_read",
             Self::AuditRead => "audit_read",
+            Self::CatalogRead => "catalog_read",
+            Self::CatalogWrite => "catalog_write",
         }
     }
 }
@@ -423,6 +427,10 @@ struct AuditRow {
     object_id: String,
     created_at: DateTime<Utc>,
     database_actor: String,
+    actor_user_id: Option<String>,
+    change_reason: Option<String>,
+    operation_id: Option<String>,
+    config_revision: Option<String>,
 }
 pub async fn audit(pool: &PgPool, who: &Human, query: AuditQuery) -> Result<Value> {
     limit(query.limit)?;
@@ -436,7 +444,7 @@ pub async fn audit(pool: &PgPool, who: &Human, query: AuditQuery) -> Result<Valu
     }
     let mut tx = begin(pool, who, Permission::AuditRead).await?;
     let mut q = QueryBuilder::new(
-        "SELECT id,action,object_id,created_at,database_actor FROM console_audit_facts WHERE tenant_id=",
+        "SELECT id,action,object_id,created_at,database_actor,actor_user_id,change_reason,operation_id,config_revision FROM console_audit_facts WHERE tenant_id=",
     );
     q.push_bind(who.tenant_id)
         .push(" AND created_at>=")
@@ -472,7 +480,7 @@ pub async fn audit(pool: &PgPool, who: &Human, query: AuditQuery) -> Result<Valu
     } else {
         None
     };
-    let data:Vec<_>=rows.into_iter().map(|r|json!({"id":r.id.to_string(),"action":r.action,"object_id":r.object_id,"created_at":r.created_at,"database_actor":r.database_actor})).collect();
+    let data:Vec<_>=rows.into_iter().map(|r|json!({"id":r.id.to_string(),"action":r.action,"object_id":r.object_id,"created_at":r.created_at,"database_actor":r.database_actor,"actor_user_id":r.actor_user_id,"change_reason":r.change_reason,"operation_id":r.operation_id,"config_revision":r.config_revision})).collect();
     finish(
         tx,
         pool,

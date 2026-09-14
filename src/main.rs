@@ -45,12 +45,16 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8086")]
         bind: SocketAddr,
     },
+    ServeCatalog {
+        #[arg(long, default_value = "127.0.0.1:8088")]
+        bind: SocketAddr,
+    },
     ConsolePermissionSet {
         #[arg(long)]
         tenant: Uuid,
         #[arg(long)]
         user: Uuid,
-        #[arg(long, value_parser=["usage_read","audit_read"])]
+        #[arg(long, value_parser=["usage_read","audit_read","catalog_read","catalog_write"])]
         permission: String,
         #[arg(long, action=clap::ArgAction::Set)]
         enabled: bool,
@@ -354,6 +358,19 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::BffMaintain => {
             brokerrouter::bff::maintain(&pool).await?;
+        }
+        Command::ServeCatalog { bind } => {
+            brokerrouter::check_schema(&pool).await?;
+            let service = brokerrouter::catalog_api::Catalog {
+                pool: pool.clone(),
+                verifier: std::sync::Arc::new(brokerrouter::human::Verifier::catalog_from_env()?),
+                connections: std::sync::Arc::new(brokerrouter::catalog::connections_from_env()?),
+            };
+            let listener = tokio::net::TcpListener::bind(bind).await?;
+            tracing::info!(address=%bind,"human catalog configuration listening; no provider credentials or approval authority");
+            axum::serve(listener, brokerrouter::catalog_api::router(service))
+                .with_graceful_shutdown(shutdown())
+                .await?;
         }
         Command::ServeConsole { bind } => {
             brokerrouter::check_schema(&pool).await?;

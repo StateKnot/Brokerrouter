@@ -17,6 +17,8 @@ pub enum Error {
     Budget,
     #[error("idempotency key conflicts with a different request")]
     Conflict,
+    #[error("configuration changed; reload and review before saving")]
+    ConfigConflict,
     #[error("no effective USD/CNY exchange rate is configured")]
     MissingFx,
     #[error("operation is already in progress or awaiting reconciliation")]
@@ -81,6 +83,7 @@ impl IntoResponse for Error {
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Self::Budget => (StatusCode::TOO_MANY_REQUESTS, "budget_exceeded"),
             Self::Conflict => (StatusCode::CONFLICT, "idempotency_conflict"),
+            Self::ConfigConflict => (StatusCode::CONFLICT, "configuration_conflict"),
             Self::MissingFx => (StatusCode::SERVICE_UNAVAILABLE, "exchange_rate_missing"),
             Self::InProgress => (StatusCode::CONFLICT, "operation_in_progress"),
             Self::SchemaMismatch => (StatusCode::SERVICE_UNAVAILABLE, "schema_mismatch"),

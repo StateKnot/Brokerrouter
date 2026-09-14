@@ -50,6 +50,21 @@ pub fn console_sign(mut claims: Claims) -> String {
     header.typ = Some("br-console+jwt".into());
     jsonwebtoken::encode(&header, &claims, &keys().0).unwrap()
 }
+pub fn catalog_verifier() -> human::Verifier {
+    human::Verifier::new_catalog(
+        ISSUER,
+        "brokerrouter-catalog-test",
+        HashMap::from([("fixture".into(), keys().1.clone())]),
+    )
+    .unwrap()
+}
+pub fn catalog_sign(mut claims: Claims) -> String {
+    claims.aud = "brokerrouter-catalog-test".into();
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some("fixture".into());
+    header.typ = Some("br-catalog+jwt".into());
+    jsonwebtoken::encode(&header, &claims, &keys().0).unwrap()
+}
 pub fn cipher() -> ResultCipher {
     ResultCipher::new(
         "fixture".into(),

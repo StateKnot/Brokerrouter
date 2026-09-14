@@ -182,4 +182,19 @@ GRANT INSERT ON audit_events TO brokerrouter_bff;
 GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_bff;
 GRANT SELECT,INSERT ON bff_identity_bindings TO brokerrouter_operator;
 GRANT UPDATE(active,generation) ON bff_identity_bindings TO brokerrouter_operator;
+-- Configuration is NOT a permission escalation of the read-only report service.
+DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_catalog') THEN
+    CREATE ROLE brokerrouter_catalog NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+END IF; END $$;
+GRANT USAGE ON SCHEMA public TO brokerrouter_catalog;
+GRANT SELECT ON _sqlx_migrations,console_permissions,models,endpoints,catalog_mutations TO brokerrouter_catalog;
+GRANT SELECT(id,active) ON tenants TO brokerrouter_catalog;
+GRANT SELECT(tenant_id,id,issuer,subject,active) ON governance_users TO brokerrouter_catalog;
+GRANT UPDATE(governance_lock) ON tenants TO brokerrouter_catalog;
+GRANT UPDATE(catalog_lock) ON governance_users,console_permissions TO brokerrouter_catalog;
+GRANT INSERT ON models,endpoints,catalog_mutations,audit_events TO brokerrouter_catalog;
+GRANT SELECT,INSERT ON catalog_endpoint_connections TO brokerrouter_catalog;
+GRANT UPDATE(name,active) ON models TO brokerrouter_catalog;
+GRANT UPDATE(name,active,priority,currency,input_per_million,output_per_million) ON endpoints TO brokerrouter_catalog;
+GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_catalog;
 COMMIT;
