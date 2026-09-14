@@ -158,6 +158,7 @@ pub fn validate_rule(rule: &Value) -> Result<()> {
             Ok(())
         }
         Some("model_judge") => crate::judge::Rule::parse(rule).map(|_| ()),
+        Some("asset_scan") => crate::output_delivery::validate_rule(rule),
         _ => Err(Error::Invalid("unsupported guardrail rule")),
     }
 }
@@ -228,6 +229,11 @@ pub(crate) async fn gate(
     if matches!(op.state.as_str(), "rejected" | "feedback") {
         return Err(Error::ActionRejected);
     }
+    if op.stage == "media_output"
+        && crate::output_delivery::validate_operation(tx, who, op).await? != *payload
+    {
+        return Err(Error::PolicyChanged);
+    }
     let rules = selected(
         tx,
         who,
@@ -258,6 +264,8 @@ pub(crate) async fn gate(
                 "skipped_by_user_approval".to_owned(),
                 "approved_current_turn".to_owned(),
             )
+        } else if r.rule["kind"] == "asset_scan" && op.stage == "media_output" {
+            crate::output_delivery::outcome(&r.rule, payload)?
         } else if r.rule["kind"] == "model_judge" {
             match crate::judge::observe(tx, who, op, &r).await? {
                 crate::judge::Observation::Pending(id) => {
@@ -274,7 +282,7 @@ pub(crate) async fn gate(
         if outcome == "risk" || outcome == "failed" {
             // Preserve the original deterministic approval hash across upgrades.
             let mut item = json!({"id":r.id,"version":r.version,"name":r.name,"stage":r.stage,"reason_code":reason});
-            if r.rule["kind"] == "model_judge" {
+            if r.rule["kind"] == "model_judge" || r.rule["kind"] == "asset_scan" {
                 item["evaluation_outcome"] = json!(outcome);
             }
             needed.push(item);
@@ -313,13 +321,20 @@ pub(crate) async fn gate(
         let expiry:Option<DateTime<Utc>>=sqlx::query_scalar("SELECT result_expires_at FROM requests WHERE tenant_id=$1 AND governance_turn_id=$2 AND id::text=(SELECT operation_key FROM governance_operations WHERE tenant_id=$1 AND id=$3) AND result_ciphertext IS NOT NULL AND result_expires_at>clock_timestamp()")
             .bind(who.tenant_id).bind(turn.id).bind(op.id).fetch_optional(&mut **tx).await?.flatten();
         turn.expires_at.min(expiry.ok_or(Error::ResultUnavailable)?)
+    } else if op.stage == "media_output" {
+        let expiry: DateTime<Utc> = serde_json::from_value(payload["expires_at"].clone())
+            .map_err(|_| Error::Configuration)?;
+        turn.expires_at.min(expiry)
     } else {
         turn.expires_at
     };
     let id = Uuid::new_v4();
-    let summary = json!({"model_id":op.model_id,"tool_name":op.tool_name,"stage":op.stage,"payload_hash":hex(&op.payload_hash),"session_id":turn.session_id,"run_id":turn.run_id,"generation":turn.generation});
-    let inserted=sqlx::query("INSERT INTO approvals(tenant_id,id,operation_id,turn_id,policy_hash,policy_snapshot,guardrails,expires_at,summary) VALUES($1,$2,$3,$4,$5,$6,$7,LEAST($8,clock_timestamp()+interval '15 minutes'),$9) ON CONFLICT(tenant_id,operation_id,policy_hash) DO NOTHING")
-        .bind(who.tenant_id).bind(id).bind(op.id).bind(turn.id).bind(&hash).bind(snapshot).bind(json!(needed)).bind(expires).bind(summary).execute(&mut **tx).await?;
+    let mut summary = json!({"model_id":op.model_id,"tool_name":op.tool_name,"stage":op.stage,"payload_hash":hex(&op.payload_hash),"session_id":turn.session_id,"run_id":turn.run_id,"generation":turn.generation});
+    if op.stage == "media_output" {
+        summary["output"] = payload.clone();
+    }
+    let inserted=sqlx::query("INSERT INTO approvals(tenant_id,id,operation_id,turn_id,policy_hash,policy_snapshot,guardrails,expires_at,summary) VALUES($1,$2,$3,$4,$5,$6,$7,CASE WHEN $10 THEN $8 ELSE LEAST($8,clock_timestamp()+interval '15 minutes') END,$9) ON CONFLICT(tenant_id,operation_id,policy_hash) DO NOTHING")
+        .bind(who.tenant_id).bind(id).bind(op.id).bind(turn.id).bind(&hash).bind(snapshot).bind(json!(needed)).bind(expires).bind(summary).bind(op.stage=="media_output").execute(&mut **tx).await?;
     let approval: Approval = sqlx::query_as(
         "SELECT * FROM approvals WHERE tenant_id=$1 AND operation_id=$2 AND policy_hash=$3",
     )

@@ -60,10 +60,12 @@ M3 已增加确定性/文本语义护栏、模型输入/输出审批、当前 tu
 
 M4.1 已增加 [私有输入资产与非 Token 人民币计费](docs/m4-assets-pricing.md)：`serve-assets` 提供 `/v1/assets` 分块上传、校验、私有下载和过期清理；`asset-quota-set` 显式配置租户/Key 字节配额。S3 兼容存储中的资产分块经应用加密，内容安全状态单独记录；不能把输入上传完成视为审核通过。
 
-M4.2 已增加 [持久媒体作业](docs/m4-media-jobs.md)：`serve-media` 提供动态能力、作业创建/状态/事件/取消，`media-worker` 独立执行。首个连接器为百炼 Wan2.7 文生视频，支持多端点能力匹配、输入真人审批、不确定受理不重发、恢复查询及冻结价格/汇率的人民币结算。**生成成功仍停在隔离的 `output_pending`，当前不交付视频文件**；M4.3 增量见下。真实供应商认证尚未执行。
+M4.2 已增加 [持久媒体作业](docs/m4-media-jobs.md)：`serve-media` 提供动态能力、作业创建/状态/事件/取消，`media-worker` 独立执行。首个连接器为百炼 Wan2.7 文生视频，支持多端点能力匹配、输入真人审批、不确定受理不重发、恢复查询及冻结价格/汇率的人民币结算。生成成功停在隔离的 `output_pending`，只有经过下述 M4.3 审批交付链才可读取文件。真实供应商认证尚未执行。
 
-M4.3a 增加 [输出隔离转存](docs/m4-output-quarantine.md)：生成前原子预留存储容量、独立 `output-worker`、精确来源/强 ETag 校验、持久加密分块与取消清理，并用数据库 RLS 阻断旧输入资产接口读取输出。**转存成功仍不等于审核或交付**；二进制护栏与真人批准后下载继续在 M4.3b 实现。
+M4.3a 增加 [输出隔离转存](docs/m4-output-quarantine.md)：生成前原子预留存储容量、独立 `output-worker`、精确来源/强 ETag 校验、持久加密分块与取消清理，并用数据库 RLS 阻断旧输入资产接口读取输出。转存成功不等于审核或交付，后续门禁见下。
 
-M4.3b 第一包增加 [扫描作业与证据链](docs/m4-output-scan-evidence.md)：独立 `serve-output-scans`、版本化检测清单摘要、租户/profile 专属扫描凭据、分块读取、持久租约与不可变回执。**完成回执不是人工批准，也不开放产物下载**；真实检测引擎适配、资产感知策略和真人审批交付仍待后续完成。
+M4.3b 第一包增加 [扫描作业与证据链](docs/m4-output-scan-evidence.md)：独立 `serve-output-scans`、版本化检测清单摘要、租户/profile 专属扫描凭据、分块读取、持久租约与不可变回执。完成回执不是人工批准，不直接开放产物下载。
 
-M4.3b 第二包接入 [实际隔离技术检测器](docs/m4-isolated-detector.md)：独立 Rust `brokerrouter-scanner` 通过无网络、只读、有限资源的固定摘要镜像执行 ClamAV、FFprobe 与 FFmpeg 全流解码，持久化证据并支持失败恢复。**技术检测不替代语义合规**：`content` 始终为 unknown，产物仍不交付；资产策略、真人审阅与同轮审批交付继续开发，生产检测质量和部署认证仍是发布闸门。
+M4.3b 第二包接入 [实际隔离技术检测器](docs/m4-isolated-detector.md)：独立 Rust `brokerrouter-scanner` 通过无网络、只读、有限资源的固定摘要镜像执行 ClamAV、FFprobe 与 FFmpeg 全流解码，持久化证据并支持失败恢复。**技术检测不替代语义合规**：`content` 始终为 unknown，不能据此自动交付。
+
+M4.3b 第三包增加 [资产策略、真人审阅与当前轮交付](docs/m4-output-delivery.md)：独立 `serve-output-delivery`、绑定扫描配置的 `media_output` 护栏、受信真人审阅、部分批准/拒绝/反馈与原 Key 受控分块读取。技术失败不可豁免，内容风险/未知由真人决定；同轮批准不跨轮，撤销和配置变化在读取前后重新校验。没有永久链接或 Agent 代批权限；专用多模态语义审核、控制台预览/原生弹窗及生产认证仍待后续完成。

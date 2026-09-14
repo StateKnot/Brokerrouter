@@ -17,6 +17,8 @@ use sqlx::PgPool;
 use std::{collections::HashMap, sync::Arc};
 use tower::ServiceExt;
 use uuid::Uuid;
+#[path = "common/write_fault.rs"]
+mod write_fault;
 
 fn cipher() -> ResultCipher {
     ResultCipher::new(
@@ -24,6 +26,69 @@ fn cipher() -> ResultCipher {
         HashMap::from([("test-v1".into(), "12".repeat(32))]),
     )
     .unwrap()
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn immutable_chunk_replay_and_unknown_put_recover_only_with_verified_stored_bytes(
+    pool: PgPool,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (who, _) = identity(&pool).await;
+    let objects = Arc::new(InMemory::new());
+    let fault = Arc::new(write_fault::Fault {
+        inner: objects.clone(),
+        mode: AtomicUsize::new(2),
+        puts: AtomicUsize::new(0),
+    });
+    let a = Assets::new(pool.clone(), fault.clone(), cipher(), 2).unwrap();
+    let asset = id(&a
+        .create(&who, "lost-put-response", request(b"abc"))
+        .await
+        .unwrap());
+    assert!(
+        a.put_chunk(&who, asset, 0, Bytes::from_static(b"abc"))
+            .await
+            .is_err(),
+        "an error without a stored object cannot succeed"
+    );
+    assert_eq!(fault.puts.load(Ordering::SeqCst), 1);
+    fault.mode.store(1, Ordering::SeqCst);
+    a.put_chunk(&who, asset, 0, Bytes::from_static(b"abc"))
+        .await
+        .unwrap();
+    let p = path(&pool, &who, asset, 0).await;
+    let before = objects.get(&p).await.unwrap().bytes().await.unwrap();
+    a.put_chunk(&who, asset, 0, Bytes::from_static(b"abc"))
+        .await
+        .unwrap();
+    assert_eq!(
+        fault.puts.load(Ordering::SeqCst),
+        2,
+        "stored replay must not perform another PUT"
+    );
+    assert_eq!(
+        objects.get(&p).await.unwrap().bytes().await.unwrap(),
+        before
+    );
+    objects
+        .put(&p, Bytes::from_static(b"corrupt").into())
+        .await
+        .unwrap();
+    assert!(
+        a.put_chunk(&who, asset, 0, Bytes::from_static(b"abc"))
+            .await
+            .is_err(),
+        "database stored flag cannot bless corrupt ciphertext"
+    );
+    assert_eq!(fault.puts.load(Ordering::SeqCst), 2);
+    objects.delete(&p).await.unwrap();
+    assert!(
+        a.put_chunk(&who, asset, 0, Bytes::from_static(b"abc"))
+            .await
+            .is_err(),
+        "stored replay must not silently recreate a missing object"
+    );
+    assert_eq!(fault.puts.load(Ordering::SeqCst), 2);
 }
 async fn identity(pool: &PgPool) -> (store::Identity, String) {
     let tenant = store::create_tenant(pool, "asset test", 10_000_000)

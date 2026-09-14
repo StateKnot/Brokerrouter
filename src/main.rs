@@ -16,6 +16,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Migrate,
+    ServeOutputDelivery {
+        #[arg(long, default_value = "127.0.0.1:8085")]
+        bind: SocketAddr,
+    },
     ServeOutputScans {
         #[arg(long, default_value = "127.0.0.1:8084")]
         bind: SocketAddr,
@@ -259,6 +263,20 @@ async fn main() -> anyhow::Result<()> {
         anyhow::anyhow!("database connection failed; verify DATABASE_URL and network")
     })?;
     match cli.command {
+        Command::ServeOutputDelivery { bind } => {
+            brokerrouter::check_schema(&pool).await?;
+            let service = brokerrouter::output_delivery_api::Service {
+                delivery: brokerrouter::output_delivery::Delivery::new(
+                    brokerrouter::assets::Assets::from_env(pool.clone())?,
+                ),
+                verifier: std::sync::Arc::new(brokerrouter::human::Verifier::from_env()?),
+            };
+            let listener = tokio::net::TcpListener::bind(bind).await?;
+            tracing::info!(address=%bind,"current-turn output delivery listening; human decisions remain on the separate control service");
+            axum::serve(listener, brokerrouter::output_delivery_api::router(service))
+                .with_graceful_shutdown(shutdown())
+                .await?;
+        }
         Command::OutputScanProfilePublish { file } => {
             brokerrouter::output_scans::publish(
                 &pool,

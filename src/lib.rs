@@ -15,6 +15,8 @@ pub mod media;
 pub mod media_api;
 pub mod media_protocol;
 pub mod money;
+pub mod output_delivery;
+pub mod output_delivery_api;
 pub mod output_scan_api;
 pub mod output_scans;
 pub mod outputs;

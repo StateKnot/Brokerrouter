@@ -133,7 +133,7 @@ impl Verifier {
         })
     }
 }
-async fn authorize(tx: &mut Tx<'_>, human: &Human) -> Result<()> {
+pub(crate) async fn authorize(tx: &mut Tx<'_>, human: &Human) -> Result<()> {
     governance::tenant_lock(tx, human.tenant_id).await?;
     let live: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM governance_users WHERE tenant_id=$1 AND id=$2 AND active) AND clock_timestamp()<to_timestamp($3::double precision)").bind(human.tenant_id).bind(human.id).bind(human.claims.exp as f64).fetch_one(&mut **tx).await?;
     if !live {
@@ -367,6 +367,9 @@ pub async fn resolve(
             return Err(Error::Unauthorized);
         }
     }
+    if op.stage == "media_output" {
+        crate::output_delivery::validate_operation(&mut tx, &who, &op).await?;
+    }
     let current = governance::selected(
         &mut tx,
         &who,
@@ -385,7 +388,12 @@ pub async fn resolve(
             .find(|r| r["id"].as_str() == Some(selected))
             .ok_or(Error::Invalid("selected guardrail was not requested"))?;
         let version = r["version"].as_i64().ok_or(Error::Configuration)? as i32;
-        sqlx::query("INSERT INTO guardrail_grants(tenant_id,turn_id,guardrail_id,version,approval_id,expires_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING").bind(who.tenant_id).bind(turn.id).bind(selected).bind(version).bind(id).bind(a.expires_at).execute(&mut *tx).await?;
+        let grant_expiry = if op.stage == "media_output" {
+            turn.expires_at
+        } else {
+            a.expires_at
+        };
+        sqlx::query("INSERT INTO guardrail_grants(tenant_id,turn_id,guardrail_id,version,approval_id,expires_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING").bind(who.tenant_id).bind(turn.id).bind(selected).bind(version).bind(id).bind(grant_expiry).execute(&mut *tx).await?;
     }
     let state = match decision.decision.as_str() {
         "continue_this_turn" => "approved",
@@ -495,12 +503,20 @@ pub async fn publish_guardrail(pool: &PgPool, tenant: Uuid, rule: Guardrail) -> 
         || rule.version < 1
         || !matches!(
             rule.stage.as_str(),
-            "pre" | "post" | "tool_input" | "tool_output" | "artifact"
+            "pre" | "post" | "tool_input" | "tool_output" | "artifact" | "media_output"
         )
     {
         return Err(Error::Invalid("invalid guardrail version"));
     }
     governance::validate_rule(&rule.rule)?;
+    if (rule.stage == "media_output"
+        && !matches!(rule.rule["kind"].as_str(), Some("asset_scan" | "always")))
+        || (rule.stage != "media_output" && rule.rule["kind"] == "asset_scan")
+    {
+        return Err(Error::Invalid(
+            "asset_scan is server-only media_output; binary output does not support text rules",
+        ));
+    }
     let mut tx = pool.begin().await?;
     governance::tenant_lock(&mut tx, tenant).await?;
     let old: Option<i32> =

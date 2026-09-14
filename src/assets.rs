@@ -280,28 +280,30 @@ impl Assets {
             return Err(Error::Conflict);
         }
         tx.commit().await?;
-        let encrypted = self.cipher.encrypt(who.tenant_id, c.id, &bytes)?;
-        let put = tokio::time::timeout(
-            IO_TIMEOUT,
-            self.store.put_opts(
-                &location(&c),
-                encrypted.into(),
-                PutOptions {
-                    mode: PutMode::Create,
-                    ..Default::default()
-                },
-            ),
-        )
-        .await;
-        match put {
-            Ok(Ok(_)) => {}
-            Ok(Err(
-                object_store::Error::AlreadyExists { .. }
-                | object_store::Error::Precondition { .. },
-            )) => {
+        if c.state == "stored" {
+            // An acknowledged immutable chunk needs no second PUT. Verify storage reality,
+            // not just the database flag, before replaying its success.
+            self.read_chunk(&c).await?;
+        } else {
+            let encrypted = self.cipher.encrypt(who.tenant_id, c.id, &bytes)?;
+            let put = tokio::time::timeout(
+                IO_TIMEOUT,
+                self.store.put_opts(
+                    &location(&c),
+                    encrypted.into(),
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await;
+            if !matches!(put, Ok(Ok(_))) {
+                // A lost/failed conditional response does not prove the write failed.
+                // Recover only from the exact existing authenticated plaintext and hash.
+                // Missing, corrupt, or unreadable objects still fail; never repeat a PUT here.
                 self.read_chunk(&c).await?;
             }
-            _ => return Err(Error::Storage),
         }
         let mut tx = self.pool.begin().await?;
         authorize(&mut tx, who).await?;

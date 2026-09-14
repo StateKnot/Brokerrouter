@@ -55,6 +55,10 @@ pub enum Error {
     ScannerUnauthorized,
     #[error("scan lease expired, superseded or closed")]
     ScanLeaseEnded,
+    #[error("technical output safety checks failed; human approval cannot override them")]
+    OutputUnsafe,
+    #[error("an active asset_scan output policy bound to the current scan profile is required")]
+    OutputPolicyMissing,
     #[error("internal persistence failure")]
     Database(#[from] sqlx::Error),
 }
@@ -86,6 +90,8 @@ impl IntoResponse for Error {
             Self::HumanUnauthorized => (StatusCode::UNAUTHORIZED, "invalid_human_attestation"),
             Self::ScannerUnauthorized => (StatusCode::UNAUTHORIZED, "invalid_scanner_credential"),
             Self::ScanLeaseEnded => (StatusCode::CONFLICT, "scan_lease_ended"),
+            Self::OutputUnsafe => (StatusCode::CONFLICT, "output_unsafe"),
+            Self::OutputPolicyMissing => (StatusCode::CONFLICT, "output_policy_missing"),
             Self::Database(_) => (StatusCode::SERVICE_UNAVAILABLE, "persistence_unavailable"),
         };
         // Database errors can include sensitive query data. Log only the category.

@@ -173,6 +173,14 @@ impl Media {
         if let Some((version, state, report)) = scan {
             v["output_scan"] = json!({"profile_version":version,"state":state.unwrap_or_else(||"not_started".into()),"technical":report.as_ref().and_then(|r|r.get("technical")),"content":report.as_ref().and_then(|r|r.get("content")),"delivery":"not_released","approval":"not_granted"});
         }
+        let delivery:Option<(Uuid,String)>=sqlx::query_as("SELECT o.id,o.state FROM media_output_deliveries d JOIN governance_operations o ON o.tenant_id=d.tenant_id AND o.id=d.operation_id JOIN output_scans s ON s.tenant_id=d.tenant_id AND s.id=d.scan_id JOIN output_scan_profiles p ON p.tenant_id=s.tenant_id AND p.id=s.profile_id AND p.active WHERE d.tenant_id=$1 AND d.job_id=$2")
+            .bind(who.tenant_id).bind(id).fetch_optional(&mut *tx).await?;
+        if let Some((operation, state)) = delivery {
+            v["output_delivery"] = json!({"operation_id":operation,"operation_state":state,"authorization":"revalidated_per_read","check_path":format!("/v1/media/jobs/{id}/output/check"),"manifest_path":format!("/v1/media/jobs/{id}/output")});
+            v["output_scan"]["delivery"] = json!("check_output_delivery_api");
+            v["output_scan"]["approval"] = json!("check_current_authority");
+            v["output_storage"]["delivery"] = json!("check_output_delivery_api");
+        }
         let approval:Option<governance::Approval>=sqlx::query_as("SELECT a.* FROM approvals a JOIN governance_operations o ON o.tenant_id=a.tenant_id AND o.id=a.operation_id WHERE o.tenant_id=$1 AND o.key_id=$2 AND o.operation_key=$3 AND a.state='pending' ORDER BY a.expires_at DESC LIMIT 1")
             .bind(who.tenant_id).bind(who.key_id).bind(format!("media:{id}")).fetch_optional(&mut *tx).await?;
         if let Some(approval) = approval {

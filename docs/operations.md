@@ -1,6 +1,6 @@
 # 运行边界与数据库权限
 
-当前发布内容是基础模块，不是完整网关生产发布。具体未完成闸门见 [milestones.md](milestones.md)。
+当前按阶段交付能力，不是完整网关生产发布。具体实现状态和未完成闸门见 [milestones.md](milestones.md)。
 
 ## 数据库身份
 
@@ -19,6 +19,8 @@ M2 增加独立 `brokerrouter_reconciler` 权限组，只给被授权的人工�
 M3 的第四次 migration 后再次应用权限脚本；单独创建 `brokerrouter_governance_control` 登录身份运行 `serve-control`。此身份可处理真人审批与工具结果核对，但不能改预算/消费，不能调用供应商。真人控制面仅接收 BFF 请求级签名证明；浏览器登录态、BFF 私钥与 Agent 执行环境隔离。完整配置、TTL、原生恢复义务见 [M3 契约](m3-governance.md)。
 
 M4.1 第六次 migration 后再次应用权限脚本；独立 `brokerrouter_assets` 登录身份运行 `serve-assets`，只可操作资产清单/字节用量/审计，不可修改预算、人民币消费、价格、护栏或审批。资产配额仍由独立 operator 配置。对象存储、独立应用加密 keyring、桶权限、反向代理与未完成部署验收见 [M4.1 契约](m4-assets-pricing.md)。
+
+M4 输出链路迁移至 0010 后重新应用权限脚本。输出转存身份 `brokerrouter_media_outputs`、扫描 API 身份 `brokerrouter_output_scan`、审批交付身份 `brokerrouter_output_delivery` 互不继承，也不能附带 input assets / runtime / human control 组。交付组只能创建待决定审批和读取输出；决定仍由独立控制组执行。S3 转存写/删、扫描只读、交付只读凭据分开配置，不能直接复用全权限桶凭据。参见 [隔离转存](m4-output-quarantine.md)、[技术检测](m4-isolated-detector.md) 与 [审批交付部署契约](m4-output-delivery.md)。
 
 权限脚本用于新建的专用权限组，不会清理 DBA 额外授予的权限；部署时必须检查角色继承链与已有授权。触发器不能防御有权删除触发器的 DBA。备份、恢复与数据库管理员审计须独立配置。
 
@@ -41,4 +43,4 @@ M4.1 第六次 migration 后再次应用权限脚本；独立 `brokerrouter_asse
 
 ## 当前尚未开放
 
-当前档位已增加非流式 Chat/Embedding、幂等结果读取、人工费用核对、M3 持久审批/文本语义检测及 M4.1 私有输入资产和单位计费基础。流式/Responses、多模态生成作业/护栏连接器、控制台、自动供应商对账，以及真实 BFF/Runtime/供应商/生产存储认证尚未完成，不能据此宣称完整网关可上线。后续各里程碑保留相同的生产验收闸门。
+当前已实现非流式 Chat/Embedding、幂等结果读取、人工费用核对、持久审批/文本语义检测、私有资产/单位计费，以及首个文生视频协议、隔离转存、技术检测和当前轮审批交付服务端。流式/Responses、图片/3D/其他供应商协议、专用多模态语义审核、控制台/隔离预览与 Runtime 薄适配、自动供应商对账，以及真实 BFF/Runtime/供应商/生产存储认证尚未完成，不能据此宣称完整网关可上线。后续各里程碑保留相同的生产验收闸门。

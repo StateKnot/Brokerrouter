@@ -1,4 +1,6 @@
 mod common;
+#[path = "outputs_delivery/mod.rs"]
+mod delivery_tests;
 mod detector;
 use axum::{
     Json, Router,
@@ -723,11 +725,13 @@ async fn output_database_role_can_import_but_cannot_generate_change_money_or_app
 #[ignore = "requires isolated S3 fixture and BROKERROUTER_ASSET_* configuration"]
 async fn s3_output_import_quarantine_and_cleanup(pool: PgPool) {
     let f = setup(&pool).await;
-    let job = generate(&f, &pool, None).await;
+    common::provision(&pool, &f.who, "s3-output-reader").await;
+    let turn = common::turn(&pool, &f.who, "s3-output-reader", 0).await;
+    let job = generate(&f, &pool, Some(turn)).await;
     let o = Outputs::new(Assets::from_env(pool.clone()).unwrap(), common::cipher());
     o.tick().await.unwrap();
     assert_eq!(state(&pool, job).await, "quarantined");
-    let (_, scanner, _) = scanner(&pool, &f, 1).await;
+    let (profile, scanner, _) = scanner(&pool, &f, 1).await;
     let scans = Scans::new(o.assets.clone());
     let task = scans
         .claim(&scanner, Uuid::new_v4())
@@ -743,7 +747,33 @@ async fn s3_output_import_quarantine_and_cleanup(pool: PgPool) {
         .report(&scanner, attempt_id(&task), scan_report(&task))
         .await
         .unwrap();
+    common::guardrail(
+        &pool,
+        f.who.tenant_id,
+        "content",
+        1,
+        "media_output",
+        json!({"kind":"asset_scan","profile_id":profile.id}),
+    )
+    .await;
+    let d = brokerrouter::output_delivery::Delivery::new(o.assets.clone());
+    let a = d.check(&f.who, job).await.unwrap();
+    assert!(d.chunk(&f.who, job, 0).await.is_err());
+    common::decide(
+        &pool,
+        "s3-output-reader",
+        common::approval_id(&a),
+        common::approve(&["content"]),
+    )
+    .await
+    .unwrap();
+    let mut delivered = Vec::new();
+    for n in 0..task["chunk_count"].as_i64().unwrap() as i32 {
+        delivered.extend_from_slice(&d.chunk(&f.who, job, n).await.unwrap());
+    }
+    assert_eq!(delivered.as_slice(), f.r.data.as_ref());
     f.m.cancel(&f.who, job).await.unwrap();
+    assert!(d.chunk(&f.who, job, 0).await.is_err());
     o.maintain().await.unwrap();
     let id = asset_id(&pool, job).await;
     sqlx::query("UPDATE assets SET gc_after=clock_timestamp()-interval '1 second' WHERE id=$1")
@@ -1411,13 +1441,15 @@ async fn detector_worker_rejects_manifest_drift_revocation_and_nonprivate_storag
 
 #[sqlx::test(migrations = "./migrations")]
 #[ignore = "requires pinned local ClamAV/FFmpeg detector image; CI explicitly runs this"]
-async fn isolated_detector_real_engines_scan_valid_video_and_keep_output_quarantined(pool: PgPool) {
+async fn isolated_detector_real_engines_require_human_before_current_turn_delivery(pool: PgPool) {
     use brokerrouter::scanner_worker::Worker;
     let mut local = detector::Local::new("http://127.0.0.1/".into(), true);
     local.engine().preflight().await.unwrap();
     let video = local.video().await;
     let f = setup_data(&pool, Bytes::from(video)).await;
-    let job = generate(&f, &pool, None).await;
+    common::provision(&pool, &f.who, "real-output-reader").await;
+    let turn = common::turn(&pool, &f.who, "real-output-reader", 0).await;
+    let job = generate(&f, &pool, Some(turn)).await;
     f.o.tick().await.unwrap();
     let (token, server) = worker_setup(&pool, &f, &mut local).await;
     let worker = Worker::new(local.config.clone(), token).unwrap();
@@ -1438,6 +1470,33 @@ async fn isolated_detector_real_engines_scan_valid_video_and_keep_output_quarant
     let evidence: Value = serde_json::from_slice(&evidence).unwrap();
     assert_eq!(evidence["steps"].as_array().unwrap().len(), 3);
     assert_eq!(f.m.get(&f.who, job).await.unwrap()["artifacts"], json!([]));
+    let profile: Uuid = sqlx::query_scalar("SELECT profile_id FROM output_scans WHERE job_id=$1")
+        .bind(job)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    common::guardrail(
+        &pool,
+        f.who.tenant_id,
+        "content",
+        1,
+        "media_output",
+        json!({"kind":"asset_scan","profile_id":profile}),
+    )
+    .await;
+    let d = brokerrouter::output_delivery::Delivery::new(f.o.assets.clone());
+    let a = d.check(&f.who, job).await.unwrap();
+    assert_eq!(a["state"], "waiting_approval");
+    assert!(d.chunk(&f.who, job, 0).await.is_err());
+    common::decide(
+        &pool,
+        "real-output-reader",
+        common::approval_id(&a),
+        common::approve(&["content"]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(d.chunk(&f.who, job, 0).await.unwrap(), f.r.data);
     assert_eq!(f.r.posts.load(Ordering::SeqCst), 1);
     assert!(!local.config.work_dir.join("input").exists());
     server.abort();

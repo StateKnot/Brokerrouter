@@ -137,4 +137,25 @@ CREATE POLICY brokerrouter_scan_asset_read ON assets FOR SELECT TO brokerrouter_
 DROP POLICY IF EXISTS brokerrouter_scan_chunk_read ON asset_chunks;
 CREATE POLICY brokerrouter_scan_chunk_read ON asset_chunks FOR SELECT TO brokerrouter_output_scan
     USING(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id AND a.id=asset_chunks.asset_id AND a.kind='output'));
+DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_output_delivery') THEN CREATE ROLE brokerrouter_output_delivery NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION; END IF; END $$;
+-- Do not attach runtime, scanner, storage, or human-control membership to this role.
+GRANT USAGE ON SCHEMA public TO brokerrouter_output_delivery;
+GRANT SELECT ON _sqlx_migrations,tenants,virtual_keys,models,key_models,requests,
+    media_jobs,media_output_imports,assets,asset_chunks,output_scans,output_scan_profiles,
+    governance_users,runtime_bindings,governance_turns,guardrails,guardrail_versions,
+    guardrail_policies,governance_operations,approvals,guardrail_grants,human_assertions,
+    media_output_deliveries TO brokerrouter_output_delivery;
+GRANT UPDATE(governance_lock) ON tenants TO brokerrouter_output_delivery;
+GRANT UPDATE(event_clock) ON governance_turns TO brokerrouter_output_delivery;
+GRANT UPDATE(state) ON governance_operations TO brokerrouter_output_delivery;
+GRANT INSERT ON governance_operations,approvals,governance_events,human_assertions,
+    media_output_deliveries,audit_events TO brokerrouter_output_delivery;
+GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_output_delivery;
+GRANT SELECT ON media_output_deliveries TO brokerrouter_runtime,brokerrouter_operator,brokerrouter_governance_control;
+GRANT SELECT ON media_jobs,media_output_imports,assets,output_scans,output_scan_profiles TO brokerrouter_governance_control;
+DROP POLICY IF EXISTS brokerrouter_delivery_output_read ON assets;
+CREATE POLICY brokerrouter_delivery_output_read ON assets FOR SELECT TO brokerrouter_output_delivery,brokerrouter_governance_control USING(kind='output');
+DROP POLICY IF EXISTS brokerrouter_delivery_output_chunk_read ON asset_chunks;
+CREATE POLICY brokerrouter_delivery_output_chunk_read ON asset_chunks FOR SELECT TO brokerrouter_output_delivery
+    USING(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id AND a.id=asset_chunks.asset_id AND a.kind='output'));
 COMMIT;
