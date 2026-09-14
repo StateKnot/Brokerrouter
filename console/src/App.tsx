@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import type { FormEvent, ReactNode } from "react";
 import type { z } from "zod";
 import {
@@ -28,15 +35,31 @@ import {
   time,
 } from "./format";
 import type { Timezone } from "./format";
+const Audit = lazy(() =>
+  import("./Management").then((module) => ({ default: module.Audit })),
+);
+const Catalog = lazy(() =>
+  import("./Management").then((module) => ({ default: module.Catalog })),
+);
 
-type Page = "usage" | "requests";
+type Page = "usage" | "requests" | "audit" | "catalog";
+const titles: Record<Page, string> = {
+  usage: "人民币用量",
+  requests: "请求日志",
+  audit: "审计日志",
+  catalog: "模型与端点",
+};
 type Auth =
   | { state: "checking" }
   | { state: "login"; message?: string }
   | { state: "error"; error: unknown }
   | { state: "ready"; session: Session };
-const pageFromHash = (): Page =>
-  location.hash === "#requests" ? "requests" : "usage";
+const pageFromHash = (): Page => {
+  const page = location.hash.slice(1);
+  return page === "requests" || page === "audit" || page === "catalog"
+    ? page
+    : "usage";
+};
 
 function Notice({
   children,
@@ -310,6 +333,7 @@ function Workspace({
     const change = () => {
       setPage(pageFromHash());
       setMenu(false);
+      setPermissionError(null);
     };
     window.addEventListener("hashchange", change);
     return () => {
@@ -318,7 +342,7 @@ function Workspace({
     };
   }, []);
   useEffect(() => {
-    document.title = `${page === "usage" ? "人民币用量" : "请求日志"} · Brokerrouter`;
+    document.title = `${titles[page]} · Brokerrouter`;
     heading.current?.focus();
   }, [page]);
   async function logout() {
@@ -372,11 +396,20 @@ function Workspace({
           >
             请求日志
           </a>
+          <a href="#audit" aria-current={page === "audit" ? "page" : undefined}>
+            审计日志
+          </a>
+          <a
+            href="#catalog"
+            aria-current={page === "catalog" ? "page" : undefined}
+          >
+            模型与端点
+          </a>
         </nav>
         <div className="sidebar-note">
           <span>结算本位币</span>
           <strong>CNY · 人民币</strong>
-          <span>只读工作台</span>
+          <span>按权限开放配置</span>
         </div>
       </aside>
       <div className="workspace-body">
@@ -392,12 +425,16 @@ function Workspace({
         <main id="main" tabIndex={-1}>
           <header className="page-header">
             <h1 ref={heading} tabIndex={-1}>
-              {page === "usage" ? "人民币用量" : "请求日志"}
+              {titles[page]}
             </h1>
             <p>
               {page === "usage"
                 ? "按请求创建时间核对已入账费用、预留与模型用量。"
-                : "查看已准入请求的状态与账本记录，不含请求原文。"}
+                : page === "audit"
+                  ? "追溯组织操作记录与配置变更，区分真人操作与数据库执行身份。"
+                  : page === "catalog"
+                    ? "统一逻辑模型与多供应商端点，使用独立配置权限和可追溯变更。"
+                    : "查看已准入请求的状态与账本记录，不含请求原文。"}
             </p>
           </header>
           {logoutError !== null && (
@@ -405,15 +442,17 @@ function Workspace({
               退出未完成，会话可能仍有效。{errorMessage(logoutError)}
             </Notice>
           )}
-          <FilterForm
-            onApply={(next) => {
-              setPermissionError(null);
-              setSelection((current) => ({
-                ...next,
-                revision: current.revision + 1,
-              }));
-            }}
-          />
+          {(page === "usage" || page === "requests") && (
+            <FilterForm
+              onApply={(next) => {
+                setPermissionError(null);
+                setSelection((current) => ({
+                  ...next,
+                  revision: current.revision + 1,
+                }));
+              }}
+            />
+          )}
           <div className="context-line">
             <span>
               时区：{selection.timezone === "UTC" ? "UTC" : "北京时间 UTC+8"}
@@ -423,16 +462,30 @@ function Workspace({
           </div>
           {permissionError !== null && (
             <Notice>
-              {errorMessage(permissionError)} 获得授权后点击“查询 / 刷新”。
+              {errorMessage(permissionError)} 获得授权后重新加载。
+              <button
+                onClick={() => {
+                  setPermissionError(null);
+                  setReportEpoch((v) => v + 1);
+                }}
+              >
+                重新检查权限
+              </button>
             </Notice>
           )}
           {!loggingOut && logoutError === null && permissionError === null && (
             <div key={`${page}-${selection.revision}-${reportEpoch}`}>
-              {page === "usage" ? (
-                <Usage selection={selection} loginNeeded={reportDenied} />
-              ) : (
-                <Requests selection={selection} loginNeeded={reportDenied} />
-              )}
+              <Suspense fallback={<Loading />}>
+                {page === "usage" ? (
+                  <Usage selection={selection} loginNeeded={reportDenied} />
+                ) : page === "audit" ? (
+                  <Audit denied={reportDenied} />
+                ) : page === "catalog" ? (
+                  <Catalog denied={reportDenied} />
+                ) : (
+                  <Requests selection={selection} loginNeeded={reportDenied} />
+                )}
+              </Suspense>
             </div>
           )}
           {loggingOut && <Loading />}

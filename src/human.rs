@@ -46,6 +46,24 @@ impl Human {
     }
 }
 impl Verifier {
+    pub fn new_catalog(
+        issuer: &str,
+        audience: &str,
+        pem_keys: HashMap<String, String>,
+    ) -> Result<Self> {
+        let mut verifier = Self::new(issuer, audience, pem_keys)?;
+        verifier.token_type = "br-catalog+jwt";
+        Ok(verifier)
+    }
+    pub fn catalog_from_env() -> Result<Self> {
+        let get = |name| std::env::var(name).map_err(|_| Error::Configuration);
+        Self::new_catalog(
+            &get("BROKERROUTER_CATALOG_ISSUER")?,
+            &get("BROKERROUTER_CATALOG_AUDIENCE")?,
+            serde_json::from_str(&get("BROKERROUTER_CATALOG_PUBLIC_KEYS")?)
+                .map_err(|_| Error::Configuration)?,
+        )
+    }
     pub fn new_console(
         issuer: &str,
         audience: &str,

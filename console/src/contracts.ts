@@ -95,3 +95,78 @@ export const requestsSchema = z.object({
     .max(100),
   next_before: requestCursorSchema.nullable(),
 });
+export const auditSchema = z.object({
+  data: z
+    .array(
+      z.object({
+        id: count,
+        action: text,
+        object_id: text,
+        created_at: timestamp,
+        database_actor: text,
+        actor_user_id: text.nullable(),
+        change_reason: text.nullable(),
+        operation_id: text.nullable(),
+        config_revision: count.nullable(),
+      }),
+    )
+    .max(100),
+  next_before: z.object({ created_at: timestamp, id: count }).nullable(),
+});
+export const modelSchema = z.object({
+  id: text,
+  name: text,
+  active: z.boolean(),
+  revision: count,
+});
+export type Model = z.infer<typeof modelSchema>;
+export const modelsSchema = z.object({
+  data: z.array(modelSchema).max(100),
+  next_after: text.nullable(),
+  can_write: z.boolean(),
+});
+export const endpointSchema = z.object({
+  connection: z
+    .object({
+      id: text,
+      name: text,
+      revision: z.string().regex(/^[a-f0-9]{64}$/),
+    })
+    .nullable(),
+  id: z.uuid(),
+  model_id: text,
+  name: text,
+  upstream_model: text,
+  active: z.boolean(),
+  revision: count,
+  currency: z.enum(["CNY", "USD"]),
+  input_per_million: amount,
+  output_per_million: amount,
+  context_tokens: z.number().int().positive(),
+  max_output_tokens: z.number().int().positive(),
+  priority: z.number().int().nonnegative(),
+  operation: z.enum(["chat", "embedding"]),
+  supports_tools: z.boolean(),
+  embedding_dimension: z.number().int().positive().nullable(),
+});
+export type Endpoint = z.infer<typeof endpointSchema>;
+export const endpointsSchema = z.object({
+  model: modelSchema,
+  data: z.array(endpointSchema).max(100),
+  next_after: z.uuid().nullable(),
+  can_write: z.boolean(),
+  connections: z
+    .array(
+      z.object({
+        id: text,
+        name: text,
+        revision: z.string().regex(/^[a-f0-9]{64}$/),
+      }),
+    )
+    .max(100),
+});
+export const mutationSchema = z.object({
+  operation_id: z.uuid(),
+  object_id: text,
+  revision: count,
+});

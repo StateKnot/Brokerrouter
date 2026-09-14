@@ -221,6 +221,23 @@ pub struct Endpoint {
 
 impl Endpoint {
     pub fn validate(&self) -> Result<()> {
+        if !crate::governance::valid_text(&self.model_id, 200)
+            || !crate::governance::valid_text(&self.name, 200)
+            || !crate::governance::valid_text(&self.upstream_model, 200)
+            || self.base_url.len() > 2048
+            || self.priority < 0
+            || self.credential_env.is_empty()
+            || self.credential_env.len() > 128
+            || !self.credential_env.as_bytes()[0].is_ascii_uppercase()
+            || !self
+                .credential_env
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return Err(Error::Invalid(
+                "invalid endpoint identity or credential reference",
+            ));
+        }
         let url =
             url::Url::parse(&self.base_url).map_err(|_| Error::Invalid("invalid base URL"))?;
         if url.host_str().is_none()
@@ -285,22 +302,8 @@ impl Endpoint {
 }
 
 pub async fn add_endpoint(pool: &PgPool, e: &Endpoint) -> Result<()> {
-    e.validate()?;
     let mut tx = pool.begin().await?;
-    sqlx::query("SELECT id FROM models WHERE tenant_id=$1 AND id=$2 FOR UPDATE")
-        .bind(e.tenant_id)
-        .bind(&e.model_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(Error::NotFound)?;
-    let conflict:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM endpoints WHERE tenant_id=$1 AND model_id=$2 AND (operation<>$3 OR embedding_dimension IS DISTINCT FROM $4))").bind(e.tenant_id).bind(&e.model_id).bind(&e.operation).bind(e.embedding_dimension).fetch_one(&mut *tx).await?;
-    if conflict {
-        return Err(Error::Invalid(
-            "logical model operation and embedding space dimension must be consistent",
-        ));
-    }
-    sqlx::query("INSERT INTO endpoints(id,tenant_id,model_id,name,upstream_model,base_url,credential_env,allow_private,currency,input_per_million,output_per_million,context_tokens,max_output_tokens,priority,operation,supports_tools,embedding_dimension) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)")
-        .bind(e.id).bind(e.tenant_id).bind(&e.model_id).bind(&e.name).bind(&e.upstream_model).bind(&e.base_url).bind(&e.credential_env).bind(e.allow_private).bind(&e.currency).bind(e.input_per_million).bind(e.output_per_million).bind(e.context_tokens).bind(e.max_output_tokens).bind(e.priority).bind(&e.operation).bind(e.supports_tools).bind(e.embedding_dimension).execute(&mut *tx).await?;
+    insert_endpoint(&mut tx, e).await?;
     audit(
         &mut tx,
         e.tenant_id,
@@ -310,6 +313,28 @@ pub async fn add_endpoint(pool: &PgPool, e: &Endpoint) -> Result<()> {
     )
     .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn insert_endpoint(
+    tx: &mut Transaction<'_, Postgres>,
+    e: &Endpoint,
+) -> Result<()> {
+    e.validate()?;
+    sqlx::query("SELECT id FROM models WHERE tenant_id=$1 AND id=$2 FOR UPDATE")
+        .bind(e.tenant_id)
+        .bind(&e.model_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(Error::NotFound)?;
+    let conflict:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM endpoints WHERE tenant_id=$1 AND model_id=$2 AND (operation<>$3 OR embedding_dimension IS DISTINCT FROM $4))").bind(e.tenant_id).bind(&e.model_id).bind(&e.operation).bind(e.embedding_dimension).fetch_one(&mut **tx).await?;
+    if conflict {
+        return Err(Error::Invalid(
+            "logical model operation and embedding space dimension must be consistent",
+        ));
+    }
+    sqlx::query("INSERT INTO endpoints(id,tenant_id,model_id,name,upstream_model,base_url,credential_env,allow_private,currency,input_per_million,output_per_million,context_tokens,max_output_tokens,priority,operation,supports_tools,embedding_dimension) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)")
+        .bind(e.id).bind(e.tenant_id).bind(&e.model_id).bind(&e.name).bind(&e.upstream_model).bind(&e.base_url).bind(&e.credential_env).bind(e.allow_private).bind(&e.currency).bind(e.input_per_million).bind(e.output_per_million).bind(e.context_tokens).bind(e.max_output_tokens).bind(e.priority).bind(&e.operation).bind(e.supports_tools).bind(e.embedding_dimension).execute(&mut **tx).await?;
     Ok(())
 }
 

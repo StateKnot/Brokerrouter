@@ -8,6 +8,34 @@ const user = "22222222-2222-4222-8222-222222222222";
 const key = "33333333-3333-4333-8333-333333333333";
 const id = "44444444-4444-4444-8444-444444444444";
 const csrf = "a".repeat(64);
+const catalogModel = {
+  id: "test/model",
+  name: "测试逻辑模型",
+  active: false,
+  revision: "1",
+};
+const catalogEndpoint = {
+  id,
+  model_id: "test/model",
+  name: "测试供应商端点",
+  upstream_model: "qwen-test",
+  active: false,
+  revision: "2",
+  currency: "CNY",
+  input_per_million: "0.000000000001",
+  output_per_million: "2.500000000000",
+  context_tokens: 4096,
+  max_output_tokens: 1024,
+  priority: 100,
+  operation: "chat",
+  supports_tools: false,
+  embedding_dimension: null,
+  connection: {
+    id: "approved",
+    name: "预登记供应商",
+    revision: "b".repeat(64),
+  },
+};
 const totals = {
   requests: "6",
   succeeded: "4",
@@ -110,6 +138,205 @@ async function setup(page: Page, loggedIn = true) {
     route.fulfill({ status: 204 }),
   );
 }
+
+async function catalogSetup(page: Page, write = true) {
+  await setup(page);
+  await page.route("**/bff/v1/catalog/models/query", (route) =>
+    route.fulfill({
+      json: { data: [catalogModel], next_after: null, can_write: write },
+    }),
+  );
+  await page.route("**/bff/v1/catalog/endpoints/query", (route) =>
+    route.fulfill({
+      json: {
+        model: catalogModel,
+        data: [catalogEndpoint],
+        next_after: null,
+        can_write: write,
+        connections: [catalogEndpoint.connection],
+      },
+    }),
+  );
+}
+test("catalog readonly permission hides mutations and preserves exact prices", async ({
+  page,
+}) => {
+  await catalogSetup(page, false);
+  await page.goto("/#catalog");
+  await expect(
+    page.getByText("当前为只读模式", { exact: false }),
+  ).toBeVisible();
+  await expect(page.getByText("新建逻辑模型", { exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "管理 测试逻辑模型" }).click();
+  await expect(
+    page.getByText("CNY 0.000000000001", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("修改端点 测试供应商端点", { exact: true }),
+  ).toHaveCount(0);
+  expect(
+    await page.evaluate(() => localStorage.length + sessionStorage.length),
+  ).toBe(0);
+});
+test("catalog mutation requires review and uncertain retry preserves operation and body", async ({
+  page,
+}) => {
+  await catalogSetup(page);
+  const bodies: unknown[] = [];
+  await page.route("**/bff/v1/catalog/apply", (route) => {
+    const body = route.request().postDataJSON();
+    bodies.push(body);
+    if (bodies.length === 1) return route.abort();
+    return route.fulfill({
+      json: {
+        operation_id: body.operation_id,
+        object_id: "new/model",
+        revision: "1",
+      },
+    });
+  });
+  await page.goto("/#catalog");
+  await page.getByText("新建逻辑模型", { exact: true }).click();
+  await page.getByLabel("逻辑模型 ID", { exact: true }).fill("new/model");
+  await page.getByLabel("模型名称", { exact: true }).fill("新测试模型");
+  await page.getByLabel("变更理由", { exact: true }).fill("通过测试后再启用");
+  await page.getByRole("button", { name: "核对变更", exact: true }).click();
+  expect(bodies).toHaveLength(0);
+  await expect(
+    page.getByRole("button", { name: "查询 / 刷新模型" }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "管理 测试逻辑模型" }),
+  ).toBeDisabled();
+  await expect(page.getByRole("region", { name: "变更确认" })).toContainText(
+    "新建模型（停用）",
+  );
+  await page.getByRole("button", { name: "确认提交配置" }).click();
+  await expect(page.getByRole("alert")).toContainText("结果尚未核对");
+  await page.getByRole("button", { name: "重试同一操作" }).click();
+  await expect(
+    page.getByRole("status").filter({ hasText: "已提交配置版本 1" }),
+  ).toBeVisible();
+  expect(bodies).toHaveLength(2);
+  expect(bodies[0]).toEqual(bodies[1]);
+  expect(JSON.stringify(bodies)).not.toContain("credential_env");
+});
+test("catalog stale revision is blocked and cannot silently retry overwrite", async ({
+  page,
+}) => {
+  await catalogSetup(page);
+  let body: Record<string, unknown> | undefined;
+  await page.route("**/bff/v1/catalog/apply", (route) => {
+    body = route.request().postDataJSON();
+    return route.fulfill({
+      status: 409,
+      json: { error: { code: "configuration_conflict" } },
+    });
+  });
+  await page.goto("/#catalog");
+  await page.getByRole("button", { name: "管理 测试逻辑模型" }).click();
+  await page.getByText("修改端点 测试供应商端点", { exact: true }).click();
+  const editor = page.locator("details").filter({
+    has: page.getByText("修改端点 测试供应商端点", { exact: true }),
+  });
+  await editor
+    .getByLabel("输入价格 / 百万 Token", { exact: true })
+    .fill("1.123456789012");
+  await editor.getByLabel("变更理由", { exact: true }).fill("调整价格");
+  await editor.getByRole("button", { name: "核对变更" }).click();
+  await editor.getByRole("button", { name: "确认提交配置" }).click();
+  await expect(page.getByRole("alert")).toContainText("配置已被其他人修改");
+  await expect(
+    page.getByRole("button", { name: "重试同一操作" }),
+  ).toBeDisabled();
+  expect(body?.change).toMatchObject({
+    kind: "endpoint_update",
+    expected_revision: "2",
+    input_per_million: "1.123456789012",
+  });
+});
+test("catalog mobile forms and audit have accessible boundaries and opaque pagination", async ({
+  page,
+}) => {
+  await catalogSetup(page);
+  await page.setViewportSize({ width: 375, height: 900 });
+  await page.goto("/#catalog");
+  await page.getByRole("button", { name: "管理 测试逻辑模型" }).click();
+  await page.getByText("添加供应商端点", { exact: true }).click();
+  await expect(
+    page.getByRole("combobox", { name: "供应商连接", exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("combobox", { name: "调用能力", exact: true })
+    .selectOption("embedding");
+  await expect(page.getByLabel("向量维度", { exact: true })).toBeVisible();
+  expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
+  for (const width of [320, 375, 414, 640, 768, 1024, 1280, 1440]) {
+    await page.setViewportSize({ width, height: 900 });
+    expect(
+      await page.evaluate(() => {
+        document.documentElement.style.overflow = "visible";
+        document.body.style.overflow = "visible";
+        const fits =
+          document.documentElement.scrollWidth <= innerWidth &&
+          document.body.scrollWidth <= innerWidth;
+        document.documentElement.style.overflow = "";
+        document.body.style.overflow = "";
+        return fits;
+      }),
+    ).toBe(true);
+  }
+  const smallControls = await page
+    .locator("button,input,select,summary")
+    .evaluateAll((elements) =>
+      elements
+        .filter((e) => {
+          const r = e.getBoundingClientRect();
+          return r.height > 0 && (r.height < 43.9 || r.width < 43.9);
+        })
+        .map((e) => e.tagName),
+    );
+  expect(smallControls).toEqual([]);
+  await page.screenshot({
+    path: test.info().outputPath("catalog.png"),
+    fullPage: true,
+  });
+  const cursor = {
+    created_at: "2026-09-14T00:00:00.123456Z",
+    id: "9007199254740993",
+  };
+  const queries: Record<string, unknown>[] = [];
+  await page.route("**/bff/v1/audit/query", (route) => {
+    queries.push(route.request().postDataJSON());
+    return route.fulfill({
+      json: {
+        data: [
+          {
+            ...cursor,
+            action: "catalog.endpoint_updated",
+            object_id: id,
+            database_actor: "brokerrouter_catalog",
+            actor_user_id: user,
+            change_reason: "调价审批后执行",
+            operation_id: key,
+            config_revision: "3",
+          },
+        ],
+        next_before: queries.length === 1 ? cursor : null,
+      },
+    });
+  });
+  await page.goto("/#audit");
+  await expect(page.getByText("调价审批后执行", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "下一页审计" }).click();
+  await expect(page.getByRole("button", { name: "下一页审计" })).toBeDisabled();
+  expect(queries[1]!.before).toEqual(cursor);
+  expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
+  await page.screenshot({
+    path: test.info().outputPath("audit.png"),
+    fullPage: true,
+  });
+});
 test("login validates tenant, sends no secret and permits only trusted HTTPS navigation", async ({
   page,
 }) => {
@@ -203,7 +430,7 @@ test("group permission denial clears already-rendered usage and does not auto-re
     });
   });
   await page.goto("/");
-  await expect(page.getByRole("alert")).toContainText("没有此项读取权限");
+  await expect(page.getByRole("alert")).toContainText("没有此项权限");
   await expect(page.getByText("¥0.000408", { exact: true })).toHaveCount(0);
   expect(calls).toBe(1);
 });

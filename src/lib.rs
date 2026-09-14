@@ -4,6 +4,8 @@ pub mod asset_api;
 pub mod assets;
 pub mod attempts;
 pub mod bff;
+pub mod catalog;
+pub mod catalog_api;
 pub mod cipher;
 pub mod console;
 pub mod console_api;
