@@ -1,0 +1,44 @@
+/* Hallmark · macrostructure: Workbench · genre: modern-minimal · tone: utilitarian · theme: Cobalt · anchor hue: 256 · enrichment: none · nav: N3 · footer: Ft2 */
+:root {
+  --color-paper: oklch(98.5% 0.004 250);
+  --color-surface: oklch(99.5% 0.002 250);
+  --color-paper-2: oklch(95.5% 0.008 250);
+  --color-ink: oklch(24% 0.02 258);
+  --color-ink-2: oklch(34% 0.018 257);
+  --color-muted: oklch(46% 0.02 258);
+  --color-rule: oklch(85% 0.014 256);
+  --color-control: oklch(58% 0.022 256);
+  --color-accent: oklch(52% 0.2 256);
+  --color-accent-ink: oklch(99% 0.003 256);
+  --color-focus: oklch(20% 0.015 256);
+  --color-error: oklch(44% 0.16 25);
+  --color-error-paper: oklch(96% 0.012 25);
+  --color-warning: oklch(42% 0.09 75);
+  --color-warning-paper: oklch(96% 0.025 75);
+  --color-success: oklch(38% 0.08 155);
+  --color-success-paper: oklch(96% 0.02 155);
+  --font-display:
+    "Space Grotesk Variable", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-body: "Inter Variable", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --space-2xs: 0.25rem;
+  --space-xs: 0.5rem;
+  --space-sm: 0.75rem;
+  --space-md: 1rem;
+  --space-lg: 1.5rem;
+  --space-xl: 2.5rem;
+  --space-2xl: 4rem;
+  --space-3xl: 6rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-md: 1.25rem;
+  --text-xl: 1.953125rem;
+  --text-display: clamp(2rem, 3vw, 3.05rem);
+  --radius-control: 0.375rem;
+  --rule-width: 1px;
+  --dur-micro: 120ms;
+  --dur-short: 220ms;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in: cubic-bezier(0.7, 0, 0.84, 0);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --z-sticky: 200;
+}

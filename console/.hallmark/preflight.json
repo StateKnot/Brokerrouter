@@ -1,0 +1,12 @@
+{
+  "date": "2026-09-14",
+  "scope": "console/",
+  "source": "New frontend module in the existing Rust repository; no package.json, design.md, CSS, tokens, or motion library existed before this build.",
+  "preserve": ["Rust BFF and report contracts", "same-origin HTTPS deployment"],
+  "introduce": [
+    "React TypeScript",
+    "Tailwind",
+    "Cobalt tokens",
+    "responsive data workbench"
+  ]
+}

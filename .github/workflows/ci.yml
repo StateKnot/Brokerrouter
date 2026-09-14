@@ -7,7 +7,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17-alpine
@@ -24,10 +24,44 @@ jobs:
           --health-retries 30
     env:
       DATABASE_URL: postgres://brokerrouter:test-only@localhost:5432/brokerrouter
+      # Each test retains its own explicit concurrent clients/workers; limit unrelated DB fixtures.
+      RUST_TEST_THREADS: "2"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      - name: Build isolated technical detector fixture (no production signature database)
+        run: |
+          docker pull --platform=linux/amd64 debian:bookworm-slim
+          BASE_IMAGE="$(docker image inspect debian:bookworm-slim --format '{{index .RepoDigests 0}}')"
+          docker build --platform=linux/amd64 --build-arg BASE_IMAGE="$BASE_IMAGE" -f deploy/detector/Dockerfile -t brokerrouter-detector-contract:test tests/detector
+      - name: Real ClamAV and FFmpeg contracts
+        env:
+          BROKERROUTER_TEST_DOCKER_BINARY: /usr/bin/docker
+          BROKERROUTER_TEST_DOCKER_SOCKET: /var/run/docker.sock
+        run: |
+          export BROKERROUTER_TEST_DETECTOR_IMAGE="$(docker image inspect brokerrouter-detector-contract:test --format '{{.Id}}')"
+          cargo test --locked --test outputs isolated_detector_real -- --ignored
+      - name: Start isolated S3 fixture
+        run: |
+          docker compose -f compose.test.yaml --profile assets up -d minio
+          curl --fail --silent --show-error --retry 15 --retry-all-errors --retry-delay 1 --retry-max-time 30 --max-time 2 http://127.0.0.1:59000/minio/health/live
+          curl --fail --silent --show-error --max-time 10 --aws-sigv4 'aws:amz:us-east-1:s3' --user 'brokerrouter-test-only:brokerrouter-local-only-not-production' -X PUT http://127.0.0.1:59000/brokerrouter-test-assets
+      - name: S3 conditional write and cleanup contract
+        env:
+          BROKERROUTER_ASSET_S3_ENDPOINT: http://127.0.0.1:59000
+          BROKERROUTER_ASSET_S3_BUCKET: brokerrouter-test-assets
+          BROKERROUTER_ASSET_S3_REGION: us-east-1
+          BROKERROUTER_ASSET_S3_ACCESS_KEY_ID: brokerrouter-test-only
+          BROKERROUTER_ASSET_S3_SECRET_ACCESS_KEY: brokerrouter-local-only-not-production
+          BROKERROUTER_ASSET_ALLOW_HTTP: "true"
+          BROKERROUTER_ACTIVE_RESULT_KEY: test-v1
+          BROKERROUTER_RESULT_KEYS: '{"test-v1":"1212121212121212121212121212121212121212121212121212121212121212"}'
+        run: |
+          cargo test --locked --test assets s3_conditional_write -- --ignored
+          cargo test --locked --test outputs s3_output_import -- --ignored
       - run: cargo build --release --locked
+      - if: always()
+        run: docker compose -f compose.test.yaml --profile assets rm -sf minio
