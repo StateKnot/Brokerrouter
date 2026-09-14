@@ -169,4 +169,17 @@ GRANT SELECT(id,active) ON tenants TO brokerrouter_console;
 GRANT SELECT(tenant_id,id,issuer,subject,active) ON governance_users TO brokerrouter_console;
 GRANT SELECT,INSERT ON console_permissions TO brokerrouter_operator;
 GRANT UPDATE(enabled) ON console_permissions TO brokerrouter_operator;
+DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_bff') THEN
+    CREATE ROLE brokerrouter_bff NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+END IF; END $$;
+GRANT USAGE ON SCHEMA public TO brokerrouter_bff;
+GRANT SELECT ON _sqlx_migrations,bff_identity_bindings TO brokerrouter_bff;
+GRANT SELECT(id,active,bff_epoch) ON tenants TO brokerrouter_bff;
+GRANT SELECT(tenant_id,id,issuer,subject,active,bff_epoch) ON governance_users TO brokerrouter_bff;
+GRANT SELECT,INSERT,DELETE ON bff_logins,bff_sessions TO brokerrouter_bff;
+GRANT UPDATE(revoked_at) ON bff_sessions TO brokerrouter_bff;
+GRANT INSERT ON audit_events TO brokerrouter_bff;
+GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_bff;
+GRANT SELECT,INSERT ON bff_identity_bindings TO brokerrouter_operator;
+GRANT UPDATE(active,generation) ON bff_identity_bindings TO brokerrouter_operator;
 COMMIT;

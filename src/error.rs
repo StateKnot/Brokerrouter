@@ -55,6 +55,12 @@ pub enum Error {
     ConsoleForbidden,
     #[error("console query deadline exceeded")]
     ConsoleTimeout,
+    #[error("a fresh browser login is required")]
+    SessionUnauthorized,
+    #[error("same-origin request with a valid CSRF token required")]
+    CsrfRejected,
+    #[error("identity provider or console service is unavailable")]
+    BffUpstream,
     #[error("active purpose-scoped scanner credential required")]
     ScannerUnauthorized,
     #[error("scan lease expired, superseded or closed")]
@@ -94,6 +100,9 @@ impl IntoResponse for Error {
             Self::HumanUnauthorized => (StatusCode::UNAUTHORIZED, "invalid_human_attestation"),
             Self::ConsoleForbidden => (StatusCode::FORBIDDEN, "console_permission_denied"),
             Self::ConsoleTimeout => (StatusCode::SERVICE_UNAVAILABLE, "console_query_timeout"),
+            Self::SessionUnauthorized => (StatusCode::UNAUTHORIZED, "browser_login_required"),
+            Self::CsrfRejected => (StatusCode::FORBIDDEN, "csrf_rejected"),
+            Self::BffUpstream => (StatusCode::BAD_GATEWAY, "bff_upstream_unavailable"),
             Self::ScannerUnauthorized => (StatusCode::UNAUTHORIZED, "invalid_scanner_credential"),
             Self::ScanLeaseEnded => (StatusCode::CONFLICT, "scan_lease_ended"),
             Self::OutputUnsafe => (StatusCode::CONFLICT, "output_unsafe"),

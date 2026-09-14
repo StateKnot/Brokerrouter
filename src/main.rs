@@ -16,6 +16,31 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Migrate,
+    ServeBff {
+        #[arg(long, default_value = "127.0.0.1:8087")]
+        bind: SocketAddr,
+    },
+    BffIdentityBind {
+        #[arg(long)]
+        tenant: Uuid,
+        #[arg(long)]
+        user: Uuid,
+        #[arg(long)]
+        issuer: String,
+        #[arg(long)]
+        subject: String,
+    },
+    BffIdentitySet {
+        #[arg(long)]
+        tenant: Uuid,
+        #[arg(long)]
+        id: Uuid,
+        #[arg(long, action=clap::ArgAction::Set)]
+        active: bool,
+        #[arg(long)]
+        reason: String,
+    },
+    BffMaintain,
     ServeConsole {
         #[arg(long, default_value = "127.0.0.1:8086")]
         bind: SocketAddr,
@@ -279,6 +304,57 @@ async fn main() -> anyhow::Result<()> {
         anyhow::anyhow!("database connection failed; verify DATABASE_URL and network")
     })?;
     match cli.command {
+        Command::ServeBff { bind } => {
+            brokerrouter::check_schema(&pool).await?;
+            let service = brokerrouter::bff::Bff::from_env(pool.clone())?;
+            let listener = tokio::net::TcpListener::bind(bind).await?;
+            let maintenance_pool = pool.clone();
+            let maintenance = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    if brokerrouter::bff::maintain(&maintenance_pool)
+                        .await
+                        .is_err()
+                    {
+                        tracing::error!(
+                            error_code = "bff_maintenance_failed",
+                            "BFF expiry cleanup failed"
+                        );
+                    }
+                }
+            });
+            tracing::info!(address=%bind,"OIDC console BFF listening; TLS termination and same-origin UI required");
+            let result = axum::serve(listener, brokerrouter::bff::router(service))
+                .with_graceful_shutdown(shutdown())
+                .await;
+            maintenance.abort();
+            result?;
+        }
+        Command::BffIdentityBind {
+            tenant,
+            user,
+            issuer,
+            subject,
+        } => {
+            println!(
+                "{}",
+                brokerrouter::bff::bind_identity(&pool, tenant, user, &issuer, &subject).await?
+            );
+        }
+        Command::BffIdentitySet {
+            tenant,
+            id,
+            active,
+            reason,
+        } => {
+            brokerrouter::bff::set_identity_active(&pool, tenant, id, active, &reason).await?;
+            println!("OIDC identity binding updated");
+        }
+        Command::BffMaintain => {
+            brokerrouter::bff::maintain(&pool).await?;
+        }
         Command::ServeConsole { bind } => {
             brokerrouter::check_schema(&pool).await?;
             let service = brokerrouter::console_api::Console {

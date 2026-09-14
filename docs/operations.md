@@ -24,6 +24,8 @@ M4 输出链路迁移至 0010 后重新应用权限脚本。输出转存身份 `
 
 权限脚本用于新建的专用权限组，不会清理 DBA 额外授予的权限；部署时必须检查角色继承链与已有授权。触发器不能防御有权删除触发器的 DBA。备份、恢复与数据库管理员审计须独立配置。
 
+M5.2a 迁移至 `0012` 后新增专用 `brokerrouter_bff` 登录运行 `serve-bff`；不要附加 console/runtime/operator/control 组。标准 OIDC、固定 HTTPS 公开源、外部身份预登记、Cookie/CSRF、独立签名及加密 keyring、反向代理和登出边界见 [BFF 契约](m5-oidc-bff.md)。停用/启用租户或用户会增加登录 epoch；不得人为回退 epoch 以恢复旧会话。BFF 每分钟执行有界过期清理，失败告警码为 `bff_maintenance_failed`。BFF 的 console 公钥绝不能同时加入 HUMAN 信任集合。
+
 ## 健康与迁移
 
 `/health/live` 只证明进程能响应；`/health/ready` 校验全部已应用迁移的版本、成功状态和 checksum 与二进制一致。数据库失联、迁移缺失、checksum 不同或有未知迁移均不就绪。服务启动同样校验，不会在普通运行身份下自行迁移。
