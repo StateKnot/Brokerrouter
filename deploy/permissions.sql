@@ -158,4 +158,15 @@ CREATE POLICY brokerrouter_delivery_output_read ON assets FOR SELECT TO brokerro
 DROP POLICY IF EXISTS brokerrouter_delivery_output_chunk_read ON asset_chunks;
 CREATE POLICY brokerrouter_delivery_output_chunk_read ON asset_chunks FOR SELECT TO brokerrouter_output_delivery
     USING(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id AND a.id=asset_chunks.asset_id AND a.kind='output'));
+-- Console reports are a separate read-only service, with no authority to approve,
+-- execute, decrypt, reconcile, change budgets or grant its own permissions.
+DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_console') THEN
+    CREATE ROLE brokerrouter_console NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+END IF; END $$;
+GRANT USAGE ON SCHEMA public TO brokerrouter_console;
+GRANT SELECT ON _sqlx_migrations,console_permissions,console_request_facts,console_audit_facts TO brokerrouter_console;
+GRANT SELECT(id,active) ON tenants TO brokerrouter_console;
+GRANT SELECT(tenant_id,id,issuer,subject,active) ON governance_users TO brokerrouter_console;
+GRANT SELECT,INSERT ON console_permissions TO brokerrouter_operator;
+GRANT UPDATE(enabled) ON console_permissions TO brokerrouter_operator;
 COMMIT;

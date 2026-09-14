@@ -69,3 +69,7 @@ M4.3b 第一包增加 [扫描作业与证据链](docs/m4-output-scan-evidence.md
 M4.3b 第二包接入 [实际隔离技术检测器](docs/m4-isolated-detector.md)：独立 Rust `brokerrouter-scanner` 通过无网络、只读、有限资源的固定摘要镜像执行 ClamAV、FFprobe 与 FFmpeg 全流解码，持久化证据并支持失败恢复。**技术检测不替代语义合规**：`content` 始终为 unknown，不能据此自动交付。
 
 M4.3b 第三包增加 [资产策略、真人审阅与当前轮交付](docs/m4-output-delivery.md)：独立 `serve-output-delivery`、绑定扫描配置的 `media_output` 护栏、受信真人审阅、部分批准/拒绝/反馈与原 Key 受控分块读取。技术失败不可豁免，内容风险/未知由真人决定；同轮批准不跨轮，撤销和配置变化在读取前后重新校验。没有永久链接或 Agent 代批权限；专用多模态语义审核、控制台预览/原生弹窗及生产认证仍待后续完成。
+
+M5.1 增加 [控制台只读报表](docs/m5-console-reporting.md)：独立 `serve-console`、用途隔离的 BFF 请求证明与用户读权限、人民币汇总/每日曲线、模型/Key 维度、请求日志和审计元数据。金额来自实际账本，未知费用/预留/用量缺失单独标识；查询不能批准动作或修改预算。OIDC/BFF、TypeScript 页面和配置写接口仍待开发。
+
+2026-09-14 已完成 [阿里云北京 4 模型真实冒烟](docs/live-aliyun-2026-09-14.md)，并记录工具原样回传、Embedding 端点限制和账单核对待办；不据此宣称全部供应商模型或完整生产认证通过。

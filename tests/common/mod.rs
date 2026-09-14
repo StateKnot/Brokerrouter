@@ -35,6 +35,21 @@ pub fn verifier() -> human::Verifier {
     )
     .unwrap()
 }
+pub fn console_verifier() -> human::Verifier {
+    human::Verifier::new_console(
+        ISSUER,
+        "brokerrouter-console-test",
+        HashMap::from([("fixture".into(), keys().1.clone())]),
+    )
+    .unwrap()
+}
+pub fn console_sign(mut claims: Claims) -> String {
+    claims.aud = "brokerrouter-console-test".into();
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some("fixture".into());
+    header.typ = Some("br-console+jwt".into());
+    jsonwebtoken::encode(&header, &claims, &keys().0).unwrap()
+}
 pub fn cipher() -> ResultCipher {
     ResultCipher::new(
         "fixture".into(),

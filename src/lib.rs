@@ -4,6 +4,8 @@ pub mod asset_api;
 pub mod assets;
 pub mod attempts;
 pub mod cipher;
+pub mod console;
+pub mod console_api;
 pub mod egress;
 pub mod error;
 pub mod gateway;

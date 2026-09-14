@@ -51,6 +51,10 @@ pub enum Error {
     PolicyChanged,
     #[error("valid request-bound human attestation required")]
     HumanUnauthorized,
+    #[error("console permission is missing or revoked")]
+    ConsoleForbidden,
+    #[error("console query deadline exceeded")]
+    ConsoleTimeout,
     #[error("active purpose-scoped scanner credential required")]
     ScannerUnauthorized,
     #[error("scan lease expired, superseded or closed")]
@@ -88,6 +92,8 @@ impl IntoResponse for Error {
             Self::ActionRejected => (StatusCode::CONFLICT, "action_rejected"),
             Self::PolicyChanged => (StatusCode::CONFLICT, "policy_changed"),
             Self::HumanUnauthorized => (StatusCode::UNAUTHORIZED, "invalid_human_attestation"),
+            Self::ConsoleForbidden => (StatusCode::FORBIDDEN, "console_permission_denied"),
+            Self::ConsoleTimeout => (StatusCode::SERVICE_UNAVAILABLE, "console_query_timeout"),
             Self::ScannerUnauthorized => (StatusCode::UNAUTHORIZED, "invalid_scanner_credential"),
             Self::ScanLeaseEnded => (StatusCode::CONFLICT, "scan_lease_ended"),
             Self::OutputUnsafe => (StatusCode::CONFLICT, "output_unsafe"),

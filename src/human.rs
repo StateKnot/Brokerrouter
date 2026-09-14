@@ -16,6 +16,7 @@ use uuid::Uuid;
 pub struct Verifier {
     keys: HashMap<String, DecodingKey>,
     validation: Validation,
+    token_type: &'static str,
 }
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Claims {
@@ -39,7 +40,30 @@ pub struct Human {
     claims: Claims,
     digest: Vec<u8>,
 }
+impl Human {
+    pub(crate) fn expires_at(&self) -> i64 {
+        self.claims.exp
+    }
+}
 impl Verifier {
+    pub fn new_console(
+        issuer: &str,
+        audience: &str,
+        pem_keys: HashMap<String, String>,
+    ) -> Result<Self> {
+        let mut verifier = Self::new(issuer, audience, pem_keys)?;
+        verifier.token_type = "br-console+jwt";
+        Ok(verifier)
+    }
+    pub fn console_from_env() -> Result<Self> {
+        let get = |name| std::env::var(name).map_err(|_| Error::Configuration);
+        Self::new_console(
+            &get("BROKERROUTER_CONSOLE_ISSUER")?,
+            &get("BROKERROUTER_CONSOLE_AUDIENCE")?,
+            serde_json::from_str(&get("BROKERROUTER_CONSOLE_PUBLIC_KEYS")?)
+                .map_err(|_| Error::Configuration)?,
+        )
+    }
     pub fn new(issuer: &str, audience: &str, pem_keys: HashMap<String, String>) -> Result<Self> {
         if !issuer.starts_with("https://")
             || !governance::valid_text(audience, 200)
@@ -64,7 +88,11 @@ impl Verifier {
         validation.set_required_spec_claims(&["exp", "nbf", "iss", "aud", "sub"]);
         validation.leeway = 0;
         validation.validate_nbf = true;
-        Ok(Self { keys, validation })
+        Ok(Self {
+            keys,
+            validation,
+            token_type: "br-human+jwt",
+        })
     }
     pub fn from_env() -> Result<Self> {
         let get = |name| std::env::var(name).map_err(|_| Error::Configuration);
@@ -88,7 +116,7 @@ impl Verifier {
         }
         let header = decode_header(token).map_err(|_| Error::HumanUnauthorized)?;
         if header.alg != Algorithm::RS256
-            || header.typ.as_deref() != Some("br-human+jwt")
+            || header.typ.as_deref() != Some(self.token_type)
             || header.crit.is_some()
             || header.jku.is_some()
             || header.jwk.is_some()

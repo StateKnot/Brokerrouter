@@ -16,6 +16,22 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Migrate,
+    ServeConsole {
+        #[arg(long, default_value = "127.0.0.1:8086")]
+        bind: SocketAddr,
+    },
+    ConsolePermissionSet {
+        #[arg(long)]
+        tenant: Uuid,
+        #[arg(long)]
+        user: Uuid,
+        #[arg(long, value_parser=["usage_read","audit_read"])]
+        permission: String,
+        #[arg(long, action=clap::ArgAction::Set)]
+        enabled: bool,
+        #[arg(long)]
+        reason: String,
+    },
     ServeOutputDelivery {
         #[arg(long, default_value = "127.0.0.1:8085")]
         bind: SocketAddr,
@@ -263,6 +279,32 @@ async fn main() -> anyhow::Result<()> {
         anyhow::anyhow!("database connection failed; verify DATABASE_URL and network")
     })?;
     match cli.command {
+        Command::ServeConsole { bind } => {
+            brokerrouter::check_schema(&pool).await?;
+            let service = brokerrouter::console_api::Console {
+                pool: pool.clone(),
+                verifier: std::sync::Arc::new(brokerrouter::human::Verifier::console_from_env()?),
+            };
+            let listener = tokio::net::TcpListener::bind(bind).await?;
+            tracing::info!(address=%bind,"read-only console reports listening; no provider, decryption or approval credentials");
+            axum::serve(listener, brokerrouter::console_api::router(service))
+                .with_graceful_shutdown(shutdown())
+                .await?;
+        }
+        Command::ConsolePermissionSet {
+            tenant,
+            user,
+            permission,
+            enabled,
+            reason,
+        } => {
+            let permission = serde_json::from_value(serde_json::Value::String(permission))?;
+            brokerrouter::console::set_permission(
+                &pool, tenant, user, permission, enabled, &reason,
+            )
+            .await?;
+            println!("Console permission saved");
+        }
         Command::ServeOutputDelivery { bind } => {
             brokerrouter::check_schema(&pool).await?;
             let service = brokerrouter::output_delivery_api::Service {
