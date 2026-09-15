@@ -77,6 +77,27 @@
   margin-block: var(--space-md);
   min-width: 0;
 }
+.secret-panel {
+  display: grid;
+  gap: var(--space-md);
+  min-width: 0;
+}
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  min-height: 44px;
+}
+.checkbox-label input[type="checkbox"] {
+  width: 44px;
+  height: 44px;
+  flex: 0 0 44px;
+}
+.fx-current {
+  font-size: var(--text-xl);
+  color: var(--color-ink);
+  overflow-wrap: anywhere;
+}
 .config-actions button,
 .record-heading button {
   white-space: normal;
@@ -127,6 +148,7 @@
   }
   button,
   input,
+  textarea,
   select {
     font: inherit;
     border: var(--rule-width) solid var(--color-control);
@@ -168,11 +190,13 @@
   }
   button:disabled,
   input:disabled,
+  textarea:disabled,
   select:disabled {
     opacity: 0.55;
     cursor: not-allowed;
   }
   input,
+  textarea,
   select {
     width: 100%;
     min-width: 0;

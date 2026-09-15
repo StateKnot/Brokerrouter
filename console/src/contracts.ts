@@ -170,3 +170,54 @@ export const mutationSchema = z.object({
   object_id: text,
   revision: count,
 });
+export const keySchema = z.object({
+  id: z.uuid(),
+  name: text,
+  prefix: text,
+  revision: count,
+  budget_cny: amount,
+  spent_cny: amount,
+  reserved_cny: amount,
+  expires_at: timestamp.nullable(),
+  revoked_at: timestamp.nullable(),
+  created_at: timestamp,
+});
+export type VirtualKey = z.infer<typeof keySchema>;
+export const keysSchema = z.object({
+  currency: z.literal("CNY"),
+  data: z.array(keySchema).max(100),
+  next_after: z.uuid().nullable(),
+  can_write: z.boolean(),
+  tenant: z.object({
+    budget_cny: amount,
+    spent_cny: amount,
+    reserved_cny: amount,
+  }),
+});
+export const keyDetailSchema = z.object({
+  key: keySchema,
+  models: z.array(text).max(100),
+  grants_truncated: z.boolean(),
+  can_write: z.boolean(),
+});
+export const grantModelsSchema = z.object({
+  data: z
+    .array(z.object({ id: text, name: text, active: z.boolean() }))
+    .max(100),
+  next_after: text.nullable(),
+});
+export const fxRateSchema = z.object({
+  id: count,
+  usd_cny: amount,
+  source: text,
+  effective_at: timestamp,
+});
+export const fxSchema = z.object({
+  currency: z.literal("CNY"),
+  observed_at: timestamp,
+  latest_id: count.nullable(),
+  current: fxRateSchema.nullable(),
+  data: z.array(fxRateSchema).max(100),
+  next_before: count.nullable(),
+  can_write: z.boolean(),
+});

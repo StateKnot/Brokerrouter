@@ -10,7 +10,12 @@ type Path =
   | "audit/query"
   | "catalog/models/query"
   | "catalog/endpoints/query"
-  | "catalog/apply";
+  | "catalog/apply"
+  | "settings/keys/query"
+  | "settings/keys/detail"
+  | "settings/models/query"
+  | "settings/fx/query"
+  | "settings/apply";
 export class ApiError extends Error {
   constructor(
     public readonly status: number,

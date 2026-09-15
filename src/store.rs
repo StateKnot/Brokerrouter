@@ -127,6 +127,11 @@ pub async fn create_key(
 
 pub async fn revoke_key(pool: &PgPool, tenant: Uuid, id: Uuid) -> Result<()> {
     let mut tx = pool.begin().await?;
+    // Configuration and accounting both lock tenant before key (including audit FK checks).
+    sqlx::query("SELECT id FROM tenants WHERE id=$1 FOR UPDATE")
+        .bind(tenant)
+        .fetch_one(&mut *tx)
+        .await?;
     if sqlx::query("UPDATE virtual_keys SET revoked_at=coalesce(revoked_at,now()) WHERE tenant_id=$1 AND id=$2").bind(tenant).bind(id).execute(&mut *tx).await?.rows_affected()==0 { return Err(Error::NotFound); }
     audit(
         &mut tx,
@@ -158,6 +163,11 @@ pub async fn set_fx(
         ));
     }
     let mut tx = pool.begin().await?;
+    // Serialize with human publication so expected_latest_id also observes CLI versions.
+    sqlx::query("SELECT id FROM tenants WHERE id=$1 FOR UPDATE")
+        .bind(tenant)
+        .fetch_one(&mut *tx)
+        .await?;
     let id: i64=sqlx::query_scalar("INSERT INTO fx_rates(tenant_id,usd_cny,effective_at,source) VALUES($1,$2,$3,$4) RETURNING id").bind(tenant).bind(rate).bind(effective).bind(source).fetch_one(&mut *tx).await?;
     audit(
         &mut tx,

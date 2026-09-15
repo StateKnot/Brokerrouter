@@ -197,4 +197,23 @@ GRANT SELECT,INSERT ON catalog_endpoint_connections TO brokerrouter_catalog;
 GRANT UPDATE(name,active) ON models TO brokerrouter_catalog;
 GRANT UPDATE(name,active,priority,currency,input_per_million,output_per_million) ON endpoints TO brokerrouter_catalog;
 GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_catalog;
+
+-- Key/FX administration is not catalog, reporting, approval, or inference authority.
+DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_settings') THEN
+    CREATE ROLE brokerrouter_settings NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+END IF; END $$;
+GRANT USAGE ON SCHEMA public TO brokerrouter_settings;
+GRANT SELECT ON _sqlx_migrations,console_permissions,settings_mutations,fx_rates,key_models TO brokerrouter_settings;
+GRANT SELECT(id,active,budget_micros,spent_micros,reserved_micros) ON tenants TO brokerrouter_settings;
+GRANT SELECT(tenant_id,id,issuer,subject,active) ON governance_users TO brokerrouter_settings;
+GRANT SELECT(tenant_id,id,name,active) ON models TO brokerrouter_settings;
+GRANT SELECT(tenant_id,id,name,key_prefix,budget_micros,spent_micros,reserved_micros,expires_at,revoked_at,created_at,config_revision) ON virtual_keys TO brokerrouter_settings;
+GRANT UPDATE(governance_lock) ON tenants TO brokerrouter_settings;
+GRANT UPDATE(catalog_lock) ON governance_users,console_permissions TO brokerrouter_settings;
+GRANT INSERT ON virtual_keys,key_models,fx_rates,settings_mutations,audit_events TO brokerrouter_settings;
+GRANT UPDATE(name,budget_micros,expires_at,revoked_at,config_revision) ON virtual_keys TO brokerrouter_settings;
+GRANT DELETE ON key_models TO brokerrouter_settings;
+GRANT USAGE ON SEQUENCE fx_rates_id_seq,audit_events_id_seq TO brokerrouter_settings;
+-- Grant-change trigger runs as the caller; operator CLI creation must still work.
+GRANT UPDATE(config_revision) ON virtual_keys TO brokerrouter_operator;
 COMMIT;

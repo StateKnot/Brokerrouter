@@ -19,14 +19,20 @@ import type { Model, Endpoint } from "./contracts";
 import { dateRange, recentRange, time } from "./format";
 import type { Timezone } from "./format";
 
-type Denied = (error: unknown) => void;
-const PendingConfig = createContext<{
+export type Denied = (error: unknown) => void;
+export const PendingConfig = createContext<{
   owner: string | null;
   setOwner: (id: string | null) => void;
 }>({ owner: null, setOwner: () => {} });
 type QueryPath =
-  "audit/query" | "catalog/models/query" | "catalog/endpoints/query";
-function useQuery<T>(
+  | "audit/query"
+  | "catalog/models/query"
+  | "catalog/endpoints/query"
+  | "settings/keys/query"
+  | "settings/keys/detail"
+  | "settings/models/query"
+  | "settings/fx/query";
+export function useQuery<T>(
   path: QueryPath,
   schema: z.ZodType<T>,
   body: unknown,
@@ -59,7 +65,13 @@ function useQuery<T>(
   }, [path, schema, encoded, epoch, denied]);
   return state;
 }
-function QueryState({ loading, error }: { loading: boolean; error?: unknown }) {
+export function QueryState({
+  loading,
+  error,
+}: {
+  loading: boolean;
+  error?: unknown;
+}) {
   if (loading) return <p role="status">正在加载最新记录…</p>;
   if (error)
     return (
@@ -253,16 +265,29 @@ const labels: Record<string, string> = {
   operation: "能力",
   supports_tools: "工具调用",
   embedding_dimension: "向量维度",
+  key_hash: "密钥摘要（不是密钥）",
+  key_prefix: "密钥前缀",
+  budget_cny: "人民币预算（元）",
+  models: "允许的模型 ID",
+  expires_at: "有效期",
+  expected_latest_id: "依据最新汇率版本",
+  usd_cny: "1 USD 兑换 CNY",
+  source: "汇率来源",
+  effective_at: "生效时间（空值代表提交时）",
 };
 const kinds: Record<string, string> = {
   model_create: "新建模型（停用）",
   model_update: "修改模型",
   endpoint_create: "新建端点（停用）",
   endpoint_update: "修改端点",
+  key_create: "创建虚拟 Key（提交后可用）",
+  key_update: "修改虚拟 Key",
+  key_revoke: "永久撤销虚拟 Key",
+  fx_publish: "发布 USD/CNY 汇率版本",
 };
 function mutationError(error: unknown): string {
   if (error instanceof ApiError && (error.status === 0 || error.status >= 500))
-    return "暂时无法核对本次提交结果，请保留操作编号，不要重新创建相同端点。";
+    return "暂时无法核对本次提交结果，请保留操作编号，不要重新创建相同配置。";
   if (
     error instanceof ApiError &&
     (error.status === 400 || error.status === 422)
@@ -270,16 +295,20 @@ function mutationError(error: unknown): string {
     return "配置未被接受，请核对字段范围、价格与逻辑模型的能力约束。";
   return errorMessage(error);
 }
-function MutationForm({
+export function MutationForm({
   children,
   build,
   saved,
   denied,
+  path = "catalog/apply",
+  review = "配置会影响后续调用。存量请求保留准入时的路由、价格与汇率快照。新增模型和端点默认停用，联调验证后再启用。",
 }: {
   children: ReactNode;
   build: (form: FormData) => Change;
   saved: (message: string) => void;
   denied: Denied;
+  path?: "catalog/apply" | "settings/apply";
+  review?: string;
 }) {
   const id = useId();
   const { owner, setOwner } = useContext(PendingConfig);
@@ -303,7 +332,7 @@ function MutationForm({
         return;
       if (
         !window.confirm(
-          "仍有待确认或结果未核对的配置操作。离开后请先查询模型和审计记录，不要直接重复创建。确定离开？",
+          "仍有待确认或结果未核对的配置操作。离开后请先查询配置和审计记录，不要直接重复创建。确定离开？",
         )
       ) {
         e.preventDefault();
@@ -340,11 +369,14 @@ function MutationForm({
           throw new Error(
             `${labels[key] ?? "配置字段"}最多 200 个 UTF-8 字节，不能包含控制字符。`,
           );
-      setPending({
+      const prepared = {
         operation_id: crypto.randomUUID(),
         reason,
         change,
-      });
+      };
+      if (encoder.encode(JSON.stringify(prepared)).length > 16384)
+        throw new Error("配置内容超过 16 KiB，请缩小本次授权范围。");
+      setPending(prepared);
       setOwner(id);
       setError(null);
       setValidation("");
@@ -362,7 +394,7 @@ function MutationForm({
     controller.current = active;
     try {
       const receipt = await request(
-        "catalog/apply",
+        path,
         mutationSchema,
         pending,
         active.signal,
@@ -372,7 +404,7 @@ function MutationForm({
       setOwner(null);
       setBusy(false);
       saved(
-        `已提交配置版本 ${receipt.revision}。操作编号 ${receipt.operation_id}。请核对最新状态；启停仅影响新准入调用。`,
+        `已提交配置版本 ${receipt.revision}。对象 ${receipt.object_id}。操作编号 ${receipt.operation_id}。请核对最新状态；配置不改写历史调用。`,
       );
     } catch (cause) {
       if (active.signal.aborted) return;
@@ -410,9 +442,7 @@ function MutationForm({
       {pending && (
         <section className="change-review" aria-label="变更确认">
           <h3>确认这次配置变更</h3>
-          <p>
-            配置会影响后续调用。存量请求保留准入时的路由、价格与汇率快照。新增模型和端点默认停用，联调验证后再启用。
-          </p>
+          <p>{review}</p>
           <dl className="config-facts">
             {Object.entries(pending.change).map(([key, value]) => (
               <div key={key}>

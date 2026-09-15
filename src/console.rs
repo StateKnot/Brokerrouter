@@ -18,6 +18,10 @@ pub enum Permission {
     AuditRead,
     CatalogRead,
     CatalogWrite,
+    KeysRead,
+    KeysWrite,
+    FxRead,
+    FxWrite,
 }
 impl Permission {
     pub(crate) fn name(self) -> &'static str {
@@ -26,6 +30,10 @@ impl Permission {
             Self::AuditRead => "audit_read",
             Self::CatalogRead => "catalog_read",
             Self::CatalogWrite => "catalog_write",
+            Self::KeysRead => "keys_read",
+            Self::KeysWrite => "keys_write",
+            Self::FxRead => "fx_read",
+            Self::FxWrite => "fx_write",
         }
     }
 }

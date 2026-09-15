@@ -27,6 +27,11 @@ pub fn router(service: Arc<Bff>) -> Router {
         .route("/bff/v1/catalog/models/query", post(query))
         .route("/bff/v1/catalog/endpoints/query", post(query))
         .route("/bff/v1/catalog/apply", post(query))
+        .route("/bff/v1/settings/keys/query", post(query))
+        .route("/bff/v1/settings/keys/detail", post(query))
+        .route("/bff/v1/settings/models/query", post(query))
+        .route("/bff/v1/settings/fx/query", post(query))
+        .route("/bff/v1/settings/apply", post(query))
         .fallback(|| async { Error::NotFound })
         .with_state(service)
         .layer(axum::extract::DefaultBodyLimit::max(16384))
@@ -239,6 +244,8 @@ async fn query(
     let (token, csrf) = auth(&headers)?;
     let path = if let Some(suffix) = uri.path().strip_prefix("/bff/v1/catalog/") {
         format!("/catalog/v1/{suffix}")
+    } else if let Some(suffix) = uri.path().strip_prefix("/bff/v1/settings/") {
+        format!("/settings/v1/{suffix}")
     } else {
         uri.path().replacen("/bff/", "/console/", 1)
     };

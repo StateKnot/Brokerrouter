@@ -158,6 +158,316 @@ async function catalogSetup(page: Page, write = true) {
     }),
   );
 }
+const managedKey = {
+  id: key,
+  name: "配置测试 Key",
+  prefix: "sk_br_12345678",
+  revision: "3",
+  budget_cny: "10.000001",
+  spent_cny: "0.000001",
+  reserved_cny: "1.000000",
+  expires_at: "2026-10-15T00:00:00.123456Z",
+  revoked_at: null,
+  created_at: "2026-09-15T00:00:00Z",
+};
+async function settingsSetup(page: Page, write = true) {
+  await setup(page);
+  await page.route("**/bff/v1/settings/keys/query", (route) =>
+    route.fulfill({
+      json: {
+        currency: "CNY",
+        data: [managedKey],
+        next_after: null,
+        can_write: write,
+        tenant: {
+          budget_cny: "20.000000",
+          spent_cny: "0.000001",
+          reserved_cny: "1.000000",
+        },
+      },
+    }),
+  );
+  await page.route("**/bff/v1/settings/keys/detail", (route) =>
+    route.fulfill({
+      json: {
+        key: managedKey,
+        models: ["test/model"],
+        grants_truncated: false,
+        can_write: write,
+      },
+    }),
+  );
+  await page.route("**/bff/v1/settings/models/query", (route) =>
+    route.fulfill({ json: { data: [catalogModel], next_after: null } }),
+  );
+  const current = {
+    id: "10",
+    usd_cny: "7.1234567890",
+    source: "财务确认",
+    effective_at: "2026-09-01T00:00:00.123456Z",
+  };
+  await page.route("**/bff/v1/settings/fx/query", (route) =>
+    route.fulfill({
+      json: {
+        currency: "CNY",
+        observed_at: "2026-09-15T00:00:00Z",
+        latest_id: "11",
+        current,
+        data: [
+          {
+            id: "11",
+            usd_cny: "7.2500000000",
+            source: "计划版本",
+            effective_at: "2026-10-01T00:00:00Z",
+          },
+          current,
+        ],
+        next_before: null,
+        can_write: write,
+      },
+    }),
+  );
+}
+test("Key and FX read permissions do not expose write controls", async ({
+  page,
+}) => {
+  await settingsSetup(page, false);
+  await page.goto("/#keys");
+  await expect(page.getByText("¥10.000001", { exact: true })).toBeVisible();
+  await expect(page.getByText("创建虚拟 Key", { exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "管理 配置测试 Key" }).click();
+  await expect(
+    page.getByText("授权模型：test/model", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText("永久撤销 Key", { exact: true })).toHaveCount(0);
+  await page.goto("/#fx");
+  await expect(
+    page.getByText("1 USD = 7.1234567890 CNY", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("发布新的人民币汇率", { exact: true }),
+  ).toHaveCount(0);
+  await expect(page.getByText("待生效", { exact: true })).toBeVisible();
+});
+test("Key secret stays browser-only and response-loss retry reuses its registration", async ({
+  page,
+}) => {
+  await settingsSetup(page);
+  const bodies: Record<string, unknown>[] = [];
+  await page.route("**/bff/v1/settings/apply", (route) => {
+    const b = route.request().postDataJSON();
+    bodies.push(b);
+    if (bodies.length === 1) return route.abort();
+    return route.fulfill({
+      json: { operation_id: b.operation_id, object_id: key, revision: "2" },
+    });
+  });
+  await page.goto("/#keys");
+  await page.getByText("创建虚拟 Key", { exact: true }).click();
+  await page.getByRole("button", { name: "生成一次性密钥" }).click();
+  const token = await page.getByLabel("待保存密钥").inputValue();
+  expect(token).toMatch(/^sk_br_[a-f0-9]{64}$/);
+  await page.getByLabel("Key 名称", { exact: true }).fill("新建测试 Key");
+  await page.getByLabel("人民币预算（元）", { exact: true }).fill("0.000001");
+  await page.getByLabel("允许的模型 ID", { exact: false }).fill("test/model");
+  await page.getByLabel("我已将密钥保存到受控凭据库", { exact: false }).check();
+  await page.getByLabel("变更理由", { exact: true }).fill("登记测试凭据");
+  await page.getByRole("button", { name: "核对变更", exact: true }).click();
+  expect(bodies).toHaveLength(0);
+  await expect(
+    page.getByRole("button", { name: "查询 / 刷新 Key" }),
+  ).toBeDisabled();
+  await page.getByRole("button", { name: "确认提交配置" }).click();
+  await expect(
+    page.getByText("暂时无法核对本次提交结果", { exact: false }),
+  ).toBeVisible();
+  expect(JSON.stringify(bodies[0])).not.toContain(token);
+  expect(JSON.stringify(bodies[0])).not.toContain('"token"');
+  await expect(page.getByLabel("待保存密钥")).toHaveValue(token);
+  await page.getByRole("button", { name: "重试同一操作" }).click();
+  await expect(
+    page.getByText("已提交配置版本 2", { exact: false }),
+  ).toBeVisible();
+  expect(bodies).toHaveLength(2);
+  expect(bodies[0]).toEqual(bodies[1]);
+  const digest = await page.evaluate(
+    async (t) =>
+      Array.from(
+        new Uint8Array(
+          await crypto.subtle.digest("SHA-256", new TextEncoder().encode(t)),
+        ),
+        (v) => v.toString(16).padStart(2, "0"),
+      ).join(""),
+    token,
+  );
+  expect((bodies[0]?.change as Record<string, unknown>).key_hash).toBe(digest);
+  await expect(page.getByLabel("待保存密钥")).toHaveCount(0);
+  expect(
+    await page.evaluate(() => localStorage.length + sessionStorage.length),
+  ).toBe(0);
+});
+test("Key revoke requires explicit confirmation and stale version cannot be overwritten", async ({
+  page,
+}) => {
+  await settingsSetup(page);
+  const bodies: unknown[] = [];
+  await page.route("**/bff/v1/settings/apply", (route) => {
+    bodies.push(route.request().postDataJSON());
+    return route.fulfill({
+      status: 409,
+      json: { error: { code: "configuration_conflict" } },
+    });
+  });
+  await page.goto("/#keys");
+  await page.getByRole("button", { name: "管理 配置测试 Key" }).click();
+  await page.getByText("永久撤销 Key", { exact: true }).click();
+  const panel = page.getByRole("region", { name: "Key 详情" });
+  await panel.getByLabel("变更理由", { exact: true }).last().fill("疑似泄漏");
+  await panel
+    .getByRole("button", { name: "核对变更", exact: true })
+    .last()
+    .click();
+  expect(bodies).toHaveLength(0);
+  await panel.getByLabel("我确认永久撤销这个 Key").check();
+  await panel
+    .getByRole("button", { name: "核对变更", exact: true })
+    .last()
+    .click();
+  await page.getByRole("button", { name: "确认提交配置" }).click();
+  await expect(
+    page.getByRole("button", { name: "重试同一操作" }),
+  ).toBeDisabled();
+  expect(bodies[0]).toMatchObject({
+    change: { kind: "key_revoke", id: key, expected_revision: "3" },
+  });
+});
+test("FX publication preserves decimal precision and prior version, with pending schedule warning", async ({
+  page,
+}) => {
+  await settingsSetup(page);
+  const bodies: unknown[] = [];
+  await page.route("**/bff/v1/settings/apply", (route) => {
+    const b = route.request().postDataJSON();
+    bodies.push(b);
+    return route.fulfill({
+      json: { operation_id: b.operation_id, object_id: "12", revision: "12" },
+    });
+  });
+  await page.goto("/#fx");
+  await page.getByText("发布新的人民币汇率", { exact: true }).click();
+  await page.getByLabel("1 USD 兑换人民币（CNY）").fill("7.0000000001");
+  await page.getByLabel("汇率来源", { exact: true }).fill("财务批准版本");
+  await page.getByLabel("变更理由", { exact: true }).fill("更新人民币结算换算");
+  await page.getByRole("button", { name: "核对变更", exact: true }).click();
+  await expect(
+    page.getByText("未来版本仍会按原定时间生效", { exact: false }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "刷新汇率", exact: true }),
+  ).toBeDisabled();
+  await page.getByRole("button", { name: "确认提交配置" }).click();
+  await expect(
+    page.getByText("已提交配置版本 12", { exact: false }),
+  ).toBeVisible();
+  expect(bodies[0]).toMatchObject({
+    change: {
+      kind: "fx_publish",
+      expected_latest_id: "11",
+      usd_cny: "7.0000000001",
+      effective_at: null,
+    },
+  });
+});
+test("Key permission failures clear generated material and all previous data", async ({
+  page,
+}) => {
+  await settingsSetup(page);
+  await page.route("**/bff/v1/settings/apply", (route) =>
+    route.fulfill({
+      status: 403,
+      json: { error: { code: "console_forbidden" } },
+    }),
+  );
+  await page.goto("/#keys");
+  await page.getByText("创建虚拟 Key", { exact: true }).click();
+  await page.getByRole("button", { name: "生成一次性密钥" }).click();
+  await page.getByLabel("Key 名称", { exact: true }).fill("test");
+  await page.getByLabel("允许的模型 ID", { exact: false }).fill("test/model");
+  await page.getByLabel("我已将密钥保存到受控凭据库", { exact: false }).check();
+  await page.getByLabel("变更理由", { exact: true }).fill("test");
+  await page.getByRole("button", { name: "核对变更", exact: true }).click();
+  await page.getByRole("button", { name: "确认提交配置" }).click();
+  await expect(
+    page.getByRole("button", { name: "重新检查权限" }),
+  ).toBeVisible();
+  await expect(page.getByLabel("待保存密钥")).toHaveCount(0);
+  await expect(page.getByRole("list", { name: "Key 列表" })).toHaveCount(0);
+});
+test("Key and FX forms fit narrow and zoomed layouts and pass accessibility checks", async ({
+  page,
+}) => {
+  await settingsSetup(page);
+  await page.goto("/#keys");
+  await page.getByRole("button", { name: "管理 配置测试 Key" }).click();
+  await page.getByText("修改 Key 配置", { exact: true }).click();
+  for (const width of [320, 640, 768, 1024, 1440]) {
+    await page.setViewportSize({ width, height: 1000 });
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= innerWidth,
+      ),
+    ).toBe(true);
+    const clipped = await page
+      .locator("main input:visible, main textarea:visible, main button:visible")
+      .evaluateAll((nodes) =>
+        nodes.some((n) => {
+          const r = n.getBoundingClientRect();
+          return r.left < 0 || r.right > innerWidth || r.height < 44;
+        }),
+      );
+    expect(clipped).toBe(false);
+  }
+  expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
+  await page.setViewportSize({ width: 720, height: 1000 });
+  await page.evaluate(() => {
+    document.documentElement.style.fontSize = "200%";
+  });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  await page.screenshot({
+    path: "test-results/settings-keys.png",
+    fullPage: false,
+  });
+  await page.evaluate(() => {
+    document.documentElement.style.fontSize = "100%";
+  });
+  await page.goto("/#fx");
+  await page.getByText("发布新的人民币汇率", { exact: true }).click();
+  await page.setViewportSize({ width: 320, height: 1000 });
+  expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  await page.screenshot({
+    path: "test-results/settings-fx.png",
+    fullPage: false,
+  });
+  expect(
+    await page
+      .locator("main input:visible, main button:visible")
+      .evaluateAll((nodes) =>
+        nodes.some((n) => {
+          const r = n.getBoundingClientRect();
+          return r.left < 0 || r.right > innerWidth || r.height < 44;
+        }),
+      ),
+  ).toBe(false);
+});
 test("catalog readonly permission hides mutations and preserves exact prices", async ({
   page,
 }) => {
