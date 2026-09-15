@@ -46,6 +46,24 @@ impl Human {
     }
 }
 impl Verifier {
+    pub fn new_settings(
+        issuer: &str,
+        audience: &str,
+        pem_keys: HashMap<String, String>,
+    ) -> Result<Self> {
+        let mut verifier = Self::new(issuer, audience, pem_keys)?;
+        verifier.token_type = "br-settings+jwt";
+        Ok(verifier)
+    }
+    pub fn settings_from_env() -> Result<Self> {
+        let get = |name| std::env::var(name).map_err(|_| Error::Configuration);
+        Self::new_settings(
+            &get("BROKERROUTER_SETTINGS_ISSUER")?,
+            &get("BROKERROUTER_SETTINGS_AUDIENCE")?,
+            serde_json::from_str(&get("BROKERROUTER_SETTINGS_PUBLIC_KEYS")?)
+                .map_err(|_| Error::Configuration)?,
+        )
+    }
     pub fn new_catalog(
         issuer: &str,
         audience: &str,

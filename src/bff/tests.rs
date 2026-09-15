@@ -189,6 +189,7 @@ async fn fixture(pool: &PgPool) -> Fixture {
     // Only this private cfg(test) fixture permits loopback HTTP. from_env has no insecure switch.
     let bff = Arc::new(Bff {
         catalog: None,
+        settings: None,
         pool: pool.clone(),
         config: Config {
             origin,
@@ -723,6 +724,134 @@ async fn catalog_bff_uses_separate_signer_csrf_whitelist_and_idempotent_mutation
             .is_err()
     );
 }
+#[sqlx::test(migrations = "./migrations")]
+async fn settings_bff_uses_bound_human_proof_and_separate_permissions(pool: PgPool) {
+    let mut f = fixture(&pool).await;
+    let (token, csrf) = logged_in(&f).await;
+    assert!(matches!(
+        f.bff
+            .query(&token, &csrf, "/settings/v1/keys/query", br#"{"limit":20}"#)
+            .await,
+        Err(Error::Configuration)
+    ));
+    let private = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let verifier = human::Verifier::new_settings(
+        &f.bff.config.origin,
+        "settings-test",
+        HashMap::from([(
+            "settings-fixture".into(),
+            private
+                .to_public_key()
+                .to_public_key_pem(LineEnding::LF)
+                .unwrap(),
+        )]),
+    )
+    .unwrap();
+    let (origin, task) = serve(crate::settings_api::router(crate::settings_api::Settings {
+        pool: pool.clone(),
+        verifier: Arc::new(verifier),
+    }))
+    .await;
+    let _settings = Task(task);
+    Arc::get_mut(&mut f.bff).unwrap().settings = Some(CatalogTarget {
+        origin,
+        audience: "settings-test".into(),
+        kid: "settings-fixture".into(),
+        signer: EncodingKey::from_rsa_pem(private.to_pkcs8_pem(LineEnding::LF).unwrap().as_bytes())
+            .unwrap(),
+    });
+    for permission in [
+        crate::console::Permission::KeysRead,
+        crate::console::Permission::KeysWrite,
+    ] {
+        crate::console::set_permission(
+            &pool,
+            f.tenant,
+            f.user,
+            permission,
+            true,
+            "settings BFF test",
+        )
+        .await
+        .unwrap();
+    }
+    store::put_model(&pool, f.tenant, "test/settings", "settings model")
+        .await
+        .unwrap();
+    let secret = format!(
+        "sk_br_{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    );
+    let body = json!({"operation_id":Uuid::new_v4(),"reason":"OIDC Key configuration test","change":{"kind":"key_create","name":"BFF key","key_hash":governance::hex(&store::hash(secret.as_bytes())),"key_prefix":&secret[..14],"budget_cny":"0","models":["test/settings"],"expires_at":(Utc::now()+chrono::Duration::days(1)).to_rfc3339_opts(chrono::SecondsFormat::Micros,true)}});
+    let (base, task) = serve(router(f.bff.clone())).await;
+    let _bff = Task(task);
+    let client = http_client().unwrap();
+    let cookie = format!("__Host-br-session={token}; __Host-br-csrf={csrf}");
+    for path in [
+        "keys/query",
+        "keys/detail",
+        "models/query",
+        "fx/query",
+        "apply",
+    ] {
+        let response = client
+            .post(format!("{base}/bff/v1/settings/{path}"))
+            .header("origin", "https://evil.example")
+            .header("cookie", &cookie)
+            .header("x-br-csrf", &csrf)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+    }
+    let mut receipts = vec![];
+    for _ in 0..2 {
+        let response = client
+            .post(format!("{base}/bff/v1/settings/apply"))
+            .header("origin", &f.bff.config.origin)
+            .header("cookie", &cookie)
+            .header("x-br-csrf", &csrf)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        receipts.push(response.json::<Value>().await.unwrap());
+    }
+    assert_eq!(receipts[0], receipts[1]);
+    assert!(!receipts[0].to_string().contains(&secret));
+    assert!(store::authenticate(&pool, &secret).await.is_ok());
+    assert_eq!(
+        f.bff
+            .query(&token, &csrf, "/settings/v1/fx/query", br#"{"limit":20}"#)
+            .await
+            .unwrap()
+            .0,
+        403
+    );
+    assert!(
+        f.bff
+            .query(&token, &csrf, "/settings/v1/permissions/apply", b"{}")
+            .await
+            .is_err()
+    );
+    f.bff.logout(&token, &csrf).await.unwrap();
+    assert!(
+        f.bff
+            .query(
+                &token,
+                &csrf,
+                "/settings/v1/apply",
+                &serde_json::to_vec(&body).unwrap()
+            )
+            .await
+            .is_err()
+    );
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn login_and_logout_audit_failures_are_atomic(pool: PgPool) {
     let f = fixture(&pool).await;

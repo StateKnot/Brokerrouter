@@ -42,6 +42,7 @@ pub struct Bff {
     cipher: ResultCipher,
     signer: EncodingKey,
     catalog: Option<CatalogTarget>,
+    settings: Option<CatalogTarget>,
     http: reqwest::Client,
 }
 impl Bff {
@@ -116,6 +117,40 @@ impl Bff {
                 signer: signing_key(&catalog_pem)?,
             })
         };
+        let settings_names = [
+            "BROKERROUTER_BFF_SETTINGS_ORIGIN",
+            "BROKERROUTER_SETTINGS_AUDIENCE",
+            "BROKERROUTER_BFF_SETTINGS_SIGNING_KID",
+            "BROKERROUTER_BFF_SETTINGS_SIGNING_PRIVATE_KEY",
+        ];
+        let settings = if settings_names
+            .iter()
+            .all(|name| std::env::var_os(name).is_none())
+        {
+            None
+        } else {
+            let origin = get(settings_names[0])?;
+            https_origin(&origin)?;
+            let audience = get(settings_names[1])?;
+            let kid = get(settings_names[2])?;
+            let settings_pem = get(settings_names[3])?;
+            let modulus = private_key(&settings_pem)?.n().clone();
+            if !governance::valid_text(&audience, 200)
+                || !governance::valid_text(&kid, 100)
+                || audience == config.audience
+                || modulus == *private_key(&pem)?.n()
+                || catalog.as_ref().is_some_and(|c| c.audience == audience)
+                || (catalog.is_some() && modulus == *private_key(&get(catalog_names[3])?)?.n())
+            {
+                return Err(Error::Configuration);
+            }
+            Some(CatalogTarget {
+                origin,
+                audience,
+                kid,
+                signer: signing_key(&settings_pem)?,
+            })
+        };
         let cipher = ResultCipher::new(
             get("BROKERROUTER_BFF_ACTIVE_KEY")?,
             serde_json::from_str(&get("BROKERROUTER_BFF_KEYS")?)
@@ -124,7 +159,7 @@ impl Bff {
         let config_hash = governance::digest(
             &json!({"origin":config.origin,"issuer":config.oidc_issuer,
             "origins":config.oidc_origins,"client":config.client_id,"console":config.console_origin,
-            "audience":config.audience,"kid":config.kid,"catalog":catalog.as_ref().map(|c|json!({"origin":c.origin,"audience":c.audience,"kid":c.kid}))}),
+            "audience":config.audience,"kid":config.kid,"catalog":catalog.as_ref().map(|c|json!({"origin":c.origin,"audience":c.audience,"kid":c.kid})),"settings":settings.as_ref().map(|c|json!({"origin":c.origin,"audience":c.audience,"kid":c.kid}))}),
         )?;
         Ok(Arc::new(Self {
             pool,
@@ -133,6 +168,7 @@ impl Bff {
             cipher,
             signer,
             catalog,
+            settings,
             http: http_client()?,
         }))
     }
@@ -287,6 +323,16 @@ impl Bff {
         ) {
             let c = self.catalog.as_ref().ok_or(Error::Configuration)?;
             (&c.origin, &c.audience, &c.kid, &c.signer, "br-catalog+jwt")
+        } else if matches!(
+            path,
+            "/settings/v1/keys/query"
+                | "/settings/v1/keys/detail"
+                | "/settings/v1/models/query"
+                | "/settings/v1/fx/query"
+                | "/settings/v1/apply"
+        ) {
+            let c = self.settings.as_ref().ok_or(Error::Configuration)?;
+            (&c.origin, &c.audience, &c.kid, &c.signer, "br-settings+jwt")
         } else if matches!(
             path,
             "/console/v1/usage/query"

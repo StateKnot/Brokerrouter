@@ -41,13 +41,21 @@ const Audit = lazy(() =>
 const Catalog = lazy(() =>
   import("./Management").then((module) => ({ default: module.Catalog })),
 );
+const Keys = lazy(() =>
+  import("./Settings").then((module) => ({ default: module.Keys })),
+);
+const Fx = lazy(() =>
+  import("./Settings").then((module) => ({ default: module.Fx })),
+);
 
-type Page = "usage" | "requests" | "audit" | "catalog";
+type Page = "usage" | "requests" | "audit" | "catalog" | "keys" | "fx";
 const titles: Record<Page, string> = {
   usage: "人民币用量",
   requests: "请求日志",
   audit: "审计日志",
   catalog: "模型与端点",
+  keys: "虚拟 Key",
+  fx: "人民币汇率",
 };
 type Auth =
   | { state: "checking" }
@@ -56,7 +64,11 @@ type Auth =
   | { state: "ready"; session: Session };
 const pageFromHash = (): Page => {
   const page = location.hash.slice(1);
-  return page === "requests" || page === "audit" || page === "catalog"
+  return page === "requests" ||
+    page === "audit" ||
+    page === "catalog" ||
+    page === "keys" ||
+    page === "fx"
     ? page
     : "usage";
 };
@@ -405,6 +417,12 @@ function Workspace({
           >
             模型与端点
           </a>
+          <a href="#keys" aria-current={page === "keys" ? "page" : undefined}>
+            虚拟 Key
+          </a>
+          <a href="#fx" aria-current={page === "fx" ? "page" : undefined}>
+            人民币汇率
+          </a>
         </nav>
         <div className="sidebar-note">
           <span>结算本位币</span>
@@ -434,7 +452,11 @@ function Workspace({
                   ? "追溯组织操作记录与配置变更，区分真人操作与数据库执行身份。"
                   : page === "catalog"
                     ? "统一逻辑模型与多供应商端点，使用独立配置权限和可追溯变更。"
-                    : "查看已准入请求的状态与账本记录，不含请求原文。"}
+                    : page === "keys"
+                      ? "管理模型调用凭据、人民币预算、有效期和明确授权。"
+                      : page === "fx"
+                        ? "版本化管理美元与人民币转换，不改写历史结算。"
+                        : "查看已准入请求的状态与账本记录，不含请求原文。"}
             </p>
           </header>
           {logoutError !== null && (
@@ -482,6 +504,10 @@ function Workspace({
                   <Audit denied={reportDenied} />
                 ) : page === "catalog" ? (
                   <Catalog denied={reportDenied} />
+                ) : page === "keys" ? (
+                  <Keys denied={reportDenied} />
+                ) : page === "fx" ? (
+                  <Fx denied={reportDenied} />
                 ) : (
                   <Requests selection={selection} loginNeeded={reportDenied} />
                 )}
