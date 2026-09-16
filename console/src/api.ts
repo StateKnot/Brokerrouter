@@ -4,6 +4,9 @@ type Path =
   | "login"
   | "session"
   | "logout"
+  | "approvals/query"
+  | "approvals/review"
+  | "approvals/decide"
   | "usage/query"
   | "usage/groups/query"
   | "requests/query"
@@ -148,6 +151,14 @@ export function errorMessage(error: unknown): string {
     return "当前账号没有此项权限，请联系组织管理员授权。";
   if (error.code === "configuration_conflict")
     return "配置已被其他人修改，请重新加载并核对后再提交。";
+  if (error.code === "policy_changed")
+    return "护栏快照或审阅凭据已失效，请重新检查并审阅原操作。";
+  if (error.code === "turn_closed")
+    return "当前轮次已经关闭或过期，不能继续审批。";
+  if (error.code === "result_unavailable")
+    return "受保护原文已过期或不可用，不能据此放行。";
+  if (error.code === "action_rejected")
+    return "审批或操作状态已经变化，请刷新并核对最新结果。";
   if (error.code === "idempotency_conflict")
     return "操作编号已用于其他内容，已拒绝提交。请核对审计记录。";
   if (error.status === 401)

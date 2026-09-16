@@ -20,6 +20,9 @@ pub fn router(service: Arc<Bff>) -> Router {
         .route("/bff/v1/callback", get(callback))
         .route("/bff/v1/session", get(session))
         .route("/bff/v1/logout", post(logout))
+        .route("/bff/v1/approvals/query", post(query))
+        .route("/bff/v1/approvals/review", post(query))
+        .route("/bff/v1/approvals/decide", post(query))
         .route("/bff/v1/usage/query", post(query))
         .route("/bff/v1/usage/groups/query", post(query))
         .route("/bff/v1/requests/query", post(query))
@@ -253,6 +256,8 @@ async fn query(
         format!("/catalog/v1/{suffix}")
     } else if let Some(suffix) = uri.path().strip_prefix("/bff/v1/settings/") {
         format!("/settings/v1/{suffix}")
+    } else if let Some(suffix) = uri.path().strip_prefix("/bff/v1/approvals/") {
+        format!("/approvals/v1/{suffix}")
     } else {
         uri.path().replacen("/bff/", "/console/", 1)
     };

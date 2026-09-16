@@ -49,6 +49,7 @@ const Fx = lazy(() =>
 );
 const GovernanceSettings = lazy(() => import("./GovernanceSettings"));
 const Monitoring = lazy(() => import("./Monitoring"));
+const Approvals = lazy(() => import("./Approvals"));
 
 type Page =
   | "usage"
@@ -58,7 +59,8 @@ type Page =
   | "keys"
   | "fx"
   | "governance"
-  | "monitoring";
+  | "monitoring"
+  | "approvals";
 const titles: Record<Page, string> = {
   usage: "人民币用量",
   requests: "请求日志",
@@ -68,6 +70,7 @@ const titles: Record<Page, string> = {
   fx: "人民币汇率",
   governance: "护栏与策略",
   monitoring: "护栏监控",
+  approvals: "本人审批",
 };
 type Auth =
   | { state: "checking" }
@@ -82,7 +85,8 @@ const pageFromHash = (): Page => {
     page === "keys" ||
     page === "fx" ||
     page === "governance" ||
-    page === "monitoring"
+    page === "monitoring" ||
+    page === "approvals"
     ? page
     : "usage";
 };
@@ -440,6 +444,12 @@ function Workspace({
           >
             护栏监控
           </a>
+          <a
+            href="#approvals"
+            aria-current={page === "approvals" ? "page" : undefined}
+          >
+            本人审批
+          </a>
           <a href="#fx" aria-current={page === "fx" ? "page" : undefined}>
             人民币汇率
           </a>
@@ -484,9 +494,11 @@ function Workspace({
                         ? "版本化管理美元与人民币转换，不改写历史结算。"
                         : page === "monitoring"
                           ? "区分护栏风险、检测失败、人工决定与执行状态，核对真实人民币账本。"
-                          : page === "governance"
-                            ? "版本化管理输入、输出与智能体节点护栏；配置不等于审批或执行授权。"
-                            : "查看已准入请求的状态与账本记录，不含请求原文。"}
+                          : page === "approvals"
+                            ? "本人按需审阅风险、明确决定；审批与智能体节点执行分开。"
+                            : page === "governance"
+                              ? "版本化管理输入、输出与智能体节点护栏；配置不等于审批或执行授权。"
+                              : "查看已准入请求的状态与账本记录，不含请求原文。"}
             </p>
           </header>
           {logoutError !== null && (
@@ -540,6 +552,8 @@ function Workspace({
                   <Fx denied={reportDenied} />
                 ) : page === "monitoring" ? (
                   <Monitoring denied={reportDenied} />
+                ) : page === "approvals" ? (
+                  <Approvals denied={reportDenied} />
                 ) : page === "governance" ? (
                   <GovernanceSettings denied={reportDenied} />
                 ) : (

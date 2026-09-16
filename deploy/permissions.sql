@@ -227,4 +227,23 @@ GRANT SELECT(tenant_id,model_id,active,operation) ON endpoints TO brokerrouter_s
 GRANT SELECT,INSERT ON guardrail_observations TO brokerrouter_runtime,brokerrouter_output_delivery;
 GRANT UPDATE(approval_skipped_at) ON guardrail_observations TO brokerrouter_runtime,brokerrouter_output_delivery;
 GRANT SELECT ON monitoring_coverage,console_guardrail_facts,console_approval_facts,console_active_guardrails TO brokerrouter_console;
+-- Human-owned review/decision service. No turn creation, execution receipts, model keys or assets.
+DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_approvals') THEN
+    CREATE ROLE brokerrouter_approvals NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+END IF; END $$;
+GRANT USAGE ON SCHEMA public TO brokerrouter_approvals;
+GRANT SELECT ON _sqlx_migrations,governance_users,runtime_bindings,governance_turns,guardrails,guardrail_versions,guardrail_policies,governance_operations,approvals,approval_reviews,guardrail_grants,human_assertions,key_models TO brokerrouter_approvals;
+GRANT SELECT(id,active) ON tenants TO brokerrouter_approvals;
+GRANT SELECT(tenant_id,id,revoked_at,expires_at) ON virtual_keys TO brokerrouter_approvals;
+GRANT SELECT(tenant_id,id,active) ON models TO brokerrouter_approvals;
+GRANT SELECT(tenant_id,id,governance_turn_id) ON requests TO brokerrouter_approvals;
+GRANT UPDATE(governance_lock) ON tenants TO brokerrouter_approvals;
+GRANT INSERT ON approval_reviews,human_assertions,guardrail_grants,governance_events,audit_events TO brokerrouter_approvals;
+GRANT DELETE ON human_assertions TO brokerrouter_approvals;
+GRANT UPDATE(expires_at) ON human_assertions TO brokerrouter_approvals;
+GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_approvals;
+GRANT UPDATE(state,event_clock) ON governance_turns TO brokerrouter_approvals;
+GRANT UPDATE(state,decision_hash,decided_by,feedback_ciphertext,decided_at) ON approvals TO brokerrouter_approvals;
+GRANT UPDATE(state,payload_ciphertext) ON governance_operations TO brokerrouter_approvals;
+GRANT UPDATE(result_ciphertext) ON requests TO brokerrouter_approvals;
 COMMIT;

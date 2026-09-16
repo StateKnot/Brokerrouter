@@ -1,5 +1,7 @@
 pub mod accounting;
 pub mod api;
+pub mod approval_workbench;
+pub mod approvals_api;
 pub mod asset_api;
 pub mod assets;
 pub mod attempts;
