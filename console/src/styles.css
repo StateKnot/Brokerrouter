@@ -2,6 +2,41 @@
 /* Hallmark · pre-emit critique: P5 H4 E4 S5 R4 V5 · contrast: pass (40–41) · mobile: pass (34, 49, 50–57); scope and evidence: ../.hallmark/qa.md */
 @import "tailwindcss";
 
+.traces {
+  min-width: 0;
+}
+.traces .table-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--color-rule);
+  border-radius: 8px;
+  margin: 1rem 0;
+}
+.traces table {
+  width: 100%;
+  min-width: 900px;
+}
+.traces td {
+  max-width: 22rem;
+  overflow-wrap: anywhere;
+}
+.trace-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 1rem 0;
+}
+.trace-metadata {
+  overflow-wrap: anywhere;
+}
+.traces .metric {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.traces .metrics {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr));
+}
+
 .monitoring {
   display: grid;
   grid-template-columns: minmax(0, 1fr);

@@ -25,6 +25,7 @@ pub enum Permission {
     GovernanceRead,
     GovernanceWrite,
     MonitoringRead,
+    TracesRead,
 }
 impl Permission {
     pub(crate) fn name(self) -> &'static str {
@@ -40,6 +41,7 @@ impl Permission {
             Self::GovernanceRead => "governance_read",
             Self::GovernanceWrite => "governance_write",
             Self::MonitoringRead => "monitoring_read",
+            Self::TracesRead => "traces_read",
         }
     }
 }

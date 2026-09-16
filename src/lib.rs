@@ -37,6 +37,7 @@ pub mod scanner_worker;
 pub mod settings;
 pub mod settings_api;
 pub mod store;
+pub mod traces;
 
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::time::Duration;

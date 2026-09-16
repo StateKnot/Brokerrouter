@@ -66,7 +66,7 @@ enum Command {
         tenant: Uuid,
         #[arg(long)]
         user: Uuid,
-        #[arg(long, value_parser=["usage_read","audit_read","catalog_read","catalog_write","keys_read","keys_write","fx_read","fx_write","governance_read","governance_write","monitoring_read"])]
+        #[arg(long, value_parser=["usage_read","audit_read","catalog_read","catalog_write","keys_read","keys_write","fx_read","fx_write","governance_read","governance_write","monitoring_read","traces_read"])]
         permission: String,
         #[arg(long, action=clap::ArgAction::Set)]
         enabled: bool,

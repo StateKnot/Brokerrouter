@@ -1,6 +1,8 @@
 mod common;
 #[path = "console_monitoring/mod.rs"]
 mod monitoring;
+#[path = "console_traces/mod.rs"]
+mod traces;
 use axum::{
     Router,
     body::Body,
