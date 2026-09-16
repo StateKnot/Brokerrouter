@@ -11,6 +11,9 @@
 .monitoring > * {
   min-width: 0;
 }
+.monitoring .metrics {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
+}
 .monitor-notes {
   padding: 1rem;
   border: 1px solid var(--color-rule);

@@ -247,6 +247,19 @@ test("monitoring responsive tables keyboard and 200 percent text remain accessib
   await page.evaluate(() => {
     document.documentElement.style.fontSize = "200%";
   });
+  expect(
+    await page
+      .locator(".monitoring .metric dd > span")
+      .evaluateAll((elements) =>
+        elements
+          .filter(
+            (element) =>
+              element.getBoundingClientRect().height >
+              parseFloat(getComputedStyle(element).lineHeight) + 1,
+          )
+          .map((element) => element.textContent),
+      ),
+  ).toEqual([]);
   expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
   await page.screenshot({
     path: info.outputPath("monitoring-200.png"),
