@@ -1,8 +1,8 @@
-//! Separate human-only listener and database role for key / exchange-rate configuration.
+//! Separate human-only listener and database role for key / exchange-rate / governance configuration.
 use crate::{
     api,
     error::{Error, Result},
-    human, settings,
+    governance_settings, human, settings,
 };
 use axum::{
     Json, Router,
@@ -29,6 +29,11 @@ pub fn router(service: Settings) -> Router {
         .route("/settings/v1/keys/detail", post(query))
         .route("/settings/v1/models/query", post(query))
         .route("/settings/v1/fx/query", post(query))
+        .route("/settings/v1/guardrails/query", post(query))
+        .route("/settings/v1/guardrails/history", post(query))
+        .route("/settings/v1/policies/query", post(query))
+        .route("/settings/v1/policies/preview", post(query))
+        .route("/settings/v1/governance/targets", post(query))
         .route("/settings/v1/apply", post(query))
         .fallback(|| async { Error::NotFound })
         .with_state(service)
@@ -94,6 +99,21 @@ async fn query(
         "/settings/v1/keys/detail" => settings::key_detail(&c.pool, &who, decode(&body)?).await?,
         "/settings/v1/models/query" => settings::models(&c.pool, &who, decode(&body)?).await?,
         "/settings/v1/fx/query" => settings::fx(&c.pool, &who, decode(&body)?).await?,
+        "/settings/v1/guardrails/query" => {
+            governance_settings::guardrails(&c.pool, &who, decode(&body)?).await?
+        }
+        "/settings/v1/guardrails/history" => {
+            governance_settings::history(&c.pool, &who, decode(&body)?).await?
+        }
+        "/settings/v1/policies/query" => {
+            governance_settings::policies(&c.pool, &who, decode(&body)?).await?
+        }
+        "/settings/v1/policies/preview" => {
+            governance_settings::preview(&c.pool, &who, decode(&body)?).await?
+        }
+        "/settings/v1/governance/targets" => {
+            governance_settings::targets(&c.pool, &who, decode(&body)?).await?
+        }
         "/settings/v1/apply" => settings::apply(&c.pool, &who, decode(&body)?).await?,
         _ => return Err(Error::NotFound),
     }))

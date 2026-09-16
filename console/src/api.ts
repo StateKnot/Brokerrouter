@@ -15,6 +15,11 @@ type Path =
   | "settings/keys/detail"
   | "settings/models/query"
   | "settings/fx/query"
+  | "settings/guardrails/query"
+  | "settings/guardrails/history"
+  | "settings/policies/query"
+  | "settings/policies/preview"
+  | "settings/governance/targets"
   | "settings/apply";
 export class ApiError extends Error {
   constructor(

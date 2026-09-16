@@ -329,6 +329,11 @@ impl Bff {
                 | "/settings/v1/keys/detail"
                 | "/settings/v1/models/query"
                 | "/settings/v1/fx/query"
+                | "/settings/v1/guardrails/query"
+                | "/settings/v1/guardrails/history"
+                | "/settings/v1/policies/query"
+                | "/settings/v1/policies/preview"
+                | "/settings/v1/governance/targets"
                 | "/settings/v1/apply"
         ) {
             let c = self.settings.as_ref().ok_or(Error::Configuration)?;

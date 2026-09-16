@@ -31,7 +31,12 @@ type QueryPath =
   | "settings/keys/query"
   | "settings/keys/detail"
   | "settings/models/query"
-  | "settings/fx/query";
+  | "settings/fx/query"
+  | "settings/guardrails/query"
+  | "settings/guardrails/history"
+  | "settings/policies/query"
+  | "settings/policies/preview"
+  | "settings/governance/targets";
 export function useQuery<T>(
   path: QueryPath,
   schema: z.ZodType<T>,
@@ -274,6 +279,12 @@ const labels: Record<string, string> = {
   usd_cny: "1 USD 兑换 CNY",
   source: "汇率来源",
   effective_at: "生效时间（空值代表提交时）",
+  stage: "执行阶段",
+  rule: "完整检测规则",
+  guardrail_id: "护栏 ID",
+  key_id: "虚拟 Key ID（空值匹配全部）",
+  runtime_id: "Runtime ID（空值匹配全部）",
+  tool_name: "工具名（空值匹配全部）",
 };
 const kinds: Record<string, string> = {
   model_create: "新建模型（停用）",
@@ -284,6 +295,8 @@ const kinds: Record<string, string> = {
   key_update: "修改虚拟 Key",
   key_revoke: "永久撤销虚拟 Key",
   fx_publish: "发布 USD/CNY 汇率版本",
+  guardrail_publish: "发布护栏新版本（包含启停状态）",
+  policy_put: "保存护栏匹配策略",
 };
 function mutationError(error: unknown): string {
   if (error instanceof ApiError && (error.status === 0 || error.status >= 500))
@@ -321,9 +334,11 @@ export function MutationForm({
     [error, setError] = useState<unknown>(null);
   const [validation, setValidation] = useState("");
   const controller = useRef<AbortController | null>(null);
+  const reviewRef = useRef<HTMLElement | null>(null);
   useEffect(() => () => controller.current?.abort(), []);
   useEffect(() => {
     if (!pending) return;
+    reviewRef.current?.focus();
     const unload = (e: BeforeUnloadEvent) => {
       e.preventDefault();
     };
@@ -440,7 +455,12 @@ export function MutationForm({
         </p>
       )}
       {pending && (
-        <section className="change-review" aria-label="变更确认">
+        <section
+          className="change-review"
+          aria-label="变更确认"
+          tabIndex={-1}
+          ref={reviewRef}
+        >
           <h3>确认这次配置变更</h3>
           <p>{review}</p>
           <dl className="config-facts">
@@ -448,15 +468,30 @@ export function MutationForm({
               <div key={key}>
                 <dt>{labels[key] ?? key}</dt>
                 <dd>
-                  {key === "kind"
-                    ? kinds[String(value)]
-                    : value === null
-                      ? "不适用"
-                      : typeof value === "boolean"
-                        ? value
-                          ? "是"
-                          : "否"
-                        : String(value)}
+                  {key === "kind" ? (
+                    kinds[String(value)]
+                  ) : value === null ? (
+                    pending.change.kind === "policy_put" &&
+                    ["model_id", "key_id", "runtime_id", "tool_name"].includes(
+                      key,
+                    ) ? (
+                      "全部（不限）"
+                    ) : (
+                      "不适用"
+                    )
+                  ) : typeof value === "boolean" ? (
+                    value ? (
+                      "是"
+                    ) : (
+                      "否"
+                    )
+                  ) : typeof value === "object" && !Array.isArray(value) ? (
+                    <pre className="config-json">
+                      {JSON.stringify(value, null, 2)}
+                    </pre>
+                  ) : (
+                    String(value)
+                  )}
                 </dd>
               </div>
             ))}

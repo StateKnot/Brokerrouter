@@ -1,4 +1,6 @@
 mod common;
+#[path = "settings_governance/mod.rs"]
+mod governance_settings;
 use axum::{
     Router,
     body::Body,

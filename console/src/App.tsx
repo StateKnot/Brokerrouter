@@ -47,8 +47,10 @@ const Keys = lazy(() =>
 const Fx = lazy(() =>
   import("./Settings").then((module) => ({ default: module.Fx })),
 );
+const GovernanceSettings = lazy(() => import("./GovernanceSettings"));
 
-type Page = "usage" | "requests" | "audit" | "catalog" | "keys" | "fx";
+type Page =
+  "usage" | "requests" | "audit" | "catalog" | "keys" | "fx" | "governance";
 const titles: Record<Page, string> = {
   usage: "人民币用量",
   requests: "请求日志",
@@ -56,6 +58,7 @@ const titles: Record<Page, string> = {
   catalog: "模型与端点",
   keys: "虚拟 Key",
   fx: "人民币汇率",
+  governance: "护栏与策略",
 };
 type Auth =
   | { state: "checking" }
@@ -68,7 +71,8 @@ const pageFromHash = (): Page => {
     page === "audit" ||
     page === "catalog" ||
     page === "keys" ||
-    page === "fx"
+    page === "fx" ||
+    page === "governance"
     ? page
     : "usage";
 };
@@ -423,6 +427,12 @@ function Workspace({
           <a href="#fx" aria-current={page === "fx" ? "page" : undefined}>
             人民币汇率
           </a>
+          <a
+            href="#governance"
+            aria-current={page === "governance" ? "page" : undefined}
+          >
+            护栏与策略
+          </a>
         </nav>
         <div className="sidebar-note">
           <span>结算本位币</span>
@@ -456,7 +466,9 @@ function Workspace({
                       ? "管理模型调用凭据、人民币预算、有效期和明确授权。"
                       : page === "fx"
                         ? "版本化管理美元与人民币转换，不改写历史结算。"
-                        : "查看已准入请求的状态与账本记录，不含请求原文。"}
+                        : page === "governance"
+                          ? "版本化管理输入、输出与智能体节点护栏；配置不等于审批或执行授权。"
+                          : "查看已准入请求的状态与账本记录，不含请求原文。"}
             </p>
           </header>
           {logoutError !== null && (
@@ -508,6 +520,8 @@ function Workspace({
                   <Keys denied={reportDenied} />
                 ) : page === "fx" ? (
                   <Fx denied={reportDenied} />
+                ) : page === "governance" ? (
+                  <GovernanceSettings denied={reportDenied} />
                 ) : (
                   <Requests selection={selection} loginNeeded={reportDenied} />
                 )}
