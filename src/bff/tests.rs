@@ -191,6 +191,8 @@ async fn fixture(pool: &PgPool) -> Fixture {
         catalog: None,
         settings: None,
         approvals: None,
+        media_review: None,
+        preview_origin: None,
         pool: pool.clone(),
         config: Config {
             origin,
@@ -421,6 +423,155 @@ async fn approval_bff_fixed_paths_bind_real_oidc_owner_review_and_decision(pool:
             .await
             .is_err()
     );
+}
+
+struct MediaFixture {
+    pool: PgPool,
+    verifier: human::Verifier,
+    mode: AtomicUsize,
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+async fn media_fixture(
+    State(f): State<Arc<MediaFixture>>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    h: HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    assert!(!h.contains_key("cookie"));
+    let token = h["authorization"]
+        .to_str()
+        .unwrap()
+        .strip_prefix("Bearer ")
+        .unwrap();
+    let who = f
+        .verifier
+        .verify(&f.pool, token, "POST", uri.path(), &body)
+        .await
+        .unwrap();
+    assert!(!who.id.is_nil());
+    match f.mode.load(Ordering::SeqCst) {
+        1 => ([("content-type", "text/html")], vec![0; 4]).into_response(),
+        2 => (
+            [("content-type", "application/octet-stream")],
+            vec![0; 4194305],
+        )
+            .into_response(),
+        3 => {
+            f.entered.notify_one();
+            f.resume.notified().await;
+            (
+                [("content-type", "application/octet-stream")],
+                vec![4; 4194304],
+            )
+                .into_response()
+        }
+        _ => (
+            [("content-type", "application/octet-stream")],
+            vec![4; 4194304],
+        )
+            .into_response(),
+    }
+}
+#[sqlx::test(migrations = "./migrations")]
+async fn media_bff_binary_proxy_is_bounded_purpose_bound_csrf_checked_and_logout_fenced(
+    pool: PgPool,
+) {
+    let mut f = fixture(&pool).await;
+    let (token, csrf) = logged_in(&f).await;
+    assert!(
+        f.bff
+            .query(&token, &csrf, "/media-review/v1/chunk", b"{}")
+            .await
+            .is_err()
+    );
+    let upstream = Arc::new(MediaFixture {
+        pool: pool.clone(),
+        verifier: human::Verifier::new_media_review(
+            &f.bff.config.origin,
+            "media-test",
+            HashMap::from([("fixture".into(), keys().1.clone())]),
+        )
+        .unwrap(),
+        mode: AtomicUsize::new(0),
+        entered: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+    });
+    let (origin, task) = serve(
+        Router::new()
+            .route("/media-review/v1/chunk", post(media_fixture))
+            .with_state(upstream.clone()),
+    )
+    .await;
+    let _upstream = Task(task);
+    Arc::get_mut(&mut f.bff).unwrap().media_review = Some(CatalogTarget {
+        origin,
+        audience: "media-test".into(),
+        kid: "fixture".into(),
+        signer: keys().0.clone(),
+    });
+    let (base, task) = serve(router(f.bff.clone())).await;
+    let _bff = Task(task);
+    let client = http_client().unwrap();
+    let url = format!("{base}/bff/v1/media-review/chunk");
+    let cookie = format!("__Host-br-session={token}; __Host-br-csrf={csrf}");
+    assert_eq!(
+        client
+            .post(&url)
+            .header("origin", &f.bff.config.origin)
+            .header("cookie", &cookie)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    let r = client
+        .post(&url)
+        .header("origin", &f.bff.config.origin)
+        .header("cookie", &cookie)
+        .header("x-br-csrf", &csrf)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["content-type"], "application/octet-stream");
+    assert_eq!(r.headers()["content-disposition"], "attachment");
+    assert_eq!(r.headers()["cache-control"], "no-store");
+    assert_eq!(r.bytes().await.unwrap().len(), 4194304);
+    for mode in [1, 2] {
+        upstream.mode.store(mode, Ordering::SeqCst);
+        assert!(
+            f.bff
+                .query(&token, &csrf, "/media-review/v1/chunk", b"{}")
+                .await
+                .is_err()
+        );
+    }
+    for path in [
+        "/media-review/v1/decide",
+        "/media-review/v1/chunk?x=1",
+        "/media-review/v1/claim",
+    ] {
+        assert!(f.bff.query(&token, &csrf, path, b"{}").await.is_err());
+    }
+    upstream.mode.store(3, Ordering::SeqCst);
+    let bff = f.bff.clone();
+    let t = token.clone();
+    let c = csrf.clone();
+    let request =
+        tokio::spawn(async move { bff.query(&t, &c, "/media-review/v1/chunk", b"{}").await });
+    tokio::time::timeout(Duration::from_secs(5), upstream.entered.notified())
+        .await
+        .unwrap();
+    f.bff.logout(&token, &csrf).await.unwrap();
+    upstream.resume.notify_one();
+    assert!(matches!(
+        request.await.unwrap(),
+        Err(Error::SessionUnauthorized)
+    ));
 }
 
 #[sqlx::test(migrations = "./migrations")]

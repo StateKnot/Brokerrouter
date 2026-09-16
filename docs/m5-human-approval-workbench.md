@@ -1,5 +1,7 @@
 # M5.4a：本人审批 BFF 与安全 JSON 审阅
 
+本文记录 M5.4a 的 JSON 范围。M5.4b 已追加 [隔离 MP4 审阅与审批](m5-isolated-media-review.md)，媒体限制现以该文为准：仍不允许 JSON 占位放行，但允许经过独立完整媒体审阅凭据的决定；审批进程仅增加媒体元数据读取，不获得字节或 S3 凭据。
+
 契约 `human-approval-workbench-v1`，2026-09-16。交付 Rust 独立审批服务、定向 OIDC BFF 和 TypeScript 本人审批工作台。它是真实 API，不是模拟弹窗；生产 IdP/MFA、通道和运行环境的认证仍在 LIVE-19。普通 SDK 或未适配 Hermes/OpenClaw 不会因为新增网页就自动获得暂停/恢复功能。
 
 ## 权限与界面范围

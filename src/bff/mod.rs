@@ -44,6 +44,8 @@ pub struct Bff {
     catalog: Option<CatalogTarget>,
     settings: Option<CatalogTarget>,
     approvals: Option<CatalogTarget>,
+    media_review: Option<CatalogTarget>,
+    preview_origin: Option<String>,
     http: reqwest::Client,
 }
 impl Bff {
@@ -185,6 +187,52 @@ impl Bff {
                 signer: signing_key(&approval_pem)?,
             })
         };
+        let media_names = [
+            "BROKERROUTER_BFF_MEDIA_REVIEW_ORIGIN",
+            "BROKERROUTER_MEDIA_REVIEW_AUDIENCE",
+            "BROKERROUTER_BFF_MEDIA_REVIEW_SIGNING_KID",
+            "BROKERROUTER_BFF_MEDIA_REVIEW_SIGNING_PRIVATE_KEY",
+            "BROKERROUTER_BFF_MEDIA_PREVIEW_ORIGIN",
+        ];
+        let (media_review, preview_origin) = if media_names
+            .iter()
+            .all(|n| std::env::var_os(n).is_none())
+        {
+            (None, None)
+        } else {
+            let origin = get(media_names[0])?;
+            https_origin(&origin)?;
+            let audience = get(media_names[1])?;
+            let kid = get(media_names[2])?;
+            let media_pem = get(media_names[3])?;
+            let preview = get(media_names[4])?;
+            https_origin(&preview)?;
+            let modulus = private_key(&media_pem)?.n().clone();
+            if approvals.is_none()
+                || !governance::valid_text(&audience, 200)
+                || !governance::valid_text(&kid, 100)
+                || audience == config.audience
+                || modulus == *private_key(&pem)?.n()
+                || [&catalog, &settings, &approvals]
+                    .iter()
+                    .any(|c| c.as_ref().is_some_and(|c| c.audience == audience))
+                || https_url(&preview)?.host_str() == https_url(&config.origin)?.host_str()
+                || (catalog.is_some() && modulus == *private_key(&get(catalog_names[3])?)?.n())
+                || (settings.is_some() && modulus == *private_key(&get(settings_names[3])?)?.n())
+                || (approvals.is_some() && modulus == *private_key(&get(approval_names[3])?)?.n())
+            {
+                return Err(Error::Configuration);
+            }
+            (
+                Some(CatalogTarget {
+                    origin,
+                    audience,
+                    kid,
+                    signer: signing_key(&media_pem)?,
+                }),
+                Some(preview),
+            )
+        };
         let cipher = ResultCipher::new(
             get("BROKERROUTER_BFF_ACTIVE_KEY")?,
             serde_json::from_str(&get("BROKERROUTER_BFF_KEYS")?)
@@ -193,7 +241,7 @@ impl Bff {
         let config_hash = governance::digest(
             &json!({"origin":config.origin,"issuer":config.oidc_issuer,
             "origins":config.oidc_origins,"client":config.client_id,"console":config.console_origin,
-            "audience":config.audience,"kid":config.kid,"catalog":catalog.as_ref().map(|c|json!({"origin":c.origin,"audience":c.audience,"kid":c.kid})),"settings":settings.as_ref().map(|c|json!({"origin":c.origin,"audience":c.audience,"kid":c.kid})),"approvals":approvals.as_ref().map(|c|json!({"origin":c.origin,"audience":c.audience,"kid":c.kid}))}),
+            "audience":config.audience,"kid":config.kid,"catalog":catalog.as_ref().map(|c|json!({"origin":c.origin,"audience":c.audience,"kid":c.kid})),"settings":settings.as_ref().map(|c|json!({"origin":c.origin,"audience":c.audience,"kid":c.kid})),"approvals":approvals.as_ref().map(|c|json!({"origin":c.origin,"audience":c.audience,"kid":c.kid})),"media_review":media_review.as_ref().map(|c|json!({"origin":c.origin,"audience":c.audience,"kid":c.kid})),"preview_origin":preview_origin}),
         )?;
         Ok(Arc::new(Self {
             pool,
@@ -204,6 +252,8 @@ impl Bff {
             catalog,
             settings,
             approvals,
+            media_review,
+            preview_origin,
             http: http_client()?,
         }))
     }
@@ -360,6 +410,18 @@ impl Bff {
             (&c.origin, &c.audience, &c.kid, &c.signer, "br-catalog+jwt")
         } else if matches!(
             path,
+            "/media-review/v1/start" | "/media-review/v1/chunk" | "/media-review/v1/complete"
+        ) {
+            let c = self.media_review.as_ref().ok_or(Error::Configuration)?;
+            (
+                &c.origin,
+                &c.audience,
+                &c.kid,
+                &c.signer,
+                "br-media-review+jwt",
+            )
+        } else if matches!(
+            path,
             "/approvals/v1/query" | "/approvals/v1/review" | "/approvals/v1/decide"
         ) {
             let c = self.approvals.as_ref().ok_or(Error::Configuration)?;
@@ -442,8 +504,24 @@ impl Bff {
         ) {
             return Err(Error::BffUpstream);
         }
-        let bytes = bounded_response(response, 2097152).await?;
-        serde_json::from_slice::<Value>(&bytes).map_err(|_| Error::BffUpstream)?;
+        let binary = path == "/media-review/v1/chunk" && status == axum::http::StatusCode::OK;
+        if binary
+            && response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                != Some("application/octet-stream")
+        {
+            return Err(Error::BffUpstream);
+        }
+        let bytes = bounded_response(response, if binary { 4194304 } else { 2097152 }).await?;
+        if binary {
+            if bytes.is_empty() {
+                return Err(Error::BffUpstream);
+            }
+        } else {
+            serde_json::from_slice::<Value>(&bytes).map_err(|_| Error::BffUpstream)?;
+        }
         // Recheck fresh DB state after upstream work; concurrent logout must suppress delivery.
         self.session(token, Some(csrf)).await?;
         Ok((status, bytes))

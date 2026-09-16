@@ -23,6 +23,9 @@ pub fn router(service: Arc<Bff>) -> Router {
         .route("/bff/v1/approvals/query", post(query))
         .route("/bff/v1/approvals/review", post(query))
         .route("/bff/v1/approvals/decide", post(query))
+        .route("/bff/v1/media-review/start", post(query))
+        .route("/bff/v1/media-review/chunk", post(query))
+        .route("/bff/v1/media-review/complete", post(query))
         .route("/bff/v1/usage/query", post(query))
         .route("/bff/v1/usage/groups/query", post(query))
         .route("/bff/v1/requests/query", post(query))
@@ -225,7 +228,7 @@ async fn session(State(b): State<Arc<Bff>>, headers: HeaderMap) -> Result<Json<V
     let token = cookie(&headers, SESSION)?.ok_or(Error::SessionUnauthorized)?;
     let s = b.session(&token, None).await?;
     Ok(Json(
-        json!({"tenant_id":s.tenant_id,"user_id":s.user_id,"expires_at":s.expires_at,"currency":"CNY"}),
+        json!({"tenant_id":s.tenant_id,"user_id":s.user_id,"expires_at":s.expires_at,"currency":"CNY","media_preview_origin":b.preview_origin}),
     ))
 }
 async fn logout(State(b): State<Arc<Bff>>, headers: HeaderMap, body: Bytes) -> Result<Response> {
@@ -258,10 +261,23 @@ async fn query(
         format!("/settings/v1/{suffix}")
     } else if let Some(suffix) = uri.path().strip_prefix("/bff/v1/approvals/") {
         format!("/approvals/v1/{suffix}")
+    } else if let Some(suffix) = uri.path().strip_prefix("/bff/v1/media-review/") {
+        format!("/media-review/v1/{suffix}")
     } else {
         uri.path().replacen("/bff/", "/console/", 1)
     };
     let (status, bytes) = b.query(&token, &csrf, &path, &body).await?;
+    if path == "/media-review/v1/chunk" && status == StatusCode::OK {
+        return Ok((
+            status,
+            [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (header::CONTENT_DISPOSITION, "attachment"),
+            ],
+            Body::from(bytes),
+        )
+            .into_response());
+    }
     Ok((
         status,
         [(header::CONTENT_TYPE, "application/json")],

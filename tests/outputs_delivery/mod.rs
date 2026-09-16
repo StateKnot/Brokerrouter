@@ -1,4 +1,5 @@
 use super::*;
+mod media_review;
 mod paused_store;
 use brokerrouter::{
     governance, human,

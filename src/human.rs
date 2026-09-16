@@ -46,6 +46,24 @@ impl Human {
     }
 }
 impl Verifier {
+    pub fn new_media_review(
+        issuer: &str,
+        audience: &str,
+        pem_keys: HashMap<String, String>,
+    ) -> Result<Self> {
+        let mut v = Self::new(issuer, audience, pem_keys)?;
+        v.token_type = "br-media-review+jwt";
+        Ok(v)
+    }
+    pub fn media_review_from_env() -> Result<Self> {
+        let get = |name| std::env::var(name).map_err(|_| Error::Configuration);
+        Self::new_media_review(
+            &get("BROKERROUTER_MEDIA_REVIEW_ISSUER")?,
+            &get("BROKERROUTER_MEDIA_REVIEW_AUDIENCE")?,
+            serde_json::from_str(&get("BROKERROUTER_MEDIA_REVIEW_PUBLIC_KEYS")?)
+                .map_err(|_| Error::Configuration)?,
+        )
+    }
     pub fn new_approvals(
         issuer: &str,
         audience: &str,

@@ -14,22 +14,22 @@ use uuid::Uuid;
 type Tx<'a> = Transaction<'a, Postgres>;
 
 #[derive(sqlx::FromRow)]
-struct Evidence {
+pub(crate) struct Evidence {
     scan_id: Uuid,
     job_id: Uuid,
-    asset_id: Uuid,
+    pub(crate) asset_id: Uuid,
     profile_id: Uuid,
     turn_id: Uuid,
     model_id: String,
-    sha256: Vec<u8>,
-    byte_length: i64,
-    chunk_count: i32,
+    pub(crate) sha256: Vec<u8>,
+    pub(crate) byte_length: i64,
+    pub(crate) chunk_count: i32,
     report_hash: Vec<u8>,
     report: Value,
-    expires_at: DateTime<Utc>,
+    pub(crate) expires_at: DateTime<Utc>,
 }
 impl Evidence {
-    fn view(&self) -> Value {
+    pub(crate) fn view(&self) -> Value {
         json!({"contract":"current-turn-output-v1","job_id":self.job_id,"scan_id":self.scan_id,
             "asset_id":self.asset_id,"profile_id":self.profile_id,"turn_id":self.turn_id,
             "sha256":governance::hex(&self.sha256),"byte_length":self.byte_length,
@@ -247,7 +247,11 @@ async fn released(tx: &mut Tx<'_>, who: &Identity, job: Uuid) -> Result<Evidence
     }
     Ok(e)
 }
-async fn review(tx: &mut Tx<'_>, human: &Human, id: Uuid) -> Result<(Identity, Evidence)> {
+pub(crate) async fn review(
+    tx: &mut Tx<'_>,
+    human: &Human,
+    id: Uuid,
+) -> Result<(Identity, Evidence)> {
     human::authorize(tx, human).await?;
     let (key,job,op,policy):(Uuid,Uuid,Uuid,Value)=sqlx::query_as("SELECT o.key_id,d.job_id,o.id,a.policy_snapshot FROM approvals a JOIN governance_operations o ON o.tenant_id=a.tenant_id AND o.id=a.operation_id JOIN governance_turns t ON t.tenant_id=a.tenant_id AND t.id=a.turn_id JOIN media_output_deliveries d ON d.tenant_id=o.tenant_id AND d.operation_id=o.id WHERE a.tenant_id=$1 AND a.id=$2 AND t.user_id=$3 AND a.state='pending' AND a.expires_at>clock_timestamp() AND o.stage='media_output' AND o.state='waiting_approval'")
         .bind(human.tenant_id).bind(id).bind(human.id).fetch_optional(&mut **tx).await?.ok_or(Error::NotFound)?;

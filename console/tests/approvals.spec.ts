@@ -240,9 +240,9 @@ test("binary media cannot be approved from JSON placeholders", async ({
   await setup(page, media);
   await open(page);
   await expect(
-    page.getByRole("button", { name: "核对本次决定" }),
-  ).toBeDisabled();
-  await expect(page.getByText(/本页不提交媒体决定/)).toBeVisible();
+    page.getByRole("option", { name: "同意本轮跳过所选护栏" }),
+  ).toHaveJSProperty("disabled", true);
+  await expect(page.getByText(/JSON 描述不能代替视频/)).toBeVisible();
   await expect(page.locator(".approval-payload")).toHaveCount(0);
 });
 test("review expiry and permission revocation clear sensitive content", async ({

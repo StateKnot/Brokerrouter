@@ -246,4 +246,30 @@ GRANT UPDATE(state,event_clock) ON governance_turns TO brokerrouter_approvals;
 GRANT UPDATE(state,decision_hash,decided_by,feedback_ciphertext,decided_at) ON approvals TO brokerrouter_approvals;
 GRANT UPDATE(state,payload_ciphertext) ON governance_operations TO brokerrouter_approvals;
 GRANT UPDATE(result_ciphertext) ON requests TO brokerrouter_approvals;
+-- The review reader cannot decide, grant, execute, change policies or write storage.
+DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_media_review') THEN
+    CREATE ROLE brokerrouter_media_review NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+END IF; END $$;
+GRANT USAGE ON SCHEMA public TO brokerrouter_media_review;
+GRANT SELECT ON _sqlx_migrations,governance_users,runtime_bindings,governance_turns,guardrails,guardrail_versions,guardrail_policies,governance_operations,approvals,guardrail_grants,human_assertions,key_models,approval_reviews,media_review_sessions,media_review_chunks,media_review_completions,media_output_deliveries,output_scans,output_scan_profiles,assets,asset_chunks TO brokerrouter_media_review;
+GRANT SELECT(id,active) ON tenants TO brokerrouter_media_review;
+GRANT SELECT(tenant_id,id,revoked_at,expires_at) ON virtual_keys TO brokerrouter_media_review;
+GRANT SELECT(tenant_id,id,active) ON models TO brokerrouter_media_review;
+GRANT SELECT(tenant_id,id,governance_turn_id,model_id) ON requests TO brokerrouter_media_review;
+GRANT SELECT(tenant_id,id,key_id,state,cancel_requested) ON media_jobs TO brokerrouter_media_review,brokerrouter_approvals;
+GRANT SELECT(tenant_id,job_id,asset_id,state) ON media_output_imports TO brokerrouter_media_review,brokerrouter_approvals;
+GRANT UPDATE(governance_lock) ON tenants TO brokerrouter_media_review;
+GRANT UPDATE(event_clock) ON governance_turns TO brokerrouter_media_review;
+GRANT INSERT ON human_assertions,media_review_sessions,media_review_chunks,media_review_completions,approval_reviews,audit_events TO brokerrouter_media_review;
+GRANT DELETE ON human_assertions TO brokerrouter_media_review;
+GRANT UPDATE(expires_at) ON human_assertions TO brokerrouter_media_review;
+GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_media_review;
+DROP POLICY IF EXISTS brokerrouter_review_output_read ON assets;
+CREATE POLICY brokerrouter_review_output_read ON assets FOR SELECT TO brokerrouter_media_review,brokerrouter_approvals USING(kind='output');
+DROP POLICY IF EXISTS brokerrouter_review_chunk_read ON asset_chunks;
+CREATE POLICY brokerrouter_review_chunk_read ON asset_chunks FOR SELECT TO brokerrouter_media_review
+    USING(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id AND a.id=asset_chunks.asset_id AND a.kind='output'));
+-- Decision service sees scan/receipt metadata for fresh revalidation, never asset chunks.
+GRANT SELECT ON media_review_completions,media_review_sessions,media_output_deliveries,output_scans,output_scan_profiles,assets TO brokerrouter_approvals;
+GRANT SELECT(model_id) ON requests TO brokerrouter_approvals;
 COMMIT;

@@ -30,3 +30,4 @@ jobs:
           docker pull nginx:stable-alpine
           export BROKERROUTER_TEST_NGINX_IMAGE="$(docker image inspect nginx:stable-alpine --format '{{index .RepoDigests 0}}')"
           node tests/edge.mjs
+          node tests/preview-edge.mjs

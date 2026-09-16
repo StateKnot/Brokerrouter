@@ -40,6 +40,7 @@ export const totalsSchema = z.object({
 });
 export type Totals = z.infer<typeof totalsSchema>;
 export const sessionSchema = z.object({
+  media_preview_origin: z.string().max(500).nullable().optional(),
   tenant_id: z.uuid(),
   user_id: z.uuid(),
   expires_at: timestamp,

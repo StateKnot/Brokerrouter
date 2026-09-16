@@ -47,7 +47,7 @@ const server = createServer(
     res.setHeader("cache-control", "no-store");
     res.setHeader(
       "content-security-policy",
-      "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+      "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self'; frame-src https://127.0.0.1:4174; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
     );
     res.setHeader("x-content-type-options", "nosniff");
     res.setHeader("referrer-policy", "no-referrer");
@@ -66,8 +66,44 @@ const server = createServer(
   },
 );
 server.listen(4173, "127.0.0.1");
+// Separate host/origin, opaque iframe sandbox, and production-equivalent CSP.
+const preview = createServer(
+  {
+    key: readFileSync(join(directory, "key.pem")),
+    cert: readFileSync(join(directory, "cert.pem")),
+  },
+  (req, res) => {
+    res.setHeader("cache-control", "no-store");
+    res.setHeader("x-content-type-options", "nosniff");
+    res.setHeader("referrer-policy", "no-referrer");
+    res.setHeader(
+      "content-security-policy",
+      "default-src 'none'; script-src 'self'; style-src 'self'; media-src blob:; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors https://localhost:4173; sandbox allow-scripts",
+    );
+    if (
+      !["/review.html", "/review.css", "/review.js"].includes(req.url) ||
+      req.method !== "GET"
+    ) {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+    const file = req.url.slice(1);
+    let data = readFileSync(resolve("../preview", file));
+    if (file === "review.html")
+      data = Buffer.from(
+        data
+          .toString()
+          .replace("https://console.example.invalid", "https://localhost:4173"),
+      );
+    res.setHeader("content-type", types[file.split(".").at(-1)]);
+    res.end(data);
+  },
+);
+preview.listen(4174, "127.0.0.1");
 const cleanup = () => {
   server.close();
+  preview.close();
   rmSync(directory, { recursive: true, force: true });
 };
 process.on("SIGTERM", () => {

@@ -7,6 +7,8 @@ type Path =
   | "approvals/query"
   | "approvals/review"
   | "approvals/decide"
+  | "media-review/start"
+  | "media-review/complete"
   | "usage/query"
   | "usage/groups/query"
   | "requests/query"
@@ -175,4 +177,62 @@ export function needsLogin(error: unknown): boolean {
     error instanceof ApiError &&
     (error.code === "browser_login_required" || error.code === "csrf_rejected")
   );
+}
+
+// Binary review bytes are transferred to the isolated frame, never decoded here.
+export async function mediaChunk(
+  body: { session_id: string; ordinal: number },
+  expected: number,
+  signal: AbortSignal,
+): Promise<ArrayBuffer> {
+  if (!Number.isInteger(expected) || expected < 1 || expected > 4194304)
+    throw new ApiError(502, "invalid_response");
+  const timeout = AbortSignal.timeout(45_000);
+  try {
+    const response = await fetch("/bff/v1/media-review/chunk", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-BR-CSRF": csrf(document.cookie),
+      },
+      credentials: "same-origin",
+      mode: "same-origin",
+      referrerPolicy: "strict-origin",
+      cache: "no-store",
+      redirect: "error",
+      body: JSON.stringify(body),
+      signal: AbortSignal.any([signal, timeout]),
+    });
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new ApiError(response.status, "media_review_unavailable");
+    }
+    if (response.headers.get("content-type") !== "application/octet-stream") {
+      await response.body?.cancel();
+      throw new ApiError(502, "invalid_response");
+    }
+    const reader = response.body?.getReader();
+    if (!reader) throw new ApiError(502, "invalid_response");
+    const bytes = new Uint8Array(expected);
+    let offset = 0;
+    try {
+      while (true) {
+        const part = await reader.read();
+        if (part.done) break;
+        if (offset + part.value.byteLength > expected)
+          throw new ApiError(502, "response_too_large");
+        bytes.set(part.value, offset);
+        offset += part.value.byteLength;
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
+    if (offset !== expected) throw new ApiError(502, "invalid_response");
+    return bytes.buffer;
+  } catch (e) {
+    if (signal.aborted) throw signal.reason;
+    if (e instanceof ApiError) throw e;
+    throw new ApiError(0, "network_or_protocol_error");
+  }
 }
