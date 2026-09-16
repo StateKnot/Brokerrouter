@@ -245,6 +245,84 @@ fn query_body() -> Vec<u8> {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn monitoring_routes_require_csrf_and_independent_read_permission(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let (token, csrf) = logged_in(&f).await;
+    let (base, task) = serve(router(f.bff.clone())).await;
+    let _abort = Task(task);
+    let client = http_client().unwrap();
+    let cookie = format!("__Host-br-session={token}; __Host-br-csrf={csrf}");
+    for suffix in ["query", "rails/query"] {
+        let mut body: Value = serde_json::from_slice(&query_body()).unwrap();
+        if suffix == "rails/query" {
+            body["limit"] = json!(20);
+        }
+        let url = format!("{base}/bff/v1/governance/monitor/{suffix}");
+        let r = client
+            .post(&url)
+            .header("origin", &f.bff.config.origin)
+            .header("cookie", &cookie)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
+        let r = client
+            .post(&url)
+            .header("origin", &f.bff.config.origin)
+            .header("cookie", &cookie)
+            .header("x-br-csrf", &csrf)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
+        crate::console::set_permission(
+            &pool,
+            f.tenant,
+            f.user,
+            crate::console::Permission::MonitoringRead,
+            true,
+            "monitor test",
+        )
+        .await
+        .unwrap();
+        let r = client
+            .post(&url)
+            .header("origin", &f.bff.config.origin)
+            .header("cookie", &cookie)
+            .header("x-br-csrf", &csrf)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.headers()["cache-control"], "no-store");
+        crate::console::set_permission(
+            &pool,
+            f.tenant,
+            f.user,
+            crate::console::Permission::MonitoringRead,
+            false,
+            "monitor revoke",
+        )
+        .await
+        .unwrap();
+    }
+    assert!(matches!(
+        f.bff
+            .query(
+                &token,
+                &csrf,
+                "/console/v1/governance/monitor/approve",
+                b"{}"
+            )
+            .await,
+        Err(Error::NotFound)
+    ));
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn browser_callback_errors_have_fixed_safe_landing_and_boundary_headers(pool: PgPool) {
     let f = fixture(&pool).await;
     let (base, task) = serve(router(f.bff.clone())).await;

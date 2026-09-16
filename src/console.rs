@@ -24,6 +24,7 @@ pub enum Permission {
     FxWrite,
     GovernanceRead,
     GovernanceWrite,
+    MonitoringRead,
 }
 impl Permission {
     pub(crate) fn name(self) -> &'static str {
@@ -38,6 +39,7 @@ impl Permission {
             Self::FxWrite => "fx_write",
             Self::GovernanceRead => "governance_read",
             Self::GovernanceWrite => "governance_write",
+            Self::MonitoringRead => "monitoring_read",
         }
     }
 }
@@ -85,7 +87,7 @@ pub(crate) async fn authorize(pool: &PgPool, who: &Human, permission: Permission
         Err(Error::ConsoleForbidden)
     }
 }
-async fn begin(
+pub(crate) async fn begin(
     pool: &PgPool,
     who: &Human,
     permission: Permission,
@@ -103,7 +105,7 @@ async fn begin(
         .await?;
     Ok(tx)
 }
-async fn finish(
+pub(crate) async fn finish(
     tx: Transaction<'_, Postgres>,
     pool: &PgPool,
     who: &Human,
@@ -190,7 +192,7 @@ pub enum Timezone {
     UTC,
 }
 impl Timezone {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Shanghai => "Asia/Shanghai",
             Self::UTC => "UTC",

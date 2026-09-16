@@ -1,4 +1,6 @@
 mod common;
+#[path = "console_monitoring/mod.rs"]
+mod monitoring;
 use axum::{
     Router,
     body::Body,

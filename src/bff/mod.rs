@@ -344,6 +344,8 @@ impl Bff {
                 | "/console/v1/usage/groups/query"
                 | "/console/v1/requests/query"
                 | "/console/v1/audit/query"
+                | "/console/v1/governance/monitor/query"
+                | "/console/v1/governance/monitor/rails/query"
         ) {
             (
                 &self.config.console_origin,

@@ -8,6 +8,8 @@ type Path =
   | "usage/groups/query"
   | "requests/query"
   | "audit/query"
+  | "governance/monitor/query"
+  | "governance/monitor/rails/query"
   | "catalog/models/query"
   | "catalog/endpoints/query"
   | "catalog/apply"

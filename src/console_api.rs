@@ -30,6 +30,11 @@ pub fn router(service: Console) -> Router {
         .route("/console/v1/usage/groups/query", post(groups))
         .route("/console/v1/requests/query", post(requests))
         .route("/console/v1/audit/query", post(audit))
+        .route("/console/v1/governance/monitor/query", post(monitor))
+        .route(
+            "/console/v1/governance/monitor/rails/query",
+            post(monitor_rails),
+        )
         .fallback(|| async { Error::NotFound })
         .with_state(service)
         .layer(axum::extract::DefaultBodyLimit::max(16384))
@@ -116,6 +121,28 @@ async fn audit(
 ) -> Result<Json<Value>> {
     let who = auth(&c, &headers, &uri.to_string(), &body).await?;
     Ok(Json(console::audit(&c.pool, &who, decode(&body)?).await?))
+}
+async fn monitor(
+    State(c): State<Console>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>> {
+    let who = auth(&c, &headers, &uri.to_string(), &body).await?;
+    Ok(Json(
+        crate::monitoring::summary(&c.pool, &who, decode(&body)?).await?,
+    ))
+}
+async fn monitor_rails(
+    State(c): State<Console>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>> {
+    let who = auth(&c, &headers, &uri.to_string(), &body).await?;
+    Ok(Json(
+        crate::monitoring::rails(&c.pool, &who, decode(&body)?).await?,
+    ))
 }
 
 #[cfg(test)]

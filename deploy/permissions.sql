@@ -224,4 +224,7 @@ GRANT UPDATE(guardrail_id,model_id,key_id,runtime_id,tool_name,active) ON guardr
 GRANT SELECT(tenant_id,key_id,user_id,runtime_id,active) ON runtime_bindings TO brokerrouter_settings;
 GRANT SELECT(tenant_id,id,model_id,version,active) ON output_scan_profiles TO brokerrouter_settings;
 GRANT SELECT(tenant_id,model_id,active,operation) ON endpoints TO brokerrouter_settings;
+GRANT SELECT,INSERT ON guardrail_observations TO brokerrouter_runtime,brokerrouter_output_delivery;
+GRANT UPDATE(approval_skipped_at) ON guardrail_observations TO brokerrouter_runtime,brokerrouter_output_delivery;
+GRANT SELECT ON monitoring_coverage,console_guardrail_facts,console_approval_facts,console_active_guardrails TO brokerrouter_console;
 COMMIT;

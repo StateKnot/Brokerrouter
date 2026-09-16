@@ -48,9 +48,17 @@ const Fx = lazy(() =>
   import("./Settings").then((module) => ({ default: module.Fx })),
 );
 const GovernanceSettings = lazy(() => import("./GovernanceSettings"));
+const Monitoring = lazy(() => import("./Monitoring"));
 
 type Page =
-  "usage" | "requests" | "audit" | "catalog" | "keys" | "fx" | "governance";
+  | "usage"
+  | "requests"
+  | "audit"
+  | "catalog"
+  | "keys"
+  | "fx"
+  | "governance"
+  | "monitoring";
 const titles: Record<Page, string> = {
   usage: "人民币用量",
   requests: "请求日志",
@@ -59,6 +67,7 @@ const titles: Record<Page, string> = {
   keys: "虚拟 Key",
   fx: "人民币汇率",
   governance: "护栏与策略",
+  monitoring: "护栏监控",
 };
 type Auth =
   | { state: "checking" }
@@ -72,7 +81,8 @@ const pageFromHash = (): Page => {
     page === "catalog" ||
     page === "keys" ||
     page === "fx" ||
-    page === "governance"
+    page === "governance" ||
+    page === "monitoring"
     ? page
     : "usage";
 };
@@ -424,6 +434,12 @@ function Workspace({
           <a href="#keys" aria-current={page === "keys" ? "page" : undefined}>
             虚拟 Key
           </a>
+          <a
+            href="#monitoring"
+            aria-current={page === "monitoring" ? "page" : undefined}
+          >
+            护栏监控
+          </a>
           <a href="#fx" aria-current={page === "fx" ? "page" : undefined}>
             人民币汇率
           </a>
@@ -466,9 +482,11 @@ function Workspace({
                       ? "管理模型调用凭据、人民币预算、有效期和明确授权。"
                       : page === "fx"
                         ? "版本化管理美元与人民币转换，不改写历史结算。"
-                        : page === "governance"
-                          ? "版本化管理输入、输出与智能体节点护栏；配置不等于审批或执行授权。"
-                          : "查看已准入请求的状态与账本记录，不含请求原文。"}
+                        : page === "monitoring"
+                          ? "区分护栏风险、检测失败、人工决定与执行状态，核对真实人民币账本。"
+                          : page === "governance"
+                            ? "版本化管理输入、输出与智能体节点护栏；配置不等于审批或执行授权。"
+                            : "查看已准入请求的状态与账本记录，不含请求原文。"}
             </p>
           </header>
           {logoutError !== null && (
@@ -520,6 +538,8 @@ function Workspace({
                   <Keys denied={reportDenied} />
                 ) : page === "fx" ? (
                   <Fx denied={reportDenied} />
+                ) : page === "monitoring" ? (
+                  <Monitoring denied={reportDenied} />
                 ) : page === "governance" ? (
                   <GovernanceSettings denied={reportDenied} />
                 ) : (
