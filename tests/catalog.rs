@@ -380,9 +380,11 @@ async fn catalog_revocation_while_waiting_and_expiry_roll_back_before_commit(poo
     tx.commit().await.unwrap();
     assert_eq!(pending.await.unwrap().0, StatusCode::FORBIDDEN);
     grant(&pool, &f, Permission::CatalogWrite, true).await;
-    sqlx::raw_sql("CREATE FUNCTION slow_catalog_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action LIKE 'catalog.%' THEN PERFORM pg_sleep(2); END IF; RETURN NEW; END $$; CREATE TRIGGER slow_catalog_audit BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION slow_catalog_audit();").execute(&pool).await.unwrap();
+    // Leave admission time under parallel CI load, then expire inside the audit transaction.
+    // A one-second JWT can already expire in begin(), legitimately returning 403 instead of 401.
+    sqlx::raw_sql("CREATE FUNCTION slow_catalog_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action LIKE 'catalog.%' THEN PERFORM pg_sleep(4); END IF; RETURN NEW; END $$; CREATE TRIGGER slow_catalog_audit BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION slow_catalog_audit();").execute(&pool).await.unwrap();
     let mut claim = claims(f.tenant, "alice", APPLY, &m);
-    claim.exp = chrono::Utc::now().timestamp() + 1;
+    claim.exp = chrono::Utc::now().timestamp() + 3;
     assert_eq!(
         send(&app(&pool, &f), APPLY, &m, catalog_sign(claim))
             .await

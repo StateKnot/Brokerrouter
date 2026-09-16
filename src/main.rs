@@ -53,6 +53,10 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8089")]
         bind: SocketAddr,
     },
+    ServeApprovals {
+        #[arg(long, default_value = "127.0.0.1:8090")]
+        bind: SocketAddr,
+    },
     ConsolePermissionSet {
         #[arg(long)]
         tenant: Uuid,
@@ -473,6 +477,33 @@ async fn main() -> anyhow::Result<()> {
             let listener = tokio::net::TcpListener::bind(bind).await?;
             tracing::info!(address=%bind,"isolated scanner evidence API listening; never expose credentials to Agents");
             axum::serve(listener, brokerrouter::output_scan_api::router(scans))
+                .with_graceful_shutdown(shutdown())
+                .await?;
+            maintenance.abort();
+        }
+        Command::ServeApprovals { bind } => {
+            brokerrouter::check_schema(&pool).await?;
+            let service = brokerrouter::governance_api::Control {
+                pool: pool.clone(),
+                verifier: std::sync::Arc::new(brokerrouter::human::Verifier::approvals_from_env()?),
+                cipher: std::sync::Arc::new(brokerrouter::cipher::ResultCipher::from_env()?),
+            };
+            let listener = tokio::net::TcpListener::bind(bind).await?;
+            tracing::info!(address=%bind,"human approval workbench listening; isolate from Agent execution");
+            let maintenance_pool = pool.clone();
+            let maintenance = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    if brokerrouter::human::maintain(&maintenance_pool)
+                        .await
+                        .is_err()
+                    {
+                        tracing::error!("approval maintenance failed");
+                    }
+                }
+            });
+            axum::serve(listener, brokerrouter::approvals_api::router(service))
                 .with_graceful_shutdown(shutdown())
                 .await?;
             maintenance.abort();

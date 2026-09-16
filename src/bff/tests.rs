@@ -190,6 +190,7 @@ async fn fixture(pool: &PgPool) -> Fixture {
     let bff = Arc::new(Bff {
         catalog: None,
         settings: None,
+        approvals: None,
         pool: pool.clone(),
         config: Config {
             origin,
@@ -242,6 +243,184 @@ fn query_body() -> Vec<u8> {
         &json!({"filter":{"start":"2026-09-01T00:00:00Z","end":"2026-09-02T00:00:00Z"}}),
     )
     .unwrap()
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn approval_bff_fixed_paths_bind_real_oidc_owner_review_and_decision(pool: PgPool) {
+    let mut f = fixture(&pool).await;
+    let (token, csrf) = logged_in(&f).await;
+    assert!(
+        f.bff
+            .query(
+                &token,
+                &csrf,
+                "/approvals/v1/query",
+                br#"{"limit":20,"pending_only":true}"#
+            )
+            .await
+            .is_err()
+    );
+    let verifier = human::Verifier::new_approvals(
+        &f.bff.config.origin,
+        "approvals-test",
+        HashMap::from([("fixture".into(), keys().1.clone())]),
+    )
+    .unwrap();
+    let cipher = ResultCipher::new(
+        "fixture".into(),
+        HashMap::from([("fixture".into(), "12".repeat(32))]),
+    )
+    .unwrap();
+    let (origin, task) = serve(crate::approvals_api::router(
+        crate::governance_api::Control {
+            pool: pool.clone(),
+            verifier: Arc::new(verifier),
+            cipher: Arc::new(cipher),
+        },
+    ))
+    .await;
+    let _service = Task(task);
+    Arc::get_mut(&mut f.bff).unwrap().approvals = Some(CatalogTarget {
+        origin,
+        audience: "approvals-test".into(),
+        kid: "fixture".into(),
+        signer: keys().0.clone(),
+    });
+    store::put_model(&pool, f.tenant, "model", "model")
+        .await
+        .unwrap();
+    let (key_id, _) = store::create_key(&pool, f.tenant, "agent", 1000, &["model".into()], None)
+        .await
+        .unwrap();
+    human::bind_runtime(&pool, f.tenant, key_id, f.user, "hermes-test", "agent-test")
+        .await
+        .unwrap();
+    let turn = Uuid::new_v4();
+    sqlx::query("INSERT INTO governance_turns(tenant_id,id,key_id,user_id,session_id,message_id,run_id,generation,expires_at) VALUES($1,$2,$3,$4,'session','message','run',0,clock_timestamp()+interval '15 minutes')").bind(f.tenant).bind(turn).bind(key_id).bind(f.user).execute(&pool).await.unwrap();
+    human::publish_guardrail(
+        &pool,
+        f.tenant,
+        governance::Guardrail {
+            id: "review".into(),
+            version: 1,
+            name: "Review".into(),
+            stage: "tool_input".into(),
+            rule: json!({"kind":"always"}),
+        },
+    )
+    .await
+    .unwrap();
+    human::put_policy(
+        &pool,
+        f.tenant,
+        human::Policy {
+            id: Uuid::new_v4(),
+            guardrail_id: "review".into(),
+            model_id: None,
+            key_id: None,
+            runtime_id: None,
+            tool_name: None,
+            active: true,
+        },
+    )
+    .await
+    .unwrap();
+    let a = governance::check(
+        &pool,
+        &f.bff.cipher,
+        &store::Identity {
+            tenant_id: f.tenant,
+            key_id,
+        },
+        governance::Check {
+            turn_id: turn,
+            operation_key: "test-op".into(),
+            stage: "tool_input".into(),
+            model_id: None,
+            tool_name: Some("send".into()),
+            payload: json!({"text":"review-only-private"}),
+        },
+    )
+    .await
+    .unwrap();
+    let id = a["approval"]["id"].clone();
+    let (base, task) = serve(router(f.bff.clone())).await;
+    let _bff = Task(task);
+    let client = http_client().unwrap();
+    let cookie = format!("__Host-br-session={token}; __Host-br-csrf={csrf}");
+    let mut receipt = Value::Null;
+    for (suffix, body) in [
+        ("query", json!({"limit":20,"pending_only":true})),
+        ("review", json!({"approval_id":id})),
+    ] {
+        let url = format!("{base}/bff/v1/approvals/{suffix}");
+        let denied = client
+            .post(&url)
+            .header("origin", &f.bff.config.origin)
+            .header("cookie", &cookie)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), 403);
+        let response = client
+            .post(&url)
+            .header("origin", &f.bff.config.origin)
+            .header("cookie", &cookie)
+            .header("x-br-csrf", &csrf)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        receipt = response.json().await.unwrap();
+        if suffix == "query" {
+            assert!(!receipt.to_string().contains("review-only-private"));
+        }
+    }
+    assert!(
+        receipt["payload_text"]
+            .as_str()
+            .unwrap()
+            .contains("review-only-private")
+    );
+    let body = json!({"approval_id":id,"review_id":receipt["review_id"],"acknowledged_scope":true,"decision":{"decision":"continue_this_turn","approved_guardrail_ids":["review"],"feedback":null}});
+    for _ in 0..2 {
+        let (status, bytes) = f
+            .bff
+            .query(
+                &token,
+                &csrf,
+                "/approvals/v1/decide",
+                &serde_json::to_vec(&body).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["state"], "approved");
+    }
+    for path in [
+        "/v1/governance/turns",
+        "/v1/governance/operations/x/claim",
+        "/approvals/v1/resolve",
+        "/approvals/v1/reconcile",
+    ] {
+        assert!(f.bff.query(&token, &csrf, path, b"{}").await.is_err());
+    }
+    f.bff.logout(&token, &csrf).await.unwrap();
+    assert!(
+        f.bff
+            .query(
+                &token,
+                &csrf,
+                "/approvals/v1/review",
+                &serde_json::to_vec(&json!({"approval_id":id})).unwrap()
+            )
+            .await
+            .is_err()
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]

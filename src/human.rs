@@ -46,6 +46,24 @@ impl Human {
     }
 }
 impl Verifier {
+    pub fn new_approvals(
+        issuer: &str,
+        audience: &str,
+        pem_keys: HashMap<String, String>,
+    ) -> Result<Self> {
+        let mut v = Self::new(issuer, audience, pem_keys)?;
+        v.token_type = "br-approvals+jwt";
+        Ok(v)
+    }
+    pub fn approvals_from_env() -> Result<Self> {
+        let get = |name| std::env::var(name).map_err(|_| Error::Configuration);
+        Self::new_approvals(
+            &get("BROKERROUTER_APPROVALS_ISSUER")?,
+            &get("BROKERROUTER_APPROVALS_AUDIENCE")?,
+            serde_json::from_str(&get("BROKERROUTER_APPROVALS_PUBLIC_KEYS")?)
+                .map_err(|_| Error::Configuration)?,
+        )
+    }
     pub fn new_settings(
         issuer: &str,
         audience: &str,
@@ -359,7 +377,27 @@ pub async fn resolve(
     cipher: &ResultCipher,
     human: &Human,
     id: Uuid,
+    decision: Decision,
+) -> Result<Value> {
+    resolve_inner(pool, cipher, human, id, decision, None).await
+}
+pub(crate) async fn resolve_reviewed(
+    pool: &PgPool,
+    cipher: &ResultCipher,
+    human: &Human,
+    id: Uuid,
+    decision: Decision,
+    review_id: Uuid,
+) -> Result<Value> {
+    resolve_inner(pool, cipher, human, id, decision, Some(review_id)).await
+}
+async fn resolve_inner(
+    pool: &PgPool,
+    cipher: &ResultCipher,
+    human: &Human,
+    id: Uuid,
     mut decision: Decision,
+    review_id: Option<Uuid>,
 ) -> Result<Value> {
     if !matches!(
         decision.decision.as_str(),
@@ -412,6 +450,10 @@ pub async fn resolve(
         let view = governance::approval_view(&a);
         tx.commit().await?;
         return Ok(view);
+    }
+    if let Some(review_id) = review_id {
+        crate::approval_workbench::validate_review(&mut tx, human, review_id, &a, &op, &decision)
+            .await?;
     }
     if turn.state != "active"
         || turn.expires_at <= chrono::Utc::now()
@@ -497,7 +539,12 @@ pub async fn resolve(
             .await?;
         }
     }
-    governance::event(&mut tx,&turn,"approval.decided",json!({"approval_id":id,"operation_id":op.id,"state":state,"user_id":human.id,"approved_guardrail_ids":decision.approved_guardrail_ids})).await?;
+    governance::event(&mut tx,&turn,"approval.decided",json!({"approval_id":id,"operation_id":op.id,"state":state,"user_id":human.id,"approved_guardrail_ids":decision.approved_guardrail_ids,"review_id":review_id})).await?;
+    if let Some(review_id) = review_id {
+        sqlx::query("INSERT INTO audit_events(tenant_id,action,object_id,details) VALUES($1,'approval.decided',$2,$3)")
+            .bind(human.tenant_id).bind(id.to_string()).bind(json!({"user_id":human.id,"review_id":review_id,"operation_id":op.id,"state":state,"approved_guardrail_ids":decision.approved_guardrail_ids})).execute(&mut *tx).await?;
+    }
+    crate::approval_workbench::fresh(&mut tx, human).await?;
     tx.commit().await?;
     let mut result = governance::approval_view(&a);
     result["state"] = state.into();

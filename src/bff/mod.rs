@@ -1,4 +1,4 @@
-//! Browser-facing, purpose-limited OIDC BFF. It holds no model or approval credentials.
+//! Browser-facing OIDC BFF with independent, fixed-path purpose credentials; no model keys.
 mod api;
 mod oidc;
 pub use api::router;
@@ -43,6 +43,7 @@ pub struct Bff {
     signer: EncodingKey,
     catalog: Option<CatalogTarget>,
     settings: Option<CatalogTarget>,
+    approvals: Option<CatalogTarget>,
     http: reqwest::Client,
 }
 impl Bff {
@@ -151,6 +152,39 @@ impl Bff {
                 signer: signing_key(&settings_pem)?,
             })
         };
+        let approval_names = [
+            "BROKERROUTER_BFF_APPROVALS_ORIGIN",
+            "BROKERROUTER_APPROVALS_AUDIENCE",
+            "BROKERROUTER_BFF_APPROVALS_SIGNING_KID",
+            "BROKERROUTER_BFF_APPROVALS_SIGNING_PRIVATE_KEY",
+        ];
+        let approvals = if approval_names.iter().all(|n| std::env::var_os(n).is_none()) {
+            None
+        } else {
+            let origin = get(approval_names[0])?;
+            https_origin(&origin)?;
+            let audience = get(approval_names[1])?;
+            let kid = get(approval_names[2])?;
+            let approval_pem = get(approval_names[3])?;
+            let modulus = private_key(&approval_pem)?.n().clone();
+            if !governance::valid_text(&audience, 200)
+                || !governance::valid_text(&kid, 100)
+                || audience == config.audience
+                || modulus == *private_key(&pem)?.n()
+                || catalog.as_ref().is_some_and(|c| c.audience == audience)
+                || settings.as_ref().is_some_and(|c| c.audience == audience)
+                || (catalog.is_some() && modulus == *private_key(&get(catalog_names[3])?)?.n())
+                || (settings.is_some() && modulus == *private_key(&get(settings_names[3])?)?.n())
+            {
+                return Err(Error::Configuration);
+            }
+            Some(CatalogTarget {
+                origin,
+                audience,
+                kid,
+                signer: signing_key(&approval_pem)?,
+            })
+        };
         let cipher = ResultCipher::new(
             get("BROKERROUTER_BFF_ACTIVE_KEY")?,
             serde_json::from_str(&get("BROKERROUTER_BFF_KEYS")?)
@@ -159,7 +193,7 @@ impl Bff {
         let config_hash = governance::digest(
             &json!({"origin":config.origin,"issuer":config.oidc_issuer,
             "origins":config.oidc_origins,"client":config.client_id,"console":config.console_origin,
-            "audience":config.audience,"kid":config.kid,"catalog":catalog.as_ref().map(|c|json!({"origin":c.origin,"audience":c.audience,"kid":c.kid})),"settings":settings.as_ref().map(|c|json!({"origin":c.origin,"audience":c.audience,"kid":c.kid}))}),
+            "audience":config.audience,"kid":config.kid,"catalog":catalog.as_ref().map(|c|json!({"origin":c.origin,"audience":c.audience,"kid":c.kid})),"settings":settings.as_ref().map(|c|json!({"origin":c.origin,"audience":c.audience,"kid":c.kid})),"approvals":approvals.as_ref().map(|c|json!({"origin":c.origin,"audience":c.audience,"kid":c.kid}))}),
         )?;
         Ok(Arc::new(Self {
             pool,
@@ -169,6 +203,7 @@ impl Bff {
             signer,
             catalog,
             settings,
+            approvals,
             http: http_client()?,
         }))
     }
@@ -325,6 +360,18 @@ impl Bff {
             (&c.origin, &c.audience, &c.kid, &c.signer, "br-catalog+jwt")
         } else if matches!(
             path,
+            "/approvals/v1/query" | "/approvals/v1/review" | "/approvals/v1/decide"
+        ) {
+            let c = self.approvals.as_ref().ok_or(Error::Configuration)?;
+            (
+                &c.origin,
+                &c.audience,
+                &c.kid,
+                &c.signer,
+                "br-approvals+jwt",
+            )
+        } else if matches!(
+            path,
             "/settings/v1/keys/query"
                 | "/settings/v1/keys/detail"
                 | "/settings/v1/models/query"
@@ -391,7 +438,7 @@ impl Bff {
         let status = response.status();
         if !matches!(
             status.as_u16(),
-            200 | 400 | 401 | 403 | 404 | 409 | 413 | 422 | 429 | 503
+            200 | 400 | 401 | 403 | 404 | 409 | 410 | 413 | 422 | 429 | 503
         ) {
             return Err(Error::BffUpstream);
         }

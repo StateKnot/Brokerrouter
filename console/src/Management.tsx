@@ -25,6 +25,7 @@ export const PendingConfig = createContext<{
   setOwner: (id: string | null) => void;
 }>({ owner: null, setOwner: () => {} });
 type QueryPath =
+  | "approvals/query"
   | "audit/query"
   | "governance/monitor/query"
   | "governance/monitor/rails/query"
