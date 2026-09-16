@@ -219,10 +219,14 @@ pub(crate) async fn validate_review(
     op: &Operation,
     decision: &human::Decision,
 ) -> Result<()> {
-    if op.stage == "media_output" {
-        return Err(Error::Invalid(
-            "binary media decisions require the dedicated review channel",
-        ));
+    if op.stage == "media_output" && decision.decision == "continue_this_turn" {
+        let completed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM media_review_completions c JOIN media_review_sessions s ON s.tenant_id=c.tenant_id AND s.id=c.review_id WHERE c.tenant_id=$1 AND c.review_id=$2 AND s.approval_id=$3 AND s.user_id=$4 AND s.payload_hash=$5 AND s.policy_hash=$6)")
+            .bind(who.tenant_id).bind(id).bind(a.id).bind(who.id).bind(&op.payload_hash).bind(governance::digest(&a.policy_snapshot)?).fetch_one(&mut **tx).await?;
+        if !completed {
+            return Err(Error::Invalid(
+                "binary media decisions require a completed isolated review",
+            ));
+        }
     }
     type StoredReview = (Vec<u8>, Vec<u8>, bool, DateTime<Utc>);
     let row:Option<StoredReview>=sqlx::query_as("SELECT payload_hash,policy_hash,can_continue,expires_at FROM approval_reviews WHERE tenant_id=$1 AND id=$2 AND approval_id=$3 AND user_id=$4")
@@ -238,7 +242,7 @@ pub(crate) async fn validate_review(
         return Err(Error::PolicyChanged);
     }
     if decision.decision == "continue_this_turn"
-        && (!can_continue || op.payload_ciphertext.is_none())
+        && (!can_continue || (op.stage != "media_output" && op.payload_ciphertext.is_none()))
     {
         return Err(Error::ResultUnavailable);
     }

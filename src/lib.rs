@@ -22,6 +22,8 @@ mod judge;
 pub mod media;
 pub mod media_api;
 pub mod media_protocol;
+pub mod media_review;
+pub mod media_review_api;
 pub mod money;
 pub mod monitoring;
 pub mod output_delivery;

@@ -1,0 +1,35 @@
+:root {
+  font-family: system-ui, sans-serif;
+  color: #171d2b;
+  background: #f3f6fb;
+  font-size: 16px;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+}
+main {
+  padding: 16px;
+  max-width: 960px;
+  margin: auto;
+}
+h1 {
+  font-size: 1.25rem;
+}
+p {
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+video {
+  display: block;
+  width: 100%;
+  max-height: 360px;
+  background: #111;
+  min-height: 140px;
+}
+video:focus-visible {
+  outline: 3px solid #194cd8;
+  outline-offset: 3px;
+}

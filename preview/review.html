@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="br-parent-origin" content="https://console.example.invalid" />
+    <title>隔离视频审阅</title>
+    <link rel="stylesheet" href="/review.css" />
+    <script src="/review.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <h1>隔离视频审阅</h1>
+      <p id="status" role="status">等待受信控制台交付内容。本页无审批权限。</p>
+      <video
+        id="video"
+        controls
+        playsinline
+        preload="none"
+        controlslist="nodownload noremoteplayback"
+        disablepictureinpicture
+        disableremoteplayback
+        aria-label="待审批的视频"
+      ></video>
+      <p>
+        请检查完整画面与声音。播放器可用键盘操作；无法完整审阅时，不要确认放行。
+      </p>
+    </main>
+  </body>
+</html>

@@ -93,11 +93,21 @@ export const reviewSchema = z
       "content_unavailable",
       "content_too_large",
     ]),
+    media: z
+      .object({
+        kind: z.literal("isolated_mp4"),
+        sha256: z.string().regex(/^[a-f0-9]{64}$/),
+        byte_length: z.number().int().min(1).max(67108864),
+      })
+      .optional(),
   })
   .refine(
     (v) =>
       !v.can_continue ||
-      (v.payload_text !== null && v.unavailable_reason === ""),
+      (v.unavailable_reason === "" &&
+        (v.stage === "media_output"
+          ? v.payload_text === null && v.media !== undefined
+          : v.payload_text !== null && v.media === undefined)),
   );
 export type Review = z.infer<typeof reviewSchema>;
 export type Decision = {

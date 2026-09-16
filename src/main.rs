@@ -57,6 +57,10 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8090")]
         bind: SocketAddr,
     },
+    ServeMediaReview {
+        #[arg(long, default_value = "127.0.0.1:8091")]
+        bind: SocketAddr,
+    },
     ConsolePermissionSet {
         #[arg(long)]
         tenant: Uuid,
@@ -477,6 +481,36 @@ async fn main() -> anyhow::Result<()> {
             let listener = tokio::net::TcpListener::bind(bind).await?;
             tracing::info!(address=%bind,"isolated scanner evidence API listening; never expose credentials to Agents");
             axum::serve(listener, brokerrouter::output_scan_api::router(scans))
+                .with_graceful_shutdown(shutdown())
+                .await?;
+            maintenance.abort();
+        }
+        Command::ServeMediaReview { bind } => {
+            brokerrouter::check_schema(&pool).await?;
+            let service = brokerrouter::media_review_api::Service {
+                delivery: brokerrouter::output_delivery::Delivery::new(
+                    brokerrouter::assets::Assets::from_env(pool.clone())?,
+                ),
+                verifier: std::sync::Arc::new(
+                    brokerrouter::human::Verifier::media_review_from_env()?,
+                ),
+            };
+            let listener = tokio::net::TcpListener::bind(bind).await?;
+            tracing::info!(address=%bind,"isolated media review listening; no approval or execution authority");
+            let maintenance_pool = pool.clone();
+            let maintenance = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    if brokerrouter::media_review::maintain(&maintenance_pool)
+                        .await
+                        .is_err()
+                    {
+                        tracing::error!("media review maintenance failed");
+                    }
+                }
+            });
+            axum::serve(listener, brokerrouter::media_review_api::router(service))
                 .with_graceful_shutdown(shutdown())
                 .await?;
             maintenance.abort();

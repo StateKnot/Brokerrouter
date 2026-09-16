@@ -553,7 +553,10 @@ function Workspace({
                 ) : page === "monitoring" ? (
                   <Monitoring denied={reportDenied} />
                 ) : page === "approvals" ? (
-                  <Approvals denied={reportDenied} />
+                  <Approvals
+                    denied={reportDenied}
+                    previewOrigin={session.media_preview_origin ?? null}
+                  />
                 ) : page === "governance" ? (
                   <GovernanceSettings denied={reportDenied} />
                 ) : (

@@ -11,8 +11,15 @@ import {
 } from "./approval-contracts";
 import type { Decision, Review } from "./approval-contracts";
 import { time } from "./format";
+import MediaReview from "./MediaReview";
 
-export default function Approvals({ denied }: { denied: Denied }) {
+export default function Approvals({
+  denied,
+  previewOrigin,
+}: {
+  denied: Denied;
+  previewOrigin: string | null;
+}) {
   const [query, setQuery] = useState<Record<string, unknown>>({
     limit: 20,
     pending_only: true,
@@ -313,7 +320,17 @@ export default function Approvals({ denied }: { denied: Denied }) {
             审阅有效至 {time(review.review_expires_at, "Asia/Shanghai")}；原文
             与上下文 SHA-256 <code>{review.operation_sha256}</code>
           </p>
-          {review.payload_text !== null ? (
+          {review.stage === "media_output" ? (
+            <MediaReview
+              key={review.approval.id}
+              approvalId={review.approval.id}
+              previewOrigin={previewOrigin}
+              disabled={frozen !== null || busy}
+              completed={review.media !== undefined}
+              onComplete={setReview}
+              denied={denied}
+            />
+          ) : review.payload_text !== null ? (
             <>
               <h3>完整操作 JSON 原文（不执行、不自动打开链接）</h3>
               <pre className="approval-payload" tabIndex={0}>
@@ -331,11 +348,7 @@ export default function Approvals({ denied }: { denied: Denied }) {
             </p>
           )}
           <form key={review.review_id} onSubmit={prepare}>
-            <fieldset
-              disabled={
-                frozen !== null || busy || review.stage === "media_output"
-              }
-            >
+            <fieldset disabled={frozen !== null || busy}>
               <legend>本人明确决定</legend>
               <fieldset>
                 <legend>需要处理的护栏（默认不选择）</legend>
@@ -385,9 +398,10 @@ export default function Approvals({ denied }: { denied: Denied }) {
               <button>核对本次决定</button>
             </fieldset>
           </form>
-          {review.stage === "media_output" && (
+          {review.stage === "media_output" && !review.media && (
             <p className="notice">
-              媒体资产审批须使用专用隔离审阅通道，本页不提交媒体决定。
+              放行前必须完整加载并确认隔离审阅；JSON
+              描述不能代替视频。可不观看内容而明确拒绝或反馈，不发放豁免。
             </p>
           )}
           {!frozen && (

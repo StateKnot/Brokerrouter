@@ -43,6 +43,21 @@ pub fn approvals_verifier() -> human::Verifier {
     )
     .unwrap()
 }
+pub fn media_review_verifier() -> human::Verifier {
+    human::Verifier::new_media_review(
+        ISSUER,
+        "brokerrouter-media-review-test",
+        HashMap::from([("fixture".into(), keys().1.clone())]),
+    )
+    .unwrap()
+}
+pub fn media_review_sign(mut claims: Claims) -> String {
+    claims.aud = "brokerrouter-media-review-test".into();
+    let mut h = Header::new(Algorithm::RS256);
+    h.kid = Some("fixture".into());
+    h.typ = Some("br-media-review+jwt".into());
+    jsonwebtoken::encode(&h, &claims, &keys().0).unwrap()
+}
 pub fn approvals_sign(mut claims: Claims) -> String {
     claims.aud = "brokerrouter-approvals-test".into();
     let mut h = Header::new(Algorithm::RS256);
