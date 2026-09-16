@@ -6,7 +6,7 @@
 
 新增 `brokerrouter serve-settings --bind 127.0.0.1:8089`。仅部署在受控内网，由可信 HTTPS edge/BFF 访问。使用只属于 `brokerrouter_settings` 的独立数据库登录，验证数据库 TLS；不得附带 runtime、operator、catalog、console、governance_control 或 BFF 组。
 
-服务配置：`DATABASE_URL`、`BROKERROUTER_SETTINGS_ISSUER`（BFF 公开 HTTPS origin）、`BROKERROUTER_SETTINGS_AUDIENCE`、`BROKERROUTER_SETTINGS_PUBLIC_KEYS`（kid 到 RSA 公钥 PEM 的 JSON）。没有供应商、存储或审批凭据。仅可修改 Key 配置/授权和追加 FX，不可读 Key hash、调用正文、端点凭据、审批或修改消费账本。
+服务配置：`DATABASE_URL`、`BROKERROUTER_SETTINGS_ISSUER`（BFF 公开 HTTPS origin）、`BROKERROUTER_SETTINGS_AUDIENCE`、`BROKERROUTER_SETTINGS_PUBLIC_KEYS`（kid 到 RSA 公钥 PEM 的 JSON）。没有供应商、存储或审批凭据。可修改 Key 配置/授权和追加 FX；后续 M5.3c 另以 `governance_read/write` 扩展[护栏与策略配置](m5-governance-settings.md)。不可读 Key hash、调用正文、端点凭据、审批或修改消费账本。
 
 BFF 可选配置（四项全缺省为关闭；部分配置会启动失败）：
 

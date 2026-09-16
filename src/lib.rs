@@ -14,6 +14,7 @@ pub mod error;
 pub mod gateway;
 pub mod governance;
 pub mod governance_api;
+pub mod governance_settings;
 pub mod human;
 mod judge;
 pub mod media;

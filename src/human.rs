@@ -556,7 +556,7 @@ pub async fn bind_runtime(
     tx.commit().await?;
     Ok(())
 }
-pub async fn publish_guardrail(pool: &PgPool, tenant: Uuid, rule: Guardrail) -> Result<()> {
+pub(crate) fn validate_guardrail(rule: &Guardrail) -> Result<()> {
     if rule.stage == "artifact" && rule.rule["kind"] == "model_judge" {
         return Err(Error::Invalid(
             "text_json judge does not inspect binary artifacts; an asset-aware connector is required",
@@ -581,6 +581,10 @@ pub async fn publish_guardrail(pool: &PgPool, tenant: Uuid, rule: Guardrail) -> 
             "asset_scan is server-only media_output; binary output does not support text rules",
         ));
     }
+    Ok(())
+}
+pub async fn publish_guardrail(pool: &PgPool, tenant: Uuid, rule: Guardrail) -> Result<()> {
+    validate_guardrail(&rule)?;
     let mut tx = pool.begin().await?;
     governance::tenant_lock(&mut tx, tenant).await?;
     let old: Option<i32> =

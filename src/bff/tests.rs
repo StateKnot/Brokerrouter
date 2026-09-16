@@ -793,6 +793,11 @@ async fn settings_bff_uses_bound_human_proof_and_separate_permissions(pool: PgPo
         "keys/detail",
         "models/query",
         "fx/query",
+        "guardrails/query",
+        "guardrails/history",
+        "policies/query",
+        "policies/preview",
+        "governance/targets",
         "apply",
     ] {
         let response = client
@@ -824,6 +829,82 @@ async fn settings_bff_uses_bound_human_proof_and_separate_permissions(pool: PgPo
     assert_eq!(receipts[0], receipts[1]);
     assert!(!receipts[0].to_string().contains(&secret));
     assert!(store::authenticate(&pool, &secret).await.is_ok());
+    // Governance configuration is an explicit, path-bound settings capability, not Key authority.
+    assert_eq!(
+        f.bff
+            .query(
+                &token,
+                &csrf,
+                "/settings/v1/guardrails/query",
+                br#"{"limit":20}"#
+            )
+            .await
+            .unwrap()
+            .0,
+        403
+    );
+    for p in [
+        crate::console::Permission::GovernanceRead,
+        crate::console::Permission::GovernanceWrite,
+    ] {
+        crate::console::set_permission(
+            &pool,
+            f.tenant,
+            f.user,
+            p,
+            true,
+            "governance configuration BFF test",
+        )
+        .await
+        .unwrap();
+    }
+    let config = json!({"operation_id":Uuid::new_v4(),"reason":"BFF guardrail contract","change":{"kind":"guardrail_publish","id":"bff-rail","expected_revision":null,"name":"BFF rail","stage":"pre","rule":{"kind":"always"},"active":false}});
+    assert_eq!(
+        f.bff
+            .query(
+                &token,
+                &csrf,
+                "/settings/v1/apply",
+                &serde_json::to_vec(&config).unwrap()
+            )
+            .await
+            .unwrap()
+            .0,
+        200
+    );
+    for (path, body) in [
+        ("guardrails/query", json!({"limit":20})),
+        ("guardrails/history", json!({"id":"bff-rail","limit":20})),
+        ("policies/query", json!({"limit":20})),
+        ("governance/targets", json!({"kind":"model","limit":20})),
+    ] {
+        let response = client
+            .post(format!("{base}/bff/v1/settings/{path}"))
+            .header("origin", &f.bff.config.origin)
+            .header("cookie", &cookie)
+            .header("x-br-csrf", &csrf)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{path}");
+    }
+    assert_eq!(
+        f.bff
+            .query(
+                &token,
+                &csrf,
+                "/settings/v1/policies/preview",
+                &serde_json::to_vec(
+                    &json!({"key_id":Uuid::new_v4(),"stage":"pre","model_id":null,"tool_name":null})
+                )
+                .unwrap()
+            )
+            .await
+            .unwrap()
+            .0,
+        400
+    );
     assert_eq!(
         f.bff
             .query(&token, &csrf, "/settings/v1/fx/query", br#"{"limit":20}"#)

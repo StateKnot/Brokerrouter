@@ -216,4 +216,12 @@ GRANT DELETE ON key_models TO brokerrouter_settings;
 GRANT USAGE ON SEQUENCE fx_rates_id_seq,audit_events_id_seq TO brokerrouter_settings;
 -- Grant-change trigger runs as the caller; operator CLI creation must still work.
 GRANT UPDATE(config_revision) ON virtual_keys TO brokerrouter_operator;
+-- Governance configuration shares the human settings listener, but has separate application grants.
+-- No access to approvals, turn payloads, scan receipts or runtime/scanner credentials.
+GRANT SELECT,INSERT ON guardrails,guardrail_versions,guardrail_policies TO brokerrouter_settings;
+GRANT UPDATE(version,active) ON guardrails TO brokerrouter_settings;
+GRANT UPDATE(guardrail_id,model_id,key_id,runtime_id,tool_name,active) ON guardrail_policies TO brokerrouter_settings;
+GRANT SELECT(tenant_id,key_id,user_id,runtime_id,active) ON runtime_bindings TO brokerrouter_settings;
+GRANT SELECT(tenant_id,id,model_id,version,active) ON output_scan_profiles TO brokerrouter_settings;
+GRANT SELECT(tenant_id,model_id,active,operation) ON endpoints TO brokerrouter_settings;
 COMMIT;

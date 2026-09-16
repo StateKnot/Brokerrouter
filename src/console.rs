@@ -22,6 +22,8 @@ pub enum Permission {
     KeysWrite,
     FxRead,
     FxWrite,
+    GovernanceRead,
+    GovernanceWrite,
 }
 impl Permission {
     pub(crate) fn name(self) -> &'static str {
@@ -34,6 +36,8 @@ impl Permission {
             Self::KeysWrite => "keys_write",
             Self::FxRead => "fx_read",
             Self::FxWrite => "fx_write",
+            Self::GovernanceRead => "governance_read",
+            Self::GovernanceWrite => "governance_write",
         }
     }
 }

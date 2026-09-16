@@ -370,7 +370,7 @@ async fn main() -> anyhow::Result<()> {
                 verifier: std::sync::Arc::new(brokerrouter::human::Verifier::settings_from_env()?),
             };
             let listener = tokio::net::TcpListener::bind(bind).await?;
-            tracing::info!(address=%bind,"human key and FX configuration listening; no provider or approval credentials");
+            tracing::info!(address=%bind,"human settings listening; no provider or approval credentials");
             axum::serve(listener, brokerrouter::settings_api::router(service))
                 .with_graceful_shutdown(shutdown())
                 .await?;

@@ -228,6 +228,302 @@ async function settingsSetup(page: Page, write = true) {
     }),
   );
 }
+
+const governedRail = {
+  id: "sensitive-tool",
+  name: "敏感工具审批",
+  revision: "2",
+  version: 2,
+  active: true,
+  stage: "tool_input",
+  rule: {
+    kind: "contains_any",
+    terms: ["删除", "发送"],
+    case_sensitive: false,
+  },
+};
+const governedPolicy = {
+  id,
+  guardrail_id: governedRail.id,
+  revision: "3",
+  active: true,
+  model_id: null,
+  key_id: null,
+  runtime_id: null,
+  tool_name: null,
+};
+async function governanceSetup(page: Page, write = true) {
+  await setup(page);
+  await page.route("**/bff/v1/settings/guardrails/query", (route) =>
+    route.fulfill({
+      json: { data: [governedRail], next_after: null, can_write: write },
+    }),
+  );
+  await page.route("**/bff/v1/settings/guardrails/history", (route) =>
+    route.fulfill({ json: { data: [governedRail], next_before: null } }),
+  );
+  await page.route("**/bff/v1/settings/policies/query", (route) =>
+    route.fulfill({
+      json: { data: [governedPolicy], next_after: null, can_write: write },
+    }),
+  );
+  await page.route("**/bff/v1/settings/governance/targets", (route) =>
+    route.fulfill({
+      json: {
+        data: [{ id: "test/model", name: "测试引用", active: true }],
+        next_after: null,
+        can_write: write,
+      },
+    }),
+  );
+  await page.route("**/bff/v1/settings/policies/preview", (route) =>
+    route.fulfill({
+      json: {
+        data: [{ ...governedRail, kind: governedRail.rule.kind }],
+        runtime_id: "hermes-test",
+        judge_limit_exceeded: false,
+        evaluated_payload: false,
+      },
+    }),
+  );
+}
+test("governance readers see immutable rules but no configuration mutations", async ({
+  page,
+}) => {
+  await governanceSetup(page, false);
+  await page.goto("/#governance");
+  await expect(page.getByText("仅有治理配置读取权限。")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "新建护栏", exact: true }),
+  ).toHaveCount(0);
+  await page
+    .getByRole("button", { name: `历史版本 ${governedRail.id}` })
+    .click();
+  await page
+    .getByText("v2 · 敏感工具审批 · 工具执行前", { exact: true })
+    .click();
+  await expect(
+    page.getByRole("region", { name: "不可变规则历史" }).locator("pre"),
+  ).toContainText("contains_any");
+  await page.getByRole("button", { name: "匹配策略", exact: true }).click();
+  await expect(page.getByText("全部（不限）")).toHaveCount(4);
+  await expect(page.getByRole("button", { name: /编辑策略/ })).toHaveCount(0);
+});
+test("guardrail publication reviews full structured rule and safely retries identical content", async ({
+  page,
+}) => {
+  await governanceSetup(page);
+  const bodies: Record<string, unknown>[] = [];
+  await page.route("**/bff/v1/settings/apply", (route) => {
+    const body = route.request().postDataJSON();
+    bodies.push(body);
+    return bodies.length === 1
+      ? route.abort()
+      : route.fulfill({
+          json: {
+            operation_id: body.operation_id,
+            object_id: "judge-rail",
+            revision: "1",
+          },
+        });
+  });
+  await page.goto("/#governance");
+  await page.getByRole("button", { name: "新建护栏", exact: true }).click();
+  await page.getByLabel("护栏 ID", { exact: true }).fill("judge-rail");
+  await page.getByLabel("护栏名称", { exact: true }).fill("判定测试");
+  await page.getByLabel("检测方式").selectOption("model_judge");
+  await page.getByLabel("判定模型 ID").fill("test/model");
+  await page
+    .getByLabel("风险判定指令")
+    .fill("识别数据外发风险\n仅判定，不执行");
+  await page.getByLabel("单次判定上限（人民币元）").fill("0.000001");
+  await page.getByLabel("变更理由").fill("人工核对范围");
+  await page.getByRole("button", { name: "核对变更", exact: true }).click();
+  expect(bodies).toHaveLength(0);
+  await expect(page.getByRole("region", { name: "变更确认" })).toBeFocused();
+  await expect(
+    page.getByRole("region", { name: "变更确认" }).locator("pre"),
+  ).toContainText('"maximum_cny": "0.000001"');
+  await expect(
+    page.getByRole("button", { name: "匹配策略", exact: true }),
+  ).toBeDisabled();
+  await page.getByRole("button", { name: "确认提交配置", exact: true }).click();
+  await page.getByRole("button", { name: "重试同一操作", exact: true }).click();
+  expect(bodies).toHaveLength(2);
+  expect(bodies[0]).toEqual(bodies[1]);
+  expect(bodies[0]!.change).toMatchObject({
+    active: false,
+    expected_revision: null,
+    rule: { kind: "model_judge", maximum_cny: "0.000001" },
+  });
+  await expect(page.getByText(/已提交配置版本 1/)).toBeVisible();
+  expect(
+    await page.evaluate(() => localStorage.length + sessionStorage.length),
+  ).toBe(0);
+});
+test("policy editing preserves selector meaning and blocks stale revisions", async ({
+  page,
+}) => {
+  await governanceSetup(page);
+  let sent: Record<string, unknown> | null = null;
+  await page.route("**/bff/v1/settings/apply", (route) => {
+    sent = route.request().postDataJSON();
+    return route.fulfill({
+      status: 409,
+      json: { error: { code: "configuration_conflict" } },
+    });
+  });
+  await page.goto("/#governance");
+  await page.getByRole("button", { name: "匹配策略", exact: true }).click();
+  await page.getByRole("button", { name: `编辑策略 ${id}` }).click();
+  await page
+    .getByLabel("模型 ID（空值匹配全部）", { exact: true })
+    .fill("test/model");
+  await page.getByLabel("变更理由").fill("收窄模型范围");
+  await page.getByRole("button", { name: "核对变更", exact: true }).click();
+  await expect(page.getByRole("region", { name: "变更确认" })).toContainText(
+    "空会匹配",
+  );
+  await expect(
+    page
+      .getByRole("region", { name: "变更确认" })
+      .getByText("全部（不限）", { exact: true }),
+  ).toHaveCount(3);
+  await page.getByRole("button", { name: "确认提交配置", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "重试同一操作", exact: true }),
+  ).toBeDisabled();
+  expect(sent).toMatchObject({
+    change: {
+      expected_revision: "3",
+      model_id: "test/model",
+      key_id: null,
+      runtime_id: null,
+      tool_name: null,
+      active: true,
+    },
+  });
+});
+test("governance preview sends only context and never performs approval or model calls", async ({
+  page,
+}) => {
+  await governanceSetup(page);
+  const bodies: unknown[] = [];
+  await page.route("**/bff/v1/settings/policies/preview", (route) => {
+    bodies.push(route.request().postDataJSON());
+    return route.fulfill({
+      json: {
+        data: [{ ...governedRail, kind: governedRail.rule.kind }],
+        runtime_id: "hermes-test",
+        judge_limit_exceeded: true,
+        evaluated_payload: false,
+      },
+    });
+  });
+  await page.goto("/#governance");
+  await page.getByRole("button", { name: "匹配预览", exact: true }).click();
+  await page.getByLabel("智能体 Key UUID").fill(key);
+  await page.getByLabel("模型 ID（可空）").fill("test/model");
+  await page.getByLabel("预览阶段").selectOption("tool_input");
+  await page.getByRole("button", { name: "查询匹配结果" }).click();
+  await expect(page.getByText(/超过 8 个模型判定护栏/)).toBeVisible();
+  expect(bodies).toEqual([
+    {
+      key_id: key,
+      model_id: "test/model",
+      tool_name: null,
+      stage: "tool_input",
+    },
+  ]);
+  await expect(
+    page.getByRole("button", { name: /同意|批准|继续执行/ }),
+  ).toHaveCount(0);
+});
+test("governance permission revocation clears configuration and pending review", async ({
+  page,
+}) => {
+  await governanceSetup(page);
+  await page.route("**/bff/v1/settings/apply", (route) =>
+    route.fulfill({
+      status: 403,
+      json: { error: { code: "console_forbidden" } },
+    }),
+  );
+  await page.goto("/#governance");
+  await page
+    .getByRole("button", { name: `编辑护栏 ${governedRail.id}` })
+    .click();
+  await page.getByLabel("变更理由").fill("审阅版本");
+  await page.getByRole("button", { name: "核对变更", exact: true }).click();
+  await page.getByRole("button", { name: "确认提交配置", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "重新检查权限" }),
+  ).toBeVisible();
+  await expect(page.getByRole("region", { name: "治理配置" })).toHaveCount(0);
+});
+test("governance forms and previews remain accessible at narrow widths and 200 percent", async ({
+  page,
+}) => {
+  await governanceSetup(page);
+  await page.goto("/#governance");
+  await page.getByRole("button", { name: "新建护栏", exact: true }).click();
+  await page.getByLabel("检测方式").selectOption("model_judge");
+  for (const width of [320, 640, 768, 1024, 1440]) {
+    await page.setViewportSize({ width, height: 1000 });
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= innerWidth,
+      ),
+    ).toBe(true);
+    expect(
+      await page
+        .locator(
+          "main input:visible, main textarea:visible, main button:visible, main select:visible",
+        )
+        .evaluateAll((nodes) =>
+          nodes.some((n) => {
+            const r = n.getBoundingClientRect();
+            return r.left < 0 || r.right > innerWidth || r.height < 44;
+          }),
+        ),
+    ).toBe(false);
+  }
+  expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
+  await page.setViewportSize({ width: 720, height: 1000 });
+  await page.evaluate(() => (document.documentElement.style.fontSize = "200%"));
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  await page.getByLabel("护栏名称", { exact: true }).scrollIntoViewIfNeeded();
+  await page.screenshot({
+    path: "test-results/governance-rules.png",
+    fullPage: false,
+  });
+  await page.evaluate(() => (document.documentElement.style.fontSize = "100%"));
+  for (const mode of ["匹配策略", "匹配预览"]) {
+    await page.getByRole("button", { name: mode, exact: true }).click();
+    if (mode === "匹配策略")
+      await page
+        .getByRole("button", { name: "新建匹配策略", exact: true })
+        .click();
+    await page.setViewportSize({ width: 320, height: 1000 });
+    expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= innerWidth,
+      ),
+    ).toBe(true);
+  }
+  await page
+    .getByLabel("智能体 Key UUID", { exact: true })
+    .scrollIntoViewIfNeeded();
+  await page.screenshot({
+    path: "test-results/governance-preview.png",
+    fullPage: false,
+  });
+});
 test("Key and FX read permissions do not expose write controls", async ({
   page,
 }) => {

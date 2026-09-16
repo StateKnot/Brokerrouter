@@ -1,6 +1,13 @@
 /* Hallmark · macrostructure: Workbench · genre: modern-minimal · theme: Cobalt · enrichment: none · nav: N3 text-only left rail · footer: Ft2 inline */
 /* Hallmark · pre-emit critique: P5 H4 E4 S5 R4 V5 · contrast: pass (40–41) · mobile: pass (34, 49, 50–57); scope and evidence: ../.hallmark/qa.md */
 @import "tailwindcss";
+
+.config-json {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.875rem;
+  max-width: 100%;
+}
 @import "../tokens.css";
 
 .management {
