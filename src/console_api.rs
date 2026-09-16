@@ -30,6 +30,9 @@ pub fn router(service: Console) -> Router {
         .route("/console/v1/usage/groups/query", post(groups))
         .route("/console/v1/requests/query", post(requests))
         .route("/console/v1/audit/query", post(audit))
+        .route("/console/v1/traces/turns/query", post(trace_turns))
+        .route("/console/v1/traces/turns/detail", post(trace_detail))
+        .route("/console/v1/traces/turns/items", post(trace_items))
         .route("/console/v1/governance/monitor/query", post(monitor))
         .route(
             "/console/v1/governance/monitor/rails/query",
@@ -142,6 +145,40 @@ async fn monitor_rails(
     let who = auth(&c, &headers, &uri.to_string(), &body).await?;
     Ok(Json(
         crate::monitoring::rails(&c.pool, &who, decode(&body)?).await?,
+    ))
+}
+
+async fn trace_turns(
+    State(c): State<Console>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>> {
+    let who = auth(&c, &headers, &uri.to_string(), &body).await?;
+    Ok(Json(
+        crate::traces::turns(&c.pool, &who, decode(&body)?).await?,
+    ))
+}
+async fn trace_detail(
+    State(c): State<Console>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>> {
+    let who = auth(&c, &headers, &uri.to_string(), &body).await?;
+    Ok(Json(
+        crate::traces::detail(&c.pool, &who, decode(&body)?).await?,
+    ))
+}
+async fn trace_items(
+    State(c): State<Console>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>> {
+    let who = auth(&c, &headers, &uri.to_string(), &body).await?;
+    Ok(Json(
+        crate::traces::items(&c.pool, &who, decode(&body)?).await?,
     ))
 }
 

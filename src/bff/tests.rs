@@ -653,6 +653,99 @@ async fn monitoring_routes_require_csrf_and_independent_read_permission(pool: Pg
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn traces_routes_are_read_only_csrf_protected_and_recheck_permission(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let (token, csrf) = logged_in(&f).await;
+    let (base, task) = serve(router(f.bff.clone())).await;
+    let _abort = Task(task);
+    let client = http_client().unwrap();
+    let cookie = format!("__Host-br-session={token}; __Host-br-csrf={csrf}");
+    for (suffix, body, expected) in [
+        (
+            "query",
+            json!({"filter":{"start":Utc::now()-chrono::Duration::days(1),"end":Utc::now()},"limit":20}),
+            200,
+        ),
+        ("detail", json!({"turn_id":Uuid::new_v4()}), 404),
+        (
+            "items",
+            json!({"turn_id":Uuid::new_v4(),"section":"nodes","limit":20}),
+            404,
+        ),
+    ] {
+        let url = format!("{base}/bff/v1/traces/turns/{suffix}");
+        for supplied in [false, true] {
+            let mut r = client
+                .post(&url)
+                .header("origin", &f.bff.config.origin)
+                .header("cookie", &cookie)
+                .json(&body);
+            if supplied {
+                r = r.header("x-br-csrf", &csrf);
+            }
+            assert_eq!(r.send().await.unwrap().status(), 403);
+        }
+        crate::console::set_permission(
+            &pool,
+            f.tenant,
+            f.user,
+            crate::console::Permission::TracesRead,
+            true,
+            "trace route test",
+        )
+        .await
+        .unwrap();
+        let r = client
+            .post(&url)
+            .header("origin", &f.bff.config.origin)
+            .header("cookie", &cookie)
+            .header("x-br-csrf", &csrf)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), expected);
+        assert_eq!(r.headers()["cache-control"], "no-store");
+        crate::console::set_permission(
+            &pool,
+            f.tenant,
+            f.user,
+            crate::console::Permission::TracesRead,
+            false,
+            "trace route revoke",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            f.bff
+                .query(
+                    &token,
+                    &csrf,
+                    &format!("/console/v1/traces/turns/{suffix}"),
+                    &serde_json::to_vec(&body).unwrap()
+                )
+                .await
+                .unwrap()
+                .0,
+            403
+        );
+    }
+    for suffix in ["approve", "ack", "resume", "claim"] {
+        assert!(matches!(
+            f.bff
+                .query(
+                    &token,
+                    &csrf,
+                    &format!("/console/v1/traces/turns/{suffix}"),
+                    b"{}"
+                )
+                .await,
+            Err(Error::NotFound)
+        ));
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn browser_callback_errors_have_fixed_safe_landing_and_boundary_headers(pool: PgPool) {
     let f = fixture(&pool).await;
     let (base, task) = serve(router(f.bff.clone())).await;

@@ -165,6 +165,7 @@ DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_con
 END IF; END $$;
 GRANT USAGE ON SCHEMA public TO brokerrouter_console;
 GRANT SELECT ON _sqlx_migrations,console_permissions,console_request_facts,console_audit_facts TO brokerrouter_console;
+GRANT SELECT ON console_trace_turns,console_trace_nodes,console_trace_requests,console_trace_links,console_trace_attempts,console_trace_approvals,console_trace_grants,console_trace_events TO brokerrouter_console;
 GRANT SELECT(id,active) ON tenants TO brokerrouter_console;
 GRANT SELECT(tenant_id,id,issuer,subject,active) ON governance_users TO brokerrouter_console;
 GRANT SELECT,INSERT ON console_permissions TO brokerrouter_operator;

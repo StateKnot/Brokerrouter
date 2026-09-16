@@ -2,7 +2,7 @@ use super::*;
 use brokerrouter::governance::{self, Check};
 const MONITOR: &str = "/console/v1/governance/monitor/query";
 const RAILS: &str = "/console/v1/governance/monitor/rails/query";
-async fn runtime(pool: &PgPool, f: &Fixture) -> Uuid {
+pub(super) async fn runtime(pool: &PgPool, f: &Fixture) -> Uuid {
     human::bind_runtime(
         pool,
         f.who.tenant_id,
@@ -40,7 +40,7 @@ fn check(t: Uuid, key: &str) -> Check {
         payload: json!({"text":"private-raw-material"}),
     }
 }
-async fn sample(pool: &PgPool, f: &Fixture, t: Uuid, key: &str) -> Value {
+pub(super) async fn sample(pool: &PgPool, f: &Fixture, t: Uuid, key: &str) -> Value {
     governance::check(pool, &cipher(), &f.who, check(t, key))
         .await
         .unwrap()

@@ -453,6 +453,9 @@ impl Bff {
                 | "/console/v1/usage/groups/query"
                 | "/console/v1/requests/query"
                 | "/console/v1/audit/query"
+                | "/console/v1/traces/turns/query"
+                | "/console/v1/traces/turns/detail"
+                | "/console/v1/traces/turns/items"
                 | "/console/v1/governance/monitor/query"
                 | "/console/v1/governance/monitor/rails/query"
         ) {
