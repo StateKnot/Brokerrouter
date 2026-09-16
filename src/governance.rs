@@ -257,6 +257,7 @@ pub(crate) async fn gate(
         return Err(Error::Configuration);
     }
     for r in rules {
+        let started = std::time::Instant::now();
         let grant: Option<Uuid>=sqlx::query_scalar("SELECT approval_id FROM guardrail_grants WHERE tenant_id=$1 AND turn_id=$2 AND guardrail_id=$3 AND version=$4 AND expires_at>clock_timestamp()")
             .bind(who.tenant_id).bind(turn.id).bind(&r.id).bind(r.version).fetch_optional(&mut **tx).await?;
         let (outcome, reason) = if grant.is_some() {
@@ -269,6 +270,8 @@ pub(crate) async fn gate(
         } else if r.rule["kind"] == "model_judge" {
             match crate::judge::observe(tx, who, op, &r).await? {
                 crate::judge::Observation::Pending(id) => {
+                    crate::monitoring::observe(tx, who.tenant_id, op.id, &r, "pending", None)
+                        .await?;
                     pending.push(id);
                     continue;
                 }
@@ -279,6 +282,16 @@ pub(crate) async fn gate(
         } else {
             ("passed".to_owned(), "configured_rule_passed".to_owned())
         };
+        let inline_us = if grant.is_none()
+            && matches!(
+                r.rule["kind"].as_str(),
+                Some("always" | "contains_any" | "asset_scan")
+            ) {
+            Some(i64::try_from(started.elapsed().as_micros()).map_err(|_| Error::Configuration)?)
+        } else {
+            None
+        };
+        crate::monitoring::observe(tx, who.tenant_id, op.id, &r, &outcome, inline_us).await?;
         if outcome == "risk" || outcome == "failed" {
             // Preserve the original deterministic approval hash across upgrades.
             let mut item = json!({"id":r.id,"version":r.version,"name":r.name,"stage":r.stage,"reason_code":reason});

@@ -26,6 +26,8 @@ export const PendingConfig = createContext<{
 }>({ owner: null, setOwner: () => {} });
 type QueryPath =
   | "audit/query"
+  | "governance/monitor/query"
+  | "governance/monitor/rails/query"
   | "catalog/models/query"
   | "catalog/endpoints/query"
   | "settings/keys/query"
@@ -45,21 +47,24 @@ export function useQuery<T>(
   denied: Denied,
 ) {
   const [state, setState] = useState<{
+    identity?: string;
     data?: T;
     error?: unknown;
     loading: boolean;
   }>({ loading: true });
   const encoded = JSON.stringify(body);
+  const identity = `${path}:${encoded}:${epoch}`;
   useEffect(() => {
     const controller = new AbortController();
-    setState({ loading: true });
+    setState({ identity, loading: true });
     void request(path, schema, JSON.parse(encoded), controller.signal)
       .then((data) => {
-        if (!controller.signal.aborted) setState({ data, loading: false });
+        if (!controller.signal.aborted)
+          setState({ identity, data, loading: false });
       })
       .catch((error) => {
         if (controller.signal.aborted) return;
-        setState({ error, loading: false });
+        setState({ identity, error, loading: false });
         if (
           needsLogin(error) ||
           (error instanceof ApiError && error.status === 403)
@@ -67,8 +72,8 @@ export function useQuery<T>(
           denied(error);
       });
     return () => controller.abort();
-  }, [path, schema, encoded, epoch, denied]);
-  return state;
+  }, [path, schema, encoded, identity, denied]);
+  return state.identity === identity ? state : { loading: true };
 }
 export function QueryState({
   loading,

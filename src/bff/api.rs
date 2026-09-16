@@ -24,6 +24,8 @@ pub fn router(service: Arc<Bff>) -> Router {
         .route("/bff/v1/usage/groups/query", post(query))
         .route("/bff/v1/requests/query", post(query))
         .route("/bff/v1/audit/query", post(query))
+        .route("/bff/v1/governance/monitor/query", post(query))
+        .route("/bff/v1/governance/monitor/rails/query", post(query))
         .route("/bff/v1/catalog/models/query", post(query))
         .route("/bff/v1/catalog/endpoints/query", post(query))
         .route("/bff/v1/catalog/apply", post(query))
