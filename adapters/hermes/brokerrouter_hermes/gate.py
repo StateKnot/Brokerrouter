@@ -12,6 +12,7 @@ from uuid import UUID
 
 from .client import GatewayFailure, GovernanceClient, HttpTransport, Transport, TransportFailure
 from .config import Config
+from .integrity import verify_runtime_installation
 from .store import Checkpoint, CheckpointConflict, CheckpointStore
 
 
@@ -93,6 +94,28 @@ class ToolContext:
         return f"hermes-v1-{self.identity_hash}"
 
 
+@dataclass(frozen=True, repr=False)
+class GatewayTurnBinding:
+    turn_id: str
+    session_id: str
+    message_id: str
+    run_id: str
+    generation: int
+
+    def validate(self) -> GatewayTurnBinding:
+        _uuid(self.turn_id, "governance_turn_missing")
+        for value, code in (
+            (self.session_id, "session_identity_missing"),
+            (self.message_id, "message_identity_missing"),
+            (self.run_id, "run_identity_missing"),
+        ):
+            if not isinstance(value, str) or not value.strip() or len(value.encode("utf-8")) > 200:
+                raise GovernanceHalt(code)
+        if isinstance(self.generation, bool) or not isinstance(self.generation, int) or self.generation < 0:
+            raise GovernanceHalt("generation_identity_invalid")
+        return self
+
+
 class GovernanceGate:
     def __init__(
         self,
@@ -141,8 +164,56 @@ class GovernanceGate:
             raise GovernanceHalt("gateway_payload_hash_invalid", operation_id)
         return self.store.checked(context.operation_key, operation_id, state, gateway_hash)
 
+    def _approval_id(
+        self, context: ToolContext, response: dict[str, Any], checkpoint: Checkpoint
+    ) -> str | None:
+        if checkpoint.state != "waiting_approval":
+            return None
+        approval = response.get("approval")
+        if not isinstance(approval, dict):
+            raise GovernanceHalt("gateway_approval_invalid", checkpoint.operation_id)
+        approval_id = _uuid(approval.get("id"), "gateway_approval_invalid")
+        if (
+            _uuid(approval.get("operation_id"), "gateway_approval_invalid")
+            != checkpoint.operation_id
+            or _uuid(approval.get("turn_id"), "gateway_approval_invalid") != context.turn_id
+            or approval.get("state") != "pending"
+            or approval.get("scope") != "current_turn_only"
+            or approval.get("resume_requires_recheck") is not True
+            or approval.get("options") != ["continue_this_turn", "reject", "feedback"]
+        ):
+            raise GovernanceHalt("gateway_approval_invalid", checkpoint.operation_id)
+        return approval_id
+
+    def _notify_approval(
+        self,
+        context: ToolContext,
+        approval_id: str,
+        callback: Callable[[dict[str, str]], None] | None,
+    ) -> None:
+        if callback is None or not self.store.reserve_approval_notice(
+            context.operation_key, approval_id
+        ):
+            return
+        try:
+            callback(
+                {
+                    "approval_id": approval_id,
+                    "turn_id": context.turn_id,
+                    "review_url": f"{self.config.approvals_url}/#approvals",
+                }
+            )
+            self.store.complete_approval_notice(context.operation_key, approval_id)
+        except BaseException:
+            self.store.release_approval_notice(context.operation_key, approval_id)
+            raise
+
     def _wait_until_ready(
-        self, context: ToolContext, checkpoint: Checkpoint, status: Callable[[str], None] | None
+        self,
+        context: ToolContext,
+        checkpoint: Checkpoint,
+        status: Callable[[str], None] | None,
+        approval: Callable[[dict[str, str]], None] | None,
     ) -> Checkpoint:
         deadline = self._monotonic() + self.config.approval_wait_seconds
         body = self._check_body(context)
@@ -155,6 +226,9 @@ class GovernanceGate:
                 response = self.client.check(body)
                 checkpoint = self._record_check(context, response)
                 self._status(status, checkpoint.state)
+                approval_id = self._approval_id(context, response, checkpoint)
+                if approval_id is not None:
+                    self._notify_approval(context, approval_id, approval)
             except GatewayFailure as exc:
                 if exc.code == "action_rejected":
                     if checkpoint.operation_id:
@@ -196,9 +270,10 @@ class GovernanceGate:
         context: ToolContext,
         dispatch: Callable[[], Any],
         status: Callable[[str], None] | None = None,
+        approval: Callable[[dict[str, str]], None] | None = None,
     ) -> Any:
         try:
-            return self._run_tool(context, dispatch, status)
+            return self._run_tool(context, dispatch, status, approval)
         except GovernanceHalt:
             raise
         except Exception as exc:
@@ -209,6 +284,7 @@ class GovernanceGate:
         context: ToolContext,
         dispatch: Callable[[], Any],
         status: Callable[[str], None] | None = None,
+        approval: Callable[[dict[str, str]], None] | None = None,
     ) -> Any:
         context = context.validate()
         payload_hash = _sha(_canonical(context.arguments))
@@ -241,7 +317,7 @@ class GovernanceGate:
             raise GovernanceHalt(checkpoint.state, checkpoint.operation_id)
 
         if checkpoint.state != "claim_prepared":
-            checkpoint = self._wait_until_ready(context, checkpoint, status)
+            checkpoint = self._wait_until_ready(context, checkpoint, status, approval)
             checkpoint = self.store.prepare_claim(context.operation_key, secrets.token_hex(32))
 
         if not checkpoint.operation_id or not checkpoint.gateway_payload_hash or not checkpoint.claim_token:
@@ -316,6 +392,32 @@ class GovernanceGate:
         self._status(status, "completed")
         return result
 
+    def bind_turn(self, binding: GatewayTurnBinding) -> str:
+        binding = binding.validate()
+        body = {
+            "session_id": binding.session_id,
+            "message_id": binding.message_id,
+            "run_id": binding.run_id,
+            "generation": binding.generation,
+        }
+        try:
+            response = self.client.bind_turn(binding.turn_id, body)
+        except GatewayFailure as exc:
+            raise GovernanceHalt(exc.code, binding.turn_id) from exc
+        except TransportFailure as exc:
+            raise GovernanceHalt("turn_binding_unavailable", binding.turn_id) from exc
+        response_id = _uuid(response.get("id"), "turn_binding_invalid")
+        if (
+            response_id != binding.turn_id
+            or response.get("state") != "active"
+            or response.get("session_id") != binding.session_id
+            or response.get("message_id") != binding.message_id
+            or response.get("run_id") != binding.run_id
+            or response.get("generation") != binding.generation
+        ):
+            raise GovernanceHalt("turn_binding_invalid", binding.turn_id)
+        return response_id
+
 
 _gate_lock = threading.Lock()
 
@@ -330,6 +432,10 @@ def gate_for_agent(agent: Any) -> GovernanceGate | None:
         raise GovernanceHalt("adapter_configuration_invalid") from exc
     if config is None:
         return None
+    try:
+        verify_runtime_installation()
+    except Exception as exc:
+        raise GovernanceHalt("adapter_integrity_invalid") from exc
     with _gate_lock:
         existing = getattr(agent, "_brokerrouter_governance_gate", None)
         if existing is None:
@@ -359,3 +465,67 @@ def context_for_agent(agent: Any, ref: Any) -> ToolContext:
         tool_name=str(getattr(ref, "name", "") or ""),
         arguments=getattr(ref, "args", None),
     )
+
+
+def reject_governed_proxy() -> None:
+    try:
+        config = Config.from_env()
+    except Exception as exc:
+        raise GovernanceHalt("adapter_configuration_invalid") from exc
+    if config is not None:
+        raise GovernanceHalt("governed_proxy_not_supported")
+
+
+def bind_gateway_agent(agent: Any, context: Any, runner: Any) -> None:
+    setattr(agent, "_brokerrouter_turn_id", None)
+    setattr(agent, "_brokerrouter_approval_callback", None)
+    gate = gate_for_agent(agent)
+    if gate is None:
+        return
+    raw = getattr(context, "_brokerrouter_turn_binding", None)
+    if not isinstance(raw, dict) or set(raw) != {"turn_id", "run_id"}:
+        raise GovernanceHalt("governance_turn_binding_missing")
+    binding = GatewayTurnBinding(
+        turn_id=str(raw.get("turn_id") or ""),
+        session_id=str(getattr(context, "session_id", "") or ""),
+        message_id=str(getattr(context, "inbound_message_id", "") or ""),
+        run_id=str(raw.get("run_id") or ""),
+        generation=getattr(context, "run_generation", None),
+    )
+    turn_id = gate.bind_turn(binding)
+    adapter = getattr(context, "_status_adapter", None)
+    loop = getattr(context, "_voice_ack_loop", None)
+    if adapter is None or loop is None:
+        raise GovernanceHalt("approval_channel_unavailable", turn_id)
+
+    def notify(details: dict[str, str]) -> None:
+        import asyncio
+        import concurrent.futures
+
+        runner._close_native_stream_boundary("Brokerrouter approval")
+        metadata = dict(getattr(context, "_status_thread_metadata", None) or {})
+        metadata.update(
+            {
+                "is_approval_prompt": True,
+                "brokerrouter_approval_id": details["approval_id"],
+            }
+        )
+        message = (
+            "Brokerrouter 需要本人审批才能继续当前工具。\n\n"
+            f"审批 ID：`{details['approval_id']}`\n"
+            f"请打开安全审阅页：{details['review_url']}\n\n"
+            "审批仅对当前 turn 的指定护栏有效；在聊天中回复“同意”不会授权。"
+        )
+        future = asyncio.run_coroutine_threadsafe(
+            adapter.send(getattr(context, "_status_chat_id", None), message, metadata=metadata),
+            loop,
+        )
+        try:
+            result = future.result(timeout=15)
+        except concurrent.futures.TimeoutError:
+            return
+        if result is not None and getattr(result, "success", True) is not True:
+            raise RuntimeError("Brokerrouter approval notice was refused")
+
+    setattr(agent, "_brokerrouter_turn_id", turn_id)
+    setattr(agent, "_brokerrouter_approval_callback", notify)

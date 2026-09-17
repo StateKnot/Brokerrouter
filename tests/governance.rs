@@ -40,6 +40,48 @@ fn action(turn: Uuid, key: &str, payload: Value) -> Check {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn runtime_turn_binding_requires_every_authoritative_identity(pool: PgPool) {
+    let (who, _, turn) = setup(&pool).await;
+    let binding = governance::RuntimeTurnBinding {
+        session_id: "session".into(),
+        message_id: "message".into(),
+        run_id: "run".into(),
+        generation: 0,
+    };
+    let bound = governance::bind_runtime_turn(&pool, &who, turn, binding.clone())
+        .await
+        .unwrap();
+    assert_eq!(bound["id"], turn.to_string());
+    assert_eq!(bound["state"], "active");
+
+    for bad in 0..4 {
+        let mut changed = binding.clone();
+        match bad {
+            0 => changed.session_id = "other-session".into(),
+            1 => changed.message_id = "other-message".into(),
+            2 => changed.run_id = "other-run".into(),
+            _ => changed.generation = 1,
+        }
+        assert!(matches!(
+            governance::bind_runtime_turn(&pool, &who, turn, changed).await,
+            Err(Error::NotFound)
+        ));
+    }
+
+    sqlx::query("UPDATE runtime_bindings SET active=false WHERE tenant_id=$1 AND key_id=$2")
+        .bind(who.tenant_id)
+        .bind(who.key_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        governance::bind_runtime_turn(&pool, &who, turn, binding)
+            .await
+            .is_err()
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn signed_human_assertions_reject_agent_forgery_wrong_audience_body_path_and_expiry(
     pool: PgPool,
 ) {

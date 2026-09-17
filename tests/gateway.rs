@@ -828,6 +828,88 @@ async fn semantic_result_get_never_starts_new_paid_policy_check(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn http_runtime_turn_binding_requires_the_virtual_key_and_exact_host_identity(pool: PgPool) {
+    let upstream = Mock::start(Reply::Chat).await;
+    let (who, key, _) = setup(&pool, "chat", &upstream.url).await;
+    common::provision(&pool, &who, "hermes-user").await;
+    let turn = common::turn(&pool, &who, "hermes-user", 0).await;
+    let app = api::gateway_router(gateway(pool, 5));
+    let path = format!("/v1/governance/turns/{turn}/bind");
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            &key,
+            "unused",
+            json!({
+                "session_id": "session",
+                "message_id": "message",
+                "run_id": "run",
+                "generation": 0
+            }),
+            &path,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["id"], turn.to_string());
+    assert_eq!(body["state"], "active");
+
+    let mismatch = app
+        .clone()
+        .oneshot(request(
+            &key,
+            "unused",
+            json!({
+                "session_id": "session",
+                "message_id": "message",
+                "run_id": "other-run",
+                "generation": 0
+            }),
+            &path,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(mismatch.status(), StatusCode::NOT_FOUND);
+
+    let unauthorized = app
+        .clone()
+        .oneshot(request(
+            &("sk_br_".to_string() + &"2".repeat(64)),
+            "unused",
+            json!({
+                "session_id": "session",
+                "message_id": "message",
+                "run_id": "run",
+                "generation": 0
+            }),
+            &path,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let unknown_field = app
+        .oneshot(request(
+            &key,
+            "unused",
+            json!({
+                "session_id": "session",
+                "message_id": "message",
+                "run_id": "run",
+                "generation": 0,
+                "turn_id": turn
+            }),
+            &path,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unknown_field.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(upstream.count(), 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn http_chat_replay_encrypted_result_and_scope(pool: PgPool) {
     let upstream = Mock::start(Reply::Chat).await;
     let (who, key, _) = setup(&pool, "chat", &upstream.url).await;

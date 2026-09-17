@@ -48,6 +48,6 @@ brokerrouter console-permission-set --tenant <TENANT_UUID> --user <USER_UUID> \
 
 ## 验收边界
 
-本包本地 PostgreSQL/HTTP/受限角色/浏览器证据汇总于 milestones；正式 PR 还必须通过全量 CI。LIVE-21 保留真实 IdP/TLS/组织权限/多副本撤权、0019 大数据索引窗口/恢复、查询计划/规模/SLO/留存、人民币供应商对账与人工读屏认证。Hermes/Claw 原生执行适配仍属 M6 未开发能力，而非把报表测试视为已完成原生恢复。
+本包本地 PostgreSQL/HTTP/受限角色/浏览器证据汇总于 milestones；正式 PR 还必须通过全量 CI。LIVE-21 保留真实 IdP/TLS/组织权限/多副本撤权、0019 大数据索引窗口/恢复、查询计划/规模/SLO/留存、人民币供应商对账与人工读屏认证。Hermes M6.1a/b 已增加受信 turn 与工具输入暂停/审批通知，但输出/产物隔离发布、生产恢复认证和 OpenClaw 仍属 M6 未完成能力，不能把报表或本地合约视为整体原生恢复已完成。
 
 下一接入的已读源码约束见 [Hermes 0.21.1 接入边界](m6-hermes-native-integration.md)。
