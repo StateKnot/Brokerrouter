@@ -301,4 +301,17 @@ Key 配置版本不会因消费变化抖动，但更新仍锁定实时预留/消
 
 本地常规 Rust 全量 **195 项通过**，最终索引友好投影再做 **6 项 PostgreSQL 治理合约复验通过**；新增共 6 项数据库/真实受限角色测试和 1 项真实本地 OIDC→BFF 路由测试。fmt 与 Clippy（`-D warnings`）通过。前端 **28 项单元、124 项 Chromium/WebKit 全量通过**；最终焦点/日期保持补丁另作治理页复验。实际 Nginx 主站与隔离预览站合约通过，首次 Docker 启动回收超时后单独复验成功。未新增付费调用，没有修改真实用户 Hermes 容器或生产部署。本地本包不重跑 4 项 MinIO/ClamAV/FFmpeg ignored 专项，正式 PR 必须由 CI 补验成功后才合并；最终 release/远端状态以本包 PR 记录为准。
 
-新增 LIVE-21 保留真实部署/IdP/分权、多副本与在途撤权、0019 大体量维护窗口、查询计划/SLO/留存、供应商对账和人工读屏验收。已只读核验用户 Docker 中 Hermes `0.21.1` 及文件摘要，发现普通工具插件失败放行、本地批准不等于网关真人证明等边界，形成 [M6.1 原生接入实施约束](m6-hermes-native-integration.md)。**Hermes/Claw 原生暂停恢复仍未实现**；需固定可重建宿主源码与强制执行入口，不把只读报表或普通插件接口算作原生治理完成。
+新增 LIVE-21 保留真实部署/IdP/分权、多副本与在途撤权、0019 大体量维护窗口、查询计划/SLO/留存、供应商对账和人工读屏验收。已只读核验用户 Docker 中 Hermes `0.21.1` 及文件摘要，发现普通工具插件失败放行、本地批准不等于网关真人证明等边界，形成 [M6.1 原生接入实施约束](m6-hermes-native-integration.md)。本节交付时 Hermes/Claw 原生暂停恢复仍未实现，后续进展见 M6.1a。
+
+## M6.1a：Hermes 工具输入原生暂停与一次性派发
+
+2026-09-17，从干净 main `153c6bc5c482b4e8fa759547a86e6c8ce2619705` 开始，针对用户指定的 NousResearch/hermes-agent 固定提交 `67764dc0863349a384c16425e73ee8571f3a94b7` 实现第一包宿主适配。网关 Rust/PostgreSQL 治理协议不变；只有贴近 Hermes 执行器的适配按宿主使用 Python。
+
+- 严格 overlay 安装器验证 `tool_executor.py` 完整 SHA-256 和唯一锚点，在新镜像构建根内原子安装、保留固定基线并生成摘要清单；不热补丁用户运行容器。
+- 强制门位于所有参数改写和 Hermes 本地授权之后、真实 dispatch 之前。受信 Brokerrouter turn 缺失、配置/存储异常、网关不可用与异常响应均形成结构化 hard stop，不降级执行。
+- `checking`/`waiting_approval` 重放同一 operation；批准后先持久化 AES-256-GCM 加密的随机 claim token，仅 `dispatch_authorized=true` 执行。原始最终参数不写检查点数据库。
+- claim 响应丢失、授权后重启、工具异常、回执丢失分别保留 `claim_unknown`、`execution_unknown` 或 `effect_recorded`；恢复只补安全回执，不自动再次调用外部工具，也不把没有结果说成未执行。
+
+在当前 Hermes 0.21.1 镜像的无网络临时容器中 **15 项适配器/安装器/真实宿主派发合约通过**，补丁后宿主与适配器均通过 Python 编译；没有模型调用、供应商费用、真实工具副作用或对运行容器的修改。CI 新增独立 Hermes 固定源码摘要/overlay/状态机检查。
+
+未完成边界：实际 Gateway 受信 turn 注入与审批卡片、`tool_output`/`artifact` 发布检查和会话结果落盘后的回执、真实进程逐点终止/多实例/串并行/委派/MCP 工具矩阵、受管镜像发布及 OpenClaw 适配。以上继续 M6.1b 和 LIVE-06/21，当前包不宣称完整输入输出治理或生产部署认证完成。
