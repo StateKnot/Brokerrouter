@@ -44,6 +44,14 @@ pub struct Check {
     pub tool_name: Option<String>,
     pub payload: Value,
 }
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeTurnBinding {
+    pub session_id: String,
+    pub message_id: String,
+    pub run_id: String,
+    pub generation: i32,
+}
 #[derive(sqlx::FromRow)]
 pub(crate) struct Operation {
     pub id: Uuid,
@@ -92,6 +100,40 @@ pub(crate) async fn tenant_lock(tx: &mut Tx<'_>, tenant: Uuid) -> Result<()> {
         return Err(Error::Unauthorized);
     }
     Ok(())
+}
+pub async fn bind_runtime_turn(
+    pool: &PgPool,
+    who: &Identity,
+    id: Uuid,
+    binding: RuntimeTurnBinding,
+) -> Result<Value> {
+    if ![&binding.session_id, &binding.message_id, &binding.run_id]
+        .iter()
+        .all(|value| valid_text(value, 200))
+        || binding.generation < 0
+    {
+        return Err(Error::Invalid("invalid runtime turn binding"));
+    }
+    let mut tx = pool.begin().await?;
+    tenant_lock(&mut tx, who.tenant_id).await?;
+    let turn = turn_locked(&mut tx, who, id, true).await?;
+    if turn.session_id != binding.session_id
+        || turn.message_id != binding.message_id
+        || turn.run_id != binding.run_id
+        || turn.generation != binding.generation
+    {
+        return Err(Error::NotFound);
+    }
+    tx.commit().await?;
+    Ok(json!({
+        "id": turn.id,
+        "state": turn.state,
+        "session_id": turn.session_id,
+        "message_id": turn.message_id,
+        "run_id": turn.run_id,
+        "generation": turn.generation,
+        "expires_at": turn.expires_at,
+    }))
 }
 pub(crate) async fn turn_locked(
     tx: &mut Tx<'_>,

@@ -90,6 +90,6 @@ M5.4b 增加 [隔离 MP4 审阅与审批边界](docs/m5-isolated-media-review.md
 
 M5.5 增加 [逐节点任务与调用治理](docs/m5-node-call-governance.md)：独立 traces_read、轮次精确筛选、节点/调用/端点尝试/护栏/审批版本/持久事件下钻；业务与护栏请求分账，人民币费用不按节点重复累计，固定事件分页上界，撤权清理只读数据。未上报的运行时 DAG 不推断、审批不替代执行。
 
-M6.1a 增加 [Hermes 原生工具输入强制门](docs/m6-hermes-native-integration.md)：固定 Hermes 0.21.1/上游提交、最终参数改写后的唯一派发门、持久审批等待、AES-GCM claim 检查点、一次性执行与未知态防重派发。实现按宿主使用 Python，网关和治理事实仍由 Rust/PostgreSQL 提供。当前未安装到用户运行实例；工具输出/产物发布回执、受信 turn 注入、原生审批卡片和生产进程终止演练继续 M6.1b/LIVE-06/21。
+M6.1a/b 增加 [Hermes 原生工具输入强制门与 turn 绑定](docs/m6-hermes-native-integration.md)：固定 Hermes 0.21.1/上游提交的三文件 overlay 与启动完整性校验、BFF turn 与 Hermes 五个宿主身份的精确重验、最终参数改写后的唯一派发门、原生通道安全审阅链接、持久审批等待/通知去重、AES-GCM claim 检查点与未知态防重派发。实现按宿主使用 Python，网关和治理事实仍由 Rust/PostgreSQL 提供。当前未安装到用户运行实例；`tool_output`/`artifact` 隔离发布事务、工具矩阵与生产进程终止演练继续后续包/LIVE-06/21。
 
 2026-09-14 已完成 [阿里云北京 4 模型真实冒烟](docs/live-aliyun-2026-09-14.md)，并记录工具原样回传、Embedding 端点限制和账单核对待办；不据此宣称全部供应商模型或完整生产认证通过。

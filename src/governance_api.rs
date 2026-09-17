@@ -25,6 +25,7 @@ pub fn runtime_routes(gateway: Gateway) -> Router {
         .route("/v1/governance/operations/{id}/claim", post(claim))
         .route("/v1/governance/operations/{id}/receipt", post(receipt))
         .route("/v1/governance/turns/{id}/approvals", get(approvals))
+        .route("/v1/governance/turns/{id}/bind", post(bind_runtime_turn))
         .route("/v1/governance/turns/{id}/events", get(events))
         .route("/v1/governance/turns/{id}/ack", post(ack))
         .route("/v1/governance/turns/{id}/close", post(runtime_close))
@@ -92,6 +93,17 @@ async fn approvals(
     let who = api::identity(&g.pool, &headers).await?;
     Ok(Json(
         governance::approvals(&g.pool, &g.cipher, &who, id).await?,
+    ))
+}
+async fn bind_runtime_turn(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(body): Json<governance::RuntimeTurnBinding>,
+) -> Result<Json<Value>> {
+    let who = api::identity(&g.pool, &headers).await?;
+    Ok(Json(
+        governance::bind_runtime_turn(&g.pool, &who, id, body).await?,
     ))
 }
 #[derive(serde::Deserialize)]

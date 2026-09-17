@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strict, idempotent overlay installer for Hermes revision 67764dc.
+"""Strict, resumable overlay installer for one audited Hermes revision.
 
 The running container is never modified by this repository on its own. Operators build a
 new image, run this installer against its source tree, run the contract suite, and only then
@@ -15,10 +15,13 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from typing import Callable
 
 
 REVISION = "67764dc0863349a384c16425e73ee8571f3a94b7"
 TOOL_EXECUTOR_SHA256 = "1610a0893588cbc067aaf84b3d019a683cd83ba0fdb92d69baf4f7b9e6d121b9"
+RUN_TURN_SHA256 = "dd203228bdfb7f69f1442adf4e24cc7e3196fb348b096ab6e7c2cb2bd2af5214"
+RUN_TURN_RUNNER_SHA256 = "9bfa045616264e944b417ce3bfe0e302168c7b6d0218ceeb253b2dad2629e4ba"
 
 OLD = '''    if ref.name == "memory":
         agent._turns_since_memory = 0
@@ -61,6 +64,7 @@ NEW = '''    dispatch_started = False
             context_for_agent(agent, ref),
             _dispatch_now,
             status=lambda message: agent._emit_status(message),
+            approval=getattr(agent, "_brokerrouter_approval_callback", None),
         )
     except GovernanceHalt as governance_halt:
         if not dispatch_started:
@@ -84,19 +88,159 @@ NEW = '''    dispatch_started = False
         )
 '''
 
+RUN_TURN_REPLACEMENTS = (
+    (
+        '''            event._heartbeat_execution_started = True
+            agent_result = await self._run_agent(
+''',
+        '''            event._heartbeat_execution_started = True
+            _event_metadata = getattr(event, "metadata", None)
+            _brokerrouter_turn_binding = (
+                _event_metadata.get("brokerrouter_turn")
+                if isinstance(_event_metadata, dict) else None
+            )
+            agent_result = await self._run_agent(
+''',
+    ),
+    (
+        '''                persist_user_display_metadata={"gateway_input_owner": prepared.persistence_owner},
+                message_type=event.message_type,
+''',
+        '''                persist_user_display_metadata={"gateway_input_owner": prepared.persistence_owner},
+                message_type=event.message_type,
+                brokerrouter_turn_binding=_brokerrouter_turn_binding,
+''',
+    ),
+    (
+        '''        # The one-slot progress/holder containers shared with the callbacks are TurnContext defaults.
+        turn_ctx = TurnContext(
+''',
+        '''        # Governance metadata is not a TurnContext schema field. Remove it before the fixed
+        # dataclass constructor and attach it as host-only state for the audited runner hook.
+        brokerrouter_turn_binding = turn_params.pop("brokerrouter_turn_binding", None)
+        # The one-slot progress/holder containers shared with the callbacks are TurnContext defaults.
+        turn_ctx = TurnContext(
+''',
+    ),
+    (
+        '''            **{name: getattr(disp, name) for name in self._DISPLAY_TO_TURN_CTX}, **turn_params,
+        )
+        turn_runner = TurnRunner(self, turn_ctx)
+''',
+        '''            **{name: getattr(disp, name) for name in self._DISPLAY_TO_TURN_CTX}, **turn_params,
+        )
+        turn_ctx._brokerrouter_turn_binding = brokerrouter_turn_binding
+        turn_runner = TurnRunner(self, turn_ctx)
+''',
+    ),
+    (
+        '''        persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
+        persist_user_display_metadata: Optional[dict] = None,
+''',
+        '''        persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
+        persist_user_display_metadata: Optional[dict] = None,
+        brokerrouter_turn_binding: Optional[dict] = None,
+''',
+    ),
+    (
+        '''        if self._get_proxy_url():
+            return await self._run_agent_via_proxy(
+''',
+        '''        if self._get_proxy_url():
+            # The remote proxy process cannot prove this local Hermes turn identity. A governed
+            # deployment must use the in-process runner until the proxy has its own attestation.
+            from brokerrouter_hermes import reject_governed_proxy
+            reject_governed_proxy()
+            return await self._run_agent_via_proxy(
+''',
+    ),
+    (
+        '''            persist_user_display_kind=persist_user_display_kind,
+            persist_user_display_metadata=persist_user_display_metadata,
+        )
+''',
+        '''            persist_user_display_kind=persist_user_display_kind,
+            persist_user_display_metadata=persist_user_display_metadata,
+            brokerrouter_turn_binding=brokerrouter_turn_binding,
+        )
+''',
+    ),
+)
+
+RUN_TURN_RUNNER_REPLACEMENTS = (
+    (
+        '''# Log-record parity with the origin module.
+logger = logging.getLogger("gateway.run")
+''',
+        '''# Log-record parity with the origin module.
+logger = logging.getLogger("gateway.run")
+
+# A governed image must fail during Gateway import, before accepting a turn, if the
+# fixed host overlay or adapter package differs from the build-time manifest.
+from brokerrouter_hermes import verify_runtime_installation
+verify_runtime_installation()
+''',
+    ),
+    (
+        '''        ctx.tools_holder[0] = getattr(agent, "tools", None)  # transcript logging
+''',
+        '''        ctx.tools_holder[0] = getattr(agent, "tools", None)  # transcript logging
+
+        # Bind the BFF-created turn before history loading or the first model/tool invocation.
+        # GovernanceHalt derives from BaseException so ordinary agent handlers cannot swallow it;
+        # at this outer boundary convert it to the host's sanitized turn failure path.
+        from brokerrouter_hermes import GovernanceHalt, bind_gateway_agent
+        try:
+            bind_gateway_agent(agent, ctx, self)
+        except GovernanceHalt as governance_halt:
+            raise RuntimeError(
+                f"Brokerrouter governance stopped turn: {governance_halt.code}"
+            ) from governance_halt
+''',
+    ),
+)
+
 
 def digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def patched_bytes(source: bytes) -> bytes:
+def _replace_exact(source: bytes, replacements: tuple[tuple[str, str], ...], name: str) -> bytes:
     try:
         text = source.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise RuntimeError("tool_executor.py is not UTF-8") from exc
-    if text.count(OLD) != 1:
-        raise RuntimeError("expected Hermes dispatch anchor exactly once")
-    return text.replace(OLD, NEW).encode("utf-8")
+        raise RuntimeError(f"{name} is not UTF-8") from exc
+    for old, new in replacements:
+        if text.count(old) != 1:
+            raise RuntimeError(f"expected {name} patch anchor exactly once")
+        text = text.replace(old, new)
+    return text.encode("utf-8")
+
+
+def patched_bytes(source: bytes) -> bytes:
+    """Backwards-compatible name for the tool executor patch contract."""
+    return _replace_exact(source, ((OLD, NEW),), "agent/tool_executor.py")
+
+
+def patched_run_turn_bytes(source: bytes) -> bytes:
+    return _replace_exact(source, RUN_TURN_REPLACEMENTS, "gateway/run_turn.py")
+
+
+def patched_run_turn_runner_bytes(source: bytes) -> bytes:
+    return _replace_exact(
+        source, RUN_TURN_RUNNER_REPLACEMENTS, "gateway/run_turn_runner.py"
+    )
+
+
+PATCHES: tuple[tuple[str, str, Callable[[bytes], bytes]], ...] = (
+    ("agent/tool_executor.py", TOOL_EXECUTOR_SHA256, patched_bytes),
+    ("gateway/run_turn.py", RUN_TURN_SHA256, patched_run_turn_bytes),
+    (
+        "gateway/run_turn_runner.py",
+        RUN_TURN_RUNNER_SHA256,
+        patched_run_turn_runner_bytes,
+    ),
+)
 
 
 def atomic_write(path: Path, value: bytes, mode: int) -> None:
@@ -130,44 +274,83 @@ def package_files() -> list[Path]:
     return files
 
 
-def inspect(root: Path) -> tuple[str, str, bytes, bytes]:
-    target = root / "agent" / "tool_executor.py"
+def _backup(root: Path, relative: str) -> Path:
+    return root / f"{relative}.brokerrouter-{REVISION[:12]}.bak"
+
+
+def _inspect_file(
+    root: Path, relative: str, original_hash: str, patcher: Callable[[bytes], bytes]
+) -> dict[str, object]:
+    target = root / relative
     if root.is_symlink() or target.is_symlink() or not target.is_file():
-        raise RuntimeError("Hermes root/tool_executor.py must be regular non-symlink paths")
+        raise RuntimeError(f"Hermes root/{relative} must be regular non-symlink paths")
     current = target.read_bytes()
     current_hash = digest(current)
-    if current_hash == TOOL_EXECUTOR_SHA256:
-        expected = patched_bytes(current)
-        return "compatible_unpatched", current_hash, current, expected
-    backup = root / f"agent/tool_executor.py.brokerrouter-{REVISION[:12]}.bak"
-    if not backup.is_file() or digest(backup.read_bytes()) != TOOL_EXECUTOR_SHA256:
-        raise RuntimeError("Hermes tool executor is neither the fixed baseline nor an audited installation")
-    expected = patched_bytes(backup.read_bytes())
-    if current_hash != digest(expected):
-        raise RuntimeError("installed Hermes tool executor drifted from the audited patch")
-    return "installed", current_hash, backup.read_bytes(), expected
+    backup = _backup(root, relative)
+    if current_hash == original_hash:
+        original = current
+        state = "compatible_unpatched"
+    else:
+        if backup.is_symlink() or not backup.is_file():
+            raise RuntimeError(f"Hermes {relative} is neither the fixed baseline nor an audited installation")
+        original = backup.read_bytes()
+        if digest(original) != original_hash:
+            raise RuntimeError(f"Hermes {relative} backup does not match the fixed baseline")
+        state = "installed"
+    expected = patcher(original)
+    if state == "installed" and current_hash != digest(expected):
+        raise RuntimeError(f"installed Hermes {relative} drifted from the audited patch")
+    return {
+        "relative": relative,
+        "state": state,
+        "current_sha256": current_hash,
+        "original_sha256": original_hash,
+        "patched_sha256": digest(expected),
+        "original": original,
+        "expected": expected,
+    }
+
+
+def inspect(root: Path) -> tuple[str, list[dict[str, object]]]:
+    files = [_inspect_file(root, *spec) for spec in PATCHES]
+    states = {item["state"] for item in files}
+    if states == {"installed"}:
+        state = "installed"
+    elif states == {"compatible_unpatched"}:
+        state = "compatible_unpatched"
+    else:
+        state = "partially_installed"
+    return state, files
 
 
 def apply(root: Path) -> dict[str, object]:
-    state, current_hash, original, expected = inspect(root)
-    target = root / "agent" / "tool_executor.py"
-    backup = root / f"agent/tool_executor.py.brokerrouter-{REVISION[:12]}.bak"
-    if state == "compatible_unpatched":
-        atomic_write(backup, original, 0o644)
-        atomic_write(target, expected, 0o644)
+    _, files = inspect(root)
+    for item in files:
+        relative = str(item["relative"])
+        if item["state"] == "compatible_unpatched":
+            atomic_write(_backup(root, relative), item["original"], 0o644)
+            atomic_write(root / relative, item["expected"], 0o644)
 
-    destination = root / "brokerrouter_hermes"
     for source in package_files():
         relative = source.relative_to(source.parents[1])
         atomic_write(root / relative, source.read_bytes(), 0o644)
 
+    final_state, final_files = inspect(root)
+    if final_state != "installed":
+        raise RuntimeError("post-install host verification failed")
     manifest = {
-        "schema": 1,
+        "schema": 2,
         "hermes_revision": REVISION,
-        "tool_executor_original_sha256": TOOL_EXECUTOR_SHA256,
-        "tool_executor_patched_sha256": digest(expected),
+        "host_files": {
+            str(item["relative"]): {
+                "original_sha256": item["original_sha256"],
+                "patched_sha256": item["patched_sha256"],
+            }
+            for item in final_files
+        },
         "adapter_files": {
-            str(path.relative_to(path.parents[1])): digest(path.read_bytes()) for path in package_files()
+            str(path.relative_to(path.parents[1])): digest(path.read_bytes())
+            for path in package_files()
         },
     }
     atomic_write(
@@ -175,10 +358,11 @@ def apply(root: Path) -> dict[str, object]:
         (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode("utf-8"),
         0o644,
     )
-    final_state, final_hash, _, _ = inspect(root)
-    if final_state != "installed" or final_hash != manifest["tool_executor_patched_sha256"]:
-        raise RuntimeError("post-install verification failed")
     return manifest
+
+
+def _public_file(item: dict[str, object]) -> dict[str, object]:
+    return {key: value for key, value in item.items() if key not in {"original", "expected"}}
 
 
 def main() -> int:
@@ -190,12 +374,11 @@ def main() -> int:
     if args.apply:
         result: object = apply(root)
     else:
-        state, current_hash, _, expected = inspect(root)
+        state, files = inspect(root)
         result = {
             "state": state,
             "hermes_revision": REVISION,
-            "current_sha256": current_hash,
-            "patched_sha256": digest(expected),
+            "host_files": [_public_file(item) for item in files],
         }
     print(json.dumps(result, sort_keys=True))
     return 0

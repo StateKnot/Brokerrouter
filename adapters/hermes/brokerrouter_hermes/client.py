@@ -77,6 +77,10 @@ class GovernanceClient:
     def check(self, body: dict[str, Any]) -> dict[str, Any]:
         return self._transport.request("POST", "/v1/governance/checks", body)
 
+    def bind_turn(self, turn_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        path = f"/v1/governance/turns/{quote(turn_id, safe='')}/bind"
+        return self._transport.request("POST", path, body)
+
     def claim(self, operation_id: str, token: str, payload_hash: str) -> dict[str, Any]:
         path = f"/v1/governance/operations/{quote(operation_id, safe='')}/claim"
         return self._transport.request("POST", path, {"token": token, "payload_hash": payload_hash})

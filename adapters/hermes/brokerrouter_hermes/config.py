@@ -24,6 +24,7 @@ def _bounded_float(env: dict[str, str], name: str, default: float, low: float, h
 @dataclass(frozen=True)
 class Config:
     base_url: str
+    approvals_url: str
     virtual_key: str = field(repr=False)
     state_db: Path
     state_key: bytes = field(repr=False)
@@ -44,6 +45,7 @@ class Config:
             name: values.get(name, "").strip()
             for name in (
                 "BROKERROUTER_BASE_URL",
+                "BROKERROUTER_HERMES_APPROVALS_URL",
                 "BROKERROUTER_VIRTUAL_KEY",
                 "BROKERROUTER_HERMES_STATE_DB",
                 "BROKERROUTER_HERMES_STATE_KEY",
@@ -66,6 +68,21 @@ class Config:
             or url.fragment
         ):
             raise ConfigurationError("Brokerrouter URL must be HTTPS without credentials/query/fragment")
+        approvals = urlsplit(required["BROKERROUTER_HERMES_APPROVALS_URL"])
+        approvals_loopback = approvals.hostname in {"127.0.0.1", "::1", "localhost"}
+        if (
+            approvals.scheme
+            not in ({"https"} | ({"http"} if allow_http and approvals_loopback else set()))
+            or not approvals.hostname
+            or approvals.username
+            or approvals.password
+            or approvals.path not in {"", "/"}
+            or approvals.query
+            or approvals.fragment
+        ):
+            raise ConfigurationError(
+                "Brokerrouter approvals URL must be an HTTPS origin without credentials/query/fragment"
+            )
         virtual_key = required["BROKERROUTER_VIRTUAL_KEY"]
         if (
             not virtual_key.startswith("sk_br_")
@@ -86,6 +103,7 @@ class Config:
 
         return cls(
             base_url=required["BROKERROUTER_BASE_URL"].rstrip("/"),
+            approvals_url=required["BROKERROUTER_HERMES_APPROVALS_URL"].rstrip("/"),
             virtual_key=required["BROKERROUTER_VIRTUAL_KEY"],
             state_db=state_db,
             state_key=key,

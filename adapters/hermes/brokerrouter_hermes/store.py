@@ -12,7 +12,7 @@ from typing import Iterator
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 STATES = frozenset(
     {
         "staged",
@@ -102,7 +102,7 @@ class CheckpointStore:
     def _migrate(self) -> None:
         with self._connection(write=True) as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, SCHEMA_VERSION):
+            if version not in (0, 1, SCHEMA_VERSION):
                 raise CheckpointConflict("unsupported checkpoint schema version")
             connection.execute(
                 """
@@ -125,6 +125,18 @@ class CheckpointStore:
                         'dispatch_authorized','dispatching','effect_recorded','completed',
                         'claim_unknown','execution_unknown','rejected'
                     ))
+                ) STRICT
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS brokerrouter_approval_notices (
+                    operation_key TEXT PRIMARY KEY REFERENCES brokerrouter_checkpoints(operation_key) ON DELETE CASCADE,
+                    approval_id TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('pending','sending','sent')),
+                    lease_until INTEGER,
+                    updated_at INTEGER NOT NULL,
+                    CHECK(length(approval_id) BETWEEN 1 AND 100)
                 ) STRICT
                 """
             )
@@ -237,3 +249,44 @@ class CheckpointStore:
         checkpoint = self.load(operation_key)
         assert checkpoint is not None
         return checkpoint
+
+    def reserve_approval_notice(self, operation_key: str, approval_id: str) -> bool:
+        now = time.time_ns()
+        lease_until = now + 30_000_000_000
+        with self._connection(write=True) as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO brokerrouter_approval_notices(operation_key,approval_id,state,updated_at) VALUES(?,?,'pending',?)",
+                (operation_key, approval_id, now),
+            )
+            row = connection.execute(
+                "SELECT approval_id FROM brokerrouter_approval_notices WHERE operation_key=?",
+                (operation_key,),
+            ).fetchone()
+            if row is None:
+                raise CheckpointConflict("approval notice was not staged")
+            if row[0] != approval_id:
+                connection.execute(
+                    "UPDATE brokerrouter_approval_notices SET approval_id=?,state='pending',lease_until=NULL,updated_at=? WHERE operation_key=?",
+                    (approval_id, now, operation_key),
+                )
+            changed = connection.execute(
+                "UPDATE brokerrouter_approval_notices SET state='sending',lease_until=?,updated_at=? WHERE operation_key=? AND approval_id=? AND (state='pending' OR (state='sending' AND lease_until<?))",
+                (lease_until, now, operation_key, approval_id, now),
+            ).rowcount
+            return changed == 1
+
+    def complete_approval_notice(self, operation_key: str, approval_id: str) -> None:
+        with self._connection(write=True) as connection:
+            changed = connection.execute(
+                "UPDATE brokerrouter_approval_notices SET state='sent',lease_until=NULL,updated_at=? WHERE operation_key=? AND approval_id=? AND state='sending'",
+                (time.time_ns(), operation_key, approval_id),
+            ).rowcount
+            if changed != 1:
+                raise CheckpointConflict("approval notice completion changed concurrently")
+
+    def release_approval_notice(self, operation_key: str, approval_id: str) -> None:
+        with self._connection(write=True) as connection:
+            connection.execute(
+                "UPDATE brokerrouter_approval_notices SET state='pending',lease_until=NULL,updated_at=? WHERE operation_key=? AND approval_id=? AND state='sending'",
+                (time.time_ns(), operation_key, approval_id),
+            )
