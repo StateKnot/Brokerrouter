@@ -1,10 +1,10 @@
 # Hermes 原生治理接入：已核验边界与实施顺序
 
-状态：2026-09-16 完成用户本地 Docker 源码只读核查；**适配器尚未实现/安装，未恢复或执行真实用户任务**。目标上游为用户指定的 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)。这是一份依据实际宿主源码制定的实施门禁，不是已完成的认证声明。
+状态：2026-09-17 完成 M6.1a 工具输入强制门、加密持久检查点与一次性 claim 适配器；**未安装到用户运行实例，工具输出/产物发布闭环和生产恢复认证仍未完成**。目标上游为用户指定的 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)。实现位于 `adapters/hermes`，当前结论只覆盖下文明确范围，不是整套原生治理已通过生产认证的声明。
 
 ## 固定目标
 
-本地源码 `/opt/hermes` 的包元数据版本 `0.21.1`，镜像内容 ID `sha256:01fbb06434eedb07908e14218c27a4e6147b6a84af2b2191025c8aa18b557cfa`。镜像没有 `.git`，不能把版本号当成上游 commit；上线前需取得对应镜像构建来源/提交、可重建锁文件及变更列表，或用正式固定构建替换候选。未读取环境变量、数据挂载内容、密钥和用户会话，也未修改/重启容器。
+当前本地源码 `/opt/hermes` 的包元数据版本为 `0.21.1`，容器 `d5dd6c405e54` 的镜像内容 ID 为 `sha256:59e5509d41aee6a1e86724e990c376463dba01968d53127e8cd20df74952f8b0`，OCI revision 为 `67764dc0863349a384c16425e73ee8571f3a94b7`。该提交可在上游仓库解析，三个关键文件与上游固定提交逐字节 SHA-256 一致。未读取环境变量、数据挂载内容、密钥和用户会话，也未修改、重启或热补丁当前容器。
 
 实际读取的关键代码摘要（SHA-256）：
 
@@ -14,6 +14,17 @@
 | `agent/turn_tool_round.py` | `3e6cf5c94125dd75e2fb95cda6fe218a456187d9385a2a8005aa2f3276442d57` |
 | `gateway/hooks.py` | `1baa2219a5c233891066be2149c5e89d98ef2b2a38bd006b3b53db7a6d53ad0b` |
 
+## M6.1a 已实现范围
+
+- 严格 overlay 安装器只接受上述 `tool_executor.py` 摘要和唯一派发锚点，原子生成备份、补丁和文件摘要清单；源码漂移、锚点变化或安装后改写均拒绝。要求构建新镜像，不支持对运行容器热修补。
+- 强制门位于 Relay/执行 middleware、普通插件参数改写、scope 与 Hermes 本地 guardrail 之后，`_begin_tool_execution` 和真实 `execute` 之前。普通 hook fail-open 不会绕过此入口；治理模式缺配置、适配器导入/数据库错误转为 Hermes 结构化 `halt`，不会落到真实派发。
+- 最终参数通过 HTTPS 发送到现有 `/v1/governance/checks`。`checking`/`waiting_approval` 保持同一个 turn、operation key 和参数摘要，线程持久等待并重查；用户批准后仍由网关重新检查 Key、绑定、turn、策略和 grant。
+- 本地 SQLite 检查点启用 WAL、`synchronous=FULL`、`0600` 和 5 秒锁等待；只保存不可逆身份/参数摘要、网关 operation ID、状态与 AES-256-GCM 加密 claim token，不保存原始工具参数或结果。目录必须禁止组/全局写入。
+- `ready` 后先提交随机 256-bit claim token，只有首个 `dispatch_authorized=true` 进入工具。claim 响应丢失、授权后重启、工具异常转 `execution_unknown`；工具已返回但回执失败保留 `effect_recorded`，重启只补回执且不重派发，也不伪造丢失结果。
+- 本地无网络临时 Hermes 镜像完成 15 项合约：固定源码安装/漂移拒绝、最终改写参数强制门、结构化停止、批准恢复、加密落盘、4xx 立即停止、claim 丢响应、授权后重启、工具异常、回执丢失及不重复派发。没有模型调用或付费请求。
+
+M6.1a 暂停发生在原工具 worker 内，因此同一存活进程可在批准后继续原调用；重启后相同 tool call 可恢复检查，但任何已取得执行权的崩溃窗口一律进入 unknown。当前尚未把 `tool_output`/`artifact` 的准入与 Hermes 会话结果落盘做成同一发布回执，也未把受信 Brokerrouter turn 注入和审批卡片接到实际 Gateway 通道。这些属于 M6.1b，不得用本包测试宣称输入输出全闭环。
+
 ## 不可直接套用的机制
 
 1. `agent/tool_executor.py::_pre_tool_block` 捕获插件异常后返回允许路径；文档亦明确 hook failures never block。普通 pre_tool_call 插件不是强制治理入口。插件缺失、导入失败、网关超时都必须禁止新派发，而非靠插件自行“尽量返回 block”。
@@ -22,11 +33,11 @@
 4. `_dispatch_authorized_once` 是实际 dispatch 边界；`_flush_session_db_after_tool_progress` 在工具返回后持久化，再发送完成回调。执行副作用到结果落盘之间仍有崩溃窗口，不能把没有结果当成没执行并重跑。
 5. `gateway/hooks.py` 生命周期通知异常不会中断宿主；可用于观察，不能当作安全门禁。文件 checkpoint 与工具副作用检查点不是同一概念。
 
-## M6.1 实施包（顺序不可交换）
+## M6.1 后续实施顺序（顺序不可交换）
 
-1. 固定宿主构建与强制执行门：对已核对源文件打最小可审计宿主补丁/受信 middleware；启动检查版本、摘要、适配器注册完整性。覆盖串行/并行、委派、MCP、内联工具和异步工具路径；缺任何强制路径即不以治理模式启动。不注入线上运行容器，先独立零成本测试镜像。
-2. 以 Python 实现 Hermes 宿主适配（保持网关 Rust）：复用其持久会话库，独立迁移保存 turn、generation、native session/run/tool_call ID、最终参数摘要、加密检查点、pending approval、claim token、receipt/outbox。checkpoint 提交先于 UI 暂停提示与网关 ack；禁止原始参数进入通用日志。
-3. 将 pending/checking 作为可恢复的暂停状态，不伪造成普通失败 tool message 后继续规划。停止后续依赖节点；并行已派发节点继续独立记账/回执，不假装撤销。原生界面只展示批准/拒绝/意见意图，由受信真人通道验证本人身份、短期审阅和精确快照；Agent/插件不持有审批签名密钥。
+1. 将 M6.1a overlay 固定到可重建 Hermes 镜像 digest，并在进程启动时校验安装清单；补齐串行、并行、委派、MCP、内联工具和异步工具的实际零费用工具矩阵。缺任何强制路径即不以治理模式启动。
+2. 由 Hermes Gateway 受信入口绑定 `agent._brokerrouter_turn_id`，不能从模型、普通插件、工具参数或全局环境变量接受 turn；接入本人审批卡片和安全审阅链接，Agent/插件不持有审批签名密钥。
+3. 将 `tool_output`/`artifact` 检查、claim 与 Hermes 会话结果持久化组成发布事务边界。pending/checking 不伪造成普通失败 tool message；并行已派发节点独立记账/回执，不假装撤销。
 4. 用户决定后通过持久事件驱动原检查重放，重验用户、Key、绑定、turn/代次、模型硬权限和最新策略；同一轮只跳过选中的护栏版本。反馈关闭旧代次并新建受信轮次，不原地修改待执行参数。
 5. claim token 先落盘；仅首次 `dispatch_authorized=true` 可派发。claim 响应丢失、进程崩溃或副作用回执缺失均进入 unknown，要求外部证据/幂等查询或人工核对；重复 claim 返回 false 不重派发。工具输出与产物另外检查，批准输入不等于批准输出。
 6. 原生模型调用必须保留请求幂等键/turn，409/checking/approval_required 不可落入 SDK 自动模型回退或换 ID 重试。非流式能力先闭环；当前网关尚未实现 SSE/Responses，不对客户端谎称兼容。
