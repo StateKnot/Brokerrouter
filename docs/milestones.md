@@ -1,6 +1,6 @@
 # 开发里程碑
 
-更新日期：2026-09-16。主语言 Rust。里程碑是生产方案的开发顺序，每个发布能力必须完成对应验收，不能把本地 fixture 当作供应商认证。
+更新日期：2026-09-18。主语言 Rust。里程碑是生产方案的开发顺序，每个发布能力必须完成对应验收，不能把本地 fixture 当作供应商认证。
 
 | 里程碑 | 范围 | 验收闸门 | 状态 |
 | --- | --- | --- | --- |
@@ -10,7 +10,7 @@
 | M3 护栏与用户审批 | 用户身份与 Agent 分离、turn 权威生命周期、持久审批、输出隔离、当前 turn 豁免、恢复协议 | 代批失败、重复决定原子、迟到批准失效、重启不重复副作用 | 核心及文本语义连接器已实现；多模态/专用审核适配、检测质量与真实 BFF/Runtime 认证待完成 |
 | M4 多模态作业与资产 | 同步图像/异步视频/3D、连接器配置、持久 worker、提交不确定、私有资产、回调 | 接收后断线不重提、转存恢复、取消竞态、跨租户资产访问拒绝 | 资产/计费、文生视频作业、隔离转存、扫描与技术检测、资产策略及真人审批交付、隔离 MP4 预览已实现；专用内容语义、其他模态预览、图片/3D/其他协议待开发，生产认证待完成 |
 | M5 控制台与治理 | TypeScript 控制台、OIDC、模型/端点、策略/护栏、汇率、人民币统计、任务审计、经验/评测样本 | 页面使用真实 API；各维度账本一致；权限矩阵与审批审计 | 报表、OIDC BFF、配置管理、护栏监控、本人 JSON/隔离 MP4 审阅审批、逐轮次节点/调用/事件治理与 HTTPS edge 已实现；其他模态预览、经验候选/评测样本和其余统计维度待开发，真实 IdP/整链路/部署待认证 |
-| M6 Runtime 与生产认证 | Hermes Python / OpenClaw TypeScript Adapter、通道认证、压测、故障演练、部署与回滚 | 指定版本完整调用/审批/恢复；容量、RPO/RTO、凭据与真实费用边界达标 | Hermes 0.21.1 M6.1a/b 已实现工具输入强制门、受信 turn 绑定与原生审批通知；输出/产物隔离发布、真实部署恢复认证和 OpenClaw 待完成 |
+| M6 Runtime、MCP 与生产认证 | Hermes Python / OpenClaw TypeScript Adapter、MCP 2026-07-28/Skills、通道认证、压测、故障演练、部署与回滚 | 指定版本完整调用/审批/恢复；MCP 官方 client/server 一致性；容量、RPO/RTO、凭据与真实费用边界达标 | Hermes 0.21.1 M6.1a/b 已实现工具输入强制门、受信 turn 绑定与原生审批通知；M6.2a 已完成 MCP/Skills 评审和 Skill 安全内核，wire/OAuth/MRTR/持久审批/官方认证、输出/产物发布、OpenClaw 仍待完成 |
 
 ## v0.3 已决定的实施契约
 
@@ -330,3 +330,13 @@ Key 配置版本不会因消费变化抖动，但更新仍锁定实时预留/消
 Rust 常规全量 **197 项通过**，4 项需 MinIO/固定 ClamAV/FFmpeg 环境的专项本地按既有闸门 ignored；`cargo fmt` 与 Clippy `-D warnings` 通过。首次全量命令因上一个被界面超时截断但仍留在后台的测试进程，与第二次 SQLx 同名临时库冲突；残留进程结束后单独复跑受影响的 outputs 42 项及后续 settings/pricing 19 项全部通过，失败中没有代码断言错误。
 
 下一包必须完成 `tool_output`/`artifact` 与 Hermes 会话持久化之间的隔离两阶段发布，不用路径 metadata 或“工具已返回”伪装安全发布。受管镜像部署、真实进程逐点终止/多实例/工具矩阵和 OpenClaw 仍由 LIVE-06/21 阻断。
+
+## M6.2a：MCP 2026-07-28 与 Skills 安全基础
+
+2026-09-18 对照最新稳定核心协议、Streamable HTTP、Authorization、`server/discover`、官方 Skills 扩展和 Agent Skills 格式完成差异评审。结论是现有 OpenAI 兼容模型网关不符合 MCP：没有 MCP client/server、逐请求元数据、无状态 HTTP、OAuth、MRTR、发现和 Skills wire 方法；已有逐节点治理、真人审批和审计只能作为上层机制复用。
+
+本包新增 [MCP/Skills 接入契约](m6-mcp-2026-skills.md) 和 Rust 安全内核：静态完整 manifest、512 文件/16 MiB、领域 URI、来源绑定身份、按需 size/SHA-256/frontmatter 校验、跨源同名冲突、动态 Skill 默认拒绝以及绑定完整资源集合的审批指纹。核心协议后续固定复用当前官方 `rmcp 3.4.0`，不自研另一套状态机。
+
+未完成边界：本包不开放 `/mcp`，不注册上游 MCP server，不读取远端 Skill，不持久化批准，也未运行官方一致性套件。M6.2b–d 将依次完成连接/能力目录、Skill 注册和审批/隔离缓存、MRTR 与 Runtime 恢复认证；以上完成前不能宣传 MCP 或 Skills 兼容。
+
+本地新增 7 项 MCP/Skills 单元测试通过；隔离 PostgreSQL 全量回归与最后的 MCP/Skills 复验合计覆盖 204 项唯一常规用例，全部通过、0 失败；4 项既有 MinIO/固定 ClamAV/FFmpeg 专项按 CI 规则保持 ignored。fmt、Clippy `-D warnings` 和 release 构建通过。没有连接外部 MCP server、调用模型或产生供应商费用；正式 PR 仍须由 CI 执行全部固定专项。
