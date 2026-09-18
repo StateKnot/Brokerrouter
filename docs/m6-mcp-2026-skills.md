@@ -1,6 +1,6 @@
 # MCP 2026-07-28 与 Skills 接入契约
 
-状态：2026-09-18 完成 M6.2a 的协议评审与 Skills 安全契约。本包**没有开放 MCP 端点，也不宣称 Brokerrouter 已兼容 MCP**。上线声明必须等 M6.2b–d 完成并通过官方一致性套件。
+状态：2026-09-18 完成 M6.2a 的协议评审与 Skills 安全契约，并完成 [M6.2b1 连接与能力目录](m6-mcp-connection-catalog.md)。当前**没有开放 MCP 端点，也不宣称 Brokerrouter 已兼容 MCP**。上线声明必须等 M6.2b2–d 完成并通过官方一致性套件。
 
 ## 规范基线
 
@@ -13,7 +13,7 @@
 - [Skills 扩展](https://modelcontextprotocol.io/extensions/skills/overview)，扩展标识 `io.modelcontextprotocol/skills`；格式遵循 [Agent Skills](https://agentskills.io/specification)。
 - [官方 Rust SDK](https://github.com/modelcontextprotocol/rust-sdk) `rmcp 3.4.0` 与 [官方一致性套件](https://github.com/modelcontextprotocol/conformance)。
 
-核心传输、MRTR、OAuth 和标准头在 M6.2b 固定采用当前发布版 `rmcp 3.4.0`，不在 Brokerrouter 内复制协议状态机。Skills 扩展在官方 SDK 提供同等能力前由本仓库实现扩展类型和安全门；升级 SDK 时必须检查其 Skills 支持并删除重复代码。
+核心传输、MRTR、OAuth 和标准头在 M6.2b2 固定采用当前发布版 `rmcp 3.4.0`，不在 Brokerrouter 内复制协议状态机。Skills 扩展在官方 SDK 提供同等能力前由本仓库实现扩展类型和安全门；升级 SDK 时必须检查其 Skills 支持并删除重复代码。
 
 ## 现状结论
 
@@ -25,7 +25,7 @@
 | 无状态 Streamable HTTP `/mcp`、Origin/Accept/标准头校验 | 未实现 | 未实现 |
 | OAuth 2.1 资源服务器/客户端、issuer/resource/audience 绑定 | 未实现 | 未实现 |
 | MRTR `input_required` 暂停与恢复 | 只有 Brokerrouter 自有审批协议 | 未实现协议映射 |
-| 上游 MCP server 注册、宿主分配身份和能力快照 | 未实现 | 设计已固定，持久化待 M6.2b |
+| 上游 MCP server 注册、宿主分配身份和能力快照 | 未实现 | M6.2b1 已持久化；实际发现连接待 b2 |
 | `skills/list`、`skills/get`、`resources/read` | 未实现 | wire 方法未实现 |
 | 完整 manifest、512 文件/16 MiB、逐文件 size/SHA-256 | 未实现 | 内部校验已实现 |
 | `(host server id, URI)` 身份与名称冲突隔离 | 未实现 | 内部身份/冲突检测已实现 |
@@ -64,8 +64,8 @@ M6.2a 的 `src/mcp.rs` 固定以下不变量：
 
 ### M6.2b：MCP 连接与能力目录
 
+- b1 已完成租户连接注册、HTTPS/stdio profile、宿主身份、加密 credential reference、OAuth 三元绑定、revision 和不可变能力快照；详见 [连接目录契约](m6-mcp-connection-catalog.md)。
 - 固定 `rmcp 3.4.0` 实现 2026-07-28 双向 client/server，显式选择该协议版本；版本升级必须重新跑一致性与安全回归。
-- 增加租户级 MCP server 注册、HTTPS/stdio 类型、宿主分配身份、加密 credential reference、固定 issuer/resource/audience、能力与缓存快照。
 - 暴露单一 `/mcp` POST；拒绝不可信 Origin、缺失/不匹配标准头、旧 session 语义和非允许协议版本。
 - 实现 `server/discover`，客户端和服务器 core 一致性测试必须全部通过。
 

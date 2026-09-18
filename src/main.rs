@@ -229,6 +229,16 @@ enum Command {
         #[arg(long)]
         name: String,
     },
+    McpServerRegister {
+        /// JSON `mcp_catalog::RegisterServer`; contains only a secret reference.
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+    McpServerUpdate {
+        /// JSON `mcp_catalog::UpdateServer`; contains only a secret reference.
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
     KeyCreate {
         #[arg(long)]
         tenant: Uuid,
@@ -580,6 +590,32 @@ async fn main() -> anyhow::Result<()> {
             "{}",
             brokerrouter::human::add_user(&pool, tenant, &issuer, &subject).await?
         ),
+        Command::McpServerRegister { file } => {
+            brokerrouter::check_schema(&pool).await?;
+            let input = serde_json::from_str(&std::fs::read_to_string(file)?)?;
+            println!(
+                "{}",
+                brokerrouter::mcp_catalog::register_server(
+                    &pool,
+                    &brokerrouter::cipher::ResultCipher::from_mcp_env()?,
+                    input,
+                )
+                .await?
+            );
+        }
+        Command::McpServerUpdate { file } => {
+            brokerrouter::check_schema(&pool).await?;
+            let input = serde_json::from_str(&std::fs::read_to_string(file)?)?;
+            println!(
+                "{}",
+                brokerrouter::mcp_catalog::update_server(
+                    &pool,
+                    &brokerrouter::cipher::ResultCipher::from_mcp_env()?,
+                    input,
+                )
+                .await?
+            );
+        }
         Command::RuntimeBind {
             tenant,
             key,

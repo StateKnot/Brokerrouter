@@ -10,7 +10,7 @@
 | M3 护栏与用户审批 | 用户身份与 Agent 分离、turn 权威生命周期、持久审批、输出隔离、当前 turn 豁免、恢复协议 | 代批失败、重复决定原子、迟到批准失效、重启不重复副作用 | 核心及文本语义连接器已实现；多模态/专用审核适配、检测质量与真实 BFF/Runtime 认证待完成 |
 | M4 多模态作业与资产 | 同步图像/异步视频/3D、连接器配置、持久 worker、提交不确定、私有资产、回调 | 接收后断线不重提、转存恢复、取消竞态、跨租户资产访问拒绝 | 资产/计费、文生视频作业、隔离转存、扫描与技术检测、资产策略及真人审批交付、隔离 MP4 预览已实现；专用内容语义、其他模态预览、图片/3D/其他协议待开发，生产认证待完成 |
 | M5 控制台与治理 | TypeScript 控制台、OIDC、模型/端点、策略/护栏、汇率、人民币统计、任务审计、经验/评测样本 | 页面使用真实 API；各维度账本一致；权限矩阵与审批审计 | 报表、OIDC BFF、配置管理、护栏监控、本人 JSON/隔离 MP4 审阅审批、逐轮次节点/调用/事件治理与 HTTPS edge 已实现；其他模态预览、经验候选/评测样本和其余统计维度待开发，真实 IdP/整链路/部署待认证 |
-| M6 Runtime、MCP 与生产认证 | Hermes Python / OpenClaw TypeScript Adapter、MCP 2026-07-28/Skills、通道认证、压测、故障演练、部署与回滚 | 指定版本完整调用/审批/恢复；MCP 官方 client/server 一致性；容量、RPO/RTO、凭据与真实费用边界达标 | Hermes 0.21.1 M6.1a/b 已实现工具输入强制门、受信 turn 绑定与原生审批通知；M6.2a 已完成 MCP/Skills 评审和 Skill 安全内核，wire/OAuth/MRTR/持久审批/官方认证、输出/产物发布、OpenClaw 仍待完成 |
+| M6 Runtime、MCP 与生产认证 | Hermes Python / OpenClaw TypeScript Adapter、MCP 2026-07-28/Skills、通道认证、压测、故障演练、部署与回滚 | 指定版本完整调用/审批/恢复；MCP 官方 client/server 一致性；容量、RPO/RTO、凭据与真实费用边界达标 | Hermes 0.21.1 M6.1a/b 已实现工具输入强制门、受信 turn 绑定与原生审批通知；M6.2a 完成 MCP/Skills 安全内核，M6.2b1 完成连接与能力持久目录；wire/OAuth 网络流/MRTR/持久审批/官方认证、输出/产物发布、OpenClaw 仍待完成 |
 
 ## v0.3 已决定的实施契约
 
@@ -340,3 +340,15 @@ Rust 常规全量 **197 项通过**，4 项需 MinIO/固定 ClamAV/FFmpeg 环境
 未完成边界：本包不开放 `/mcp`，不注册上游 MCP server，不读取远端 Skill，不持久化批准，也未运行官方一致性套件。M6.2b–d 将依次完成连接/能力目录、Skill 注册和审批/隔离缓存、MRTR 与 Runtime 恢复认证；以上完成前不能宣传 MCP 或 Skills 兼容。
 
 本地新增 7 项 MCP/Skills 单元测试通过；隔离 PostgreSQL 全量回归与最后的 MCP/Skills 复验合计覆盖 204 项唯一常规用例，全部通过、0 失败；4 项既有 MinIO/固定 ClamAV/FFmpeg 专项按 CI 规则保持 ignored。fmt、Clippy `-D warnings` 和 release 构建通过。没有连接外部 MCP server、调用模型或产生供应商费用；正式 PR 仍须由 CI 执行全部固定专项。
+
+## M6.2b1：MCP 连接与能力持久目录
+
+2026-09-18，在 M6.2a 的身份与资源安全内核上完成 [连接目录契约](m6-mcp-connection-catalog.md) 和 0020 迁移。每个上游由 Brokerrouter 按租户分配不可变 UUID；Streamable HTTP 强制 HTTPS，stdio 只能引用部署 launcher profile，控制面不能注入命令。环境变量/Secret Manager credential reference 使用独立 MCP AES-256-GCM 密钥环加密并绑定 tenant/server，不保存实际 Secret。
+
+OAuth client credentials 配置固定 issuer/resource/audience 且 audience 必须等于规范化 resource。服务器先以 draft 注册，再通过乐观 revision 明确启用；更新与发现通过 server advisory lock 串行。`server/discover` 持久边界只接受 `2026-07-28`、`resultType=complete`、包含当前版本的能力结果，限制 JSON 大小/深度和 TTL；private cache 同时绑定实际解析认证上下文指纹，使引用不变时的 Token/Secret 轮换也失效，远端 serverInfo 仅保留为不可信展示字段。配置、发现、幂等回执和审计原子提交，旧 revision 快照不会用于新配置。
+
+部署新增互不继承的 `brokerrouter_mcp_catalog` 与 `brokerrouter_mcp_client` 角色：前者不能写发现或读取业务密钥/审批，后者不能更新连接或审批。CLI 增加 `mcp-server-register`/`mcp-server-update` 严格 JSON 入口，专用密钥环境变量已加入样例。
+
+新增 5 项 PostgreSQL 合约全部通过，覆盖并发幂等/冲突、跨租户、密文与 AAD、draft/启用/revision、OAuth 绑定、实际认证上下文变化、错误协议/resultType/传输/超限拒绝、cacheScope 分区、旧快照失效、stdio 路径逃逸、租户停用、审计故障回滚和真实受限角色正反权限。全量常规 Rust **209 项通过、0 失败**；4 项既有 MinIO/固定 ClamAV/FFmpeg 专项按本地闸门 ignored，必须由正式 CI 执行。fmt、Clippy `-D warnings` 和最终 release 全目标构建通过；正式 PR 状态以下方提交记录为准。
+
+未完成边界：本包没有增加未使用的 SDK 依赖，不进行网络发现，也不开放 `/mcp`。固定 `rmcp 3.4.0`、Secret resolver、OAuth metadata/token 校验、DNS/IP 固定、Streamable HTTP/stdio wire、Origin/标准头/SSE 和官方 client/server conformance 属于 M6.2b2；M6.2c–d 继续 Skill 持久审批、MRTR 与 Runtime 恢复认证。以上完成前仍不能宣传 MCP 兼容。

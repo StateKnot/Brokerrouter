@@ -51,6 +51,19 @@ impl ResultCipher {
             serde_json::from_str(&keys).map_err(|_| Error::Configuration)?,
         )
     }
+    /// Dedicated key ring for encrypted MCP credential references. Keeping it
+    /// separate from model results prevents a connector compromise from
+    /// becoming historical response decryption authority (and vice versa).
+    pub fn from_mcp_env() -> Result<Self> {
+        let active = std::env::var("BROKERROUTER_ACTIVE_MCP_CONFIG_KEY")
+            .map_err(|_| Error::Configuration)?;
+        let keys =
+            std::env::var("BROKERROUTER_MCP_CONFIG_KEYS").map_err(|_| Error::Configuration)?;
+        Self::new(
+            active,
+            serde_json::from_str(&keys).map_err(|_| Error::Configuration)?,
+        )
+    }
     pub fn encrypt(&self, tenant: Uuid, request: Uuid, plaintext: &[u8]) -> Result<Vec<u8>> {
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
         let mut envelope = vec![1, self.active.len() as u8];

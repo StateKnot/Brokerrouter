@@ -20,6 +20,7 @@ pub mod governance_settings;
 pub mod human;
 mod judge;
 pub mod mcp;
+pub mod mcp_catalog;
 pub mod media;
 pub mod media_api;
 pub mod media_protocol;
