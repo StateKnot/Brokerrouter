@@ -92,6 +92,8 @@ M5.5 增加 [逐节点任务与调用治理](docs/m5-node-call-governance.md)：
 
 M6.1a/b 增加 [Hermes 原生工具输入强制门与 turn 绑定](docs/m6-hermes-native-integration.md)：固定 Hermes 0.21.1/上游提交的三文件 overlay 与启动完整性校验、BFF turn 与 Hermes 五个宿主身份的精确重验、最终参数改写后的唯一派发门、原生通道安全审阅链接、持久审批等待/通知去重、AES-GCM claim 检查点与未知态防重派发。实现按宿主使用 Python，网关和治理事实仍由 Rust/PostgreSQL 提供。当前未安装到用户运行实例；`tool_output`/`artifact` 隔离发布事务、工具矩阵与生产进程终止演练继续后续包/LIVE-06/21。
 
-M6.2a 完成 [MCP 2026-07-28 与 Skills 兼容性评审及安全契约](docs/m6-mcp-2026-skills.md)：确认现有 OpenAI 兼容网关尚不符合 MCP wire 协议，新增静态 Skill manifest、来源身份、按需内容校验、名称冲突和内容绑定审批指纹内核。MCP 传输将在下一包固定复用当前官方 `rmcp 3.4.0`；`/mcp`、OAuth、MRTR、持久 Skill 审批与官方一致性套件仍属 M6.2b–d，当前不得宣称 MCP 兼容。
+M6.2a 完成 [MCP 2026-07-28 与 Skills 兼容性评审及安全契约](docs/m6-mcp-2026-skills.md)：确认现有 OpenAI 兼容网关尚不符合 MCP wire 协议，新增静态 Skill manifest、来源身份、按需内容校验、名称冲突和内容绑定审批指纹内核。MCP 传输将在 M6.2b2 固定复用当前官方 `rmcp 3.4.0`；`/mcp`、OAuth 网络流、MRTR、持久 Skill 审批与官方一致性套件仍属 M6.2b2–d，当前不得宣称 MCP 兼容。
+
+M6.2b1 完成 [MCP 连接与能力目录](docs/m6-mcp-connection-catalog.md)：租户隔离的宿主 UUID、HTTPS/stdio launcher profile、独立密钥环加密 credential reference、OAuth issuer/resource/audience 绑定、draft/revision、不可变 `server/discover` 能力快照和 catalog/client 数据库分权。该包不发送网络请求；`rmcp` wire、OAuth/Secret resolver、`/mcp` 与官方一致性仍由 M6.2b2 阻断。
 
 2026-09-14 已完成 [阿里云北京 4 模型真实冒烟](docs/live-aliyun-2026-09-14.md)，并记录工具原样回传、Embedding 端点限制和账单核对待办；不据此宣称全部供应商模型或完整生产认证通过。

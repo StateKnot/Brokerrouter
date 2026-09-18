@@ -273,4 +273,31 @@ CREATE POLICY brokerrouter_review_chunk_read ON asset_chunks FOR SELECT TO broke
 -- Decision service sees scan/receipt metadata for fresh revalidation, never asset chunks.
 GRANT SELECT ON media_review_completions,media_review_sessions,media_output_deliveries,output_scans,output_scan_profiles,assets TO brokerrouter_approvals;
 GRANT SELECT(model_id) ON requests TO brokerrouter_approvals;
+
+-- MCP configuration and network execution remain separate identities. The
+-- catalog role can change connection metadata but cannot invoke servers; the
+-- client role can discover active servers but cannot alter their identity.
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_mcp_catalog') THEN
+        CREATE ROLE brokerrouter_mcp_catalog NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_mcp_client') THEN
+        CREATE ROLE brokerrouter_mcp_client NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
+END $$;
+GRANT USAGE ON SCHEMA public TO brokerrouter_mcp_catalog,brokerrouter_mcp_client;
+GRANT SELECT ON _sqlx_migrations TO brokerrouter_mcp_catalog,brokerrouter_mcp_client;
+GRANT SELECT(id,active) ON tenants TO brokerrouter_mcp_catalog,brokerrouter_mcp_client;
+-- Harmless lock column enables SELECT ... FOR SHARE so tenant revocation is
+-- serialized with a catalog/discovery commit without granting state changes.
+GRANT UPDATE(governance_lock) ON tenants TO brokerrouter_mcp_catalog,brokerrouter_mcp_client;
+GRANT SELECT,INSERT ON mcp_catalog_mutations TO brokerrouter_mcp_catalog,brokerrouter_mcp_client;
+GRANT SELECT,INSERT ON mcp_discovery_snapshots TO brokerrouter_mcp_client;
+GRANT SELECT,INSERT ON mcp_servers TO brokerrouter_mcp_catalog;
+GRANT UPDATE(display_name,transport,endpoint_url,stdio_profile,allow_private,auth_mode,
+    credential_ref_kind,credential_ref_ciphertext,oauth_issuer,oauth_resource,oauth_audience,active)
+    ON mcp_servers TO brokerrouter_mcp_catalog;
+GRANT SELECT ON mcp_servers TO brokerrouter_mcp_client;
+GRANT INSERT ON audit_events TO brokerrouter_mcp_catalog,brokerrouter_mcp_client;
+GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_mcp_catalog,brokerrouter_mcp_client;
 COMMIT;
