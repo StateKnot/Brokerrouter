@@ -1,6 +1,6 @@
 # MCP 2026-07-28 与 Skills 接入契约
 
-状态：2026-09-18 完成 M6.2a 的协议评审与 Skills 安全契约，并完成 [M6.2b1 连接与能力目录](m6-mcp-connection-catalog.md)。当前**没有开放 MCP 端点，也不宣称 Brokerrouter 已兼容 MCP**。上线声明必须等 M6.2b2–d 完成并通过官方一致性套件。
+状态：2026-09-18 完成 M6.2a 的协议评审与 Skills 安全契约，随后完成 [M6.2b1 连接与能力目录](m6-mcp-connection-catalog.md)及 [M6.2b2a Streamable HTTP 上游发现](m6-mcp-http-discovery.md)。当前**没有开放下游 `/mcp`，也不宣称 Brokerrouter 已完整兼容 MCP**。上线声明必须等 M6.2b2b–d 完成并通过官方一致性套件。
 
 ## 规范基线
 
@@ -13,7 +13,7 @@
 - [Skills 扩展](https://modelcontextprotocol.io/extensions/skills/overview)，扩展标识 `io.modelcontextprotocol/skills`；格式遵循 [Agent Skills](https://agentskills.io/specification)。
 - [官方 Rust SDK](https://github.com/modelcontextprotocol/rust-sdk) `rmcp 3.4.0` 与 [官方一致性套件](https://github.com/modelcontextprotocol/conformance)。
 
-核心传输、MRTR、OAuth 和标准头在 M6.2b2 固定采用当前发布版 `rmcp 3.4.0`，不在 Brokerrouter 内复制协议状态机。Skills 扩展在官方 SDK 提供同等能力前由本仓库实现扩展类型和安全门；升级 SDK 时必须检查其 Skills 支持并删除重复代码。
+上游发现、OAuth 和标准头已在 M6.2b2a 固定采用当前发布版 `rmcp 3.4.0`，不在 Brokerrouter 内复制协议状态机。下游 server 与 MRTR 继续复用同一 SDK。Skills 扩展在官方 SDK 提供同等能力前由本仓库实现扩展类型和安全门；升级 SDK 时必须检查其 Skills 支持并删除重复代码。
 
 ## 现状结论
 
@@ -34,7 +34,7 @@
 | 动态 Skill、`allowed-tools`、嵌套和跨源读取安全门 | 未实现 | 动态 Skill 默认拒绝；工具授权被标记，执行门待 M6.2c |
 | 官方 core/client/server/extension 一致性测试 | 未执行 | 待真实端点完成后执行 |
 
-所以当前准确表述是：**已开始按最新协议建设，尚不符合 MCP wire 协议；M6.2a 只提供不会返工的 Skills 安全内核。**
+所以当前准确表述是：**M6.2a 提供 Skills 安全内核，M6.2b2a 已具备受管上游发现 wire；下游 server、工具代理、MRTR、Skill wire 与官方认证未完成，因此尚不是完整 MCP 网关。**
 
 ## 双向网关边界
 
@@ -65,9 +65,9 @@ M6.2a 的 `src/mcp.rs` 固定以下不变量：
 ### M6.2b：MCP 连接与能力目录
 
 - b1 已完成租户连接注册、HTTPS/stdio profile、宿主身份、加密 credential reference、OAuth 三元绑定、revision 和不可变能力快照；详见 [连接目录契约](m6-mcp-connection-catalog.md)。
-- 固定 `rmcp 3.4.0` 实现 2026-07-28 双向 client/server，显式选择该协议版本；版本升级必须重新跑一致性与安全回归。
-- 暴露单一 `/mcp` POST；拒绝不可信 Origin、缺失/不匹配标准头、旧 session 语义和非允许协议版本。
-- 实现 `server/discover`，客户端和服务器 core 一致性测试必须全部通过。
+- b2a 已固定 `rmcp 3.4.0` 实现 2026-07-28 Streamable HTTP 上游 `server/discover`、Secret/OAuth 与出站边界；详见 [上游发现契约](m6-mcp-http-discovery.md)。
+- b2b 实现受管 stdio launcher，并暴露单一 `/mcp` POST；拒绝不可信 Origin、缺失/不匹配标准头、旧 session 语义和非允许协议版本。
+- 客户端和服务器 core 一致性测试必须全部通过；版本升级必须重新跑一致性与安全回归。
 
 ### M6.2c：Skill 注册、真人审批和隔离缓存
 

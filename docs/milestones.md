@@ -1,6 +1,6 @@
 # 开发里程碑
 
-更新日期：2026-09-18。主语言 Rust。里程碑是生产方案的开发顺序，每个发布能力必须完成对应验收，不能把本地 fixture 当作供应商认证。
+更新日期：2026-09-20。主语言 Rust。里程碑是生产方案的开发顺序，每个发布能力必须完成对应验收，不能把本地 fixture 当作供应商认证。
 
 | 里程碑 | 范围 | 验收闸门 | 状态 |
 | --- | --- | --- | --- |
@@ -10,7 +10,7 @@
 | M3 护栏与用户审批 | 用户身份与 Agent 分离、turn 权威生命周期、持久审批、输出隔离、当前 turn 豁免、恢复协议 | 代批失败、重复决定原子、迟到批准失效、重启不重复副作用 | 核心及文本语义连接器已实现；多模态/专用审核适配、检测质量与真实 BFF/Runtime 认证待完成 |
 | M4 多模态作业与资产 | 同步图像/异步视频/3D、连接器配置、持久 worker、提交不确定、私有资产、回调 | 接收后断线不重提、转存恢复、取消竞态、跨租户资产访问拒绝 | 资产/计费、文生视频作业、隔离转存、扫描与技术检测、资产策略及真人审批交付、隔离 MP4 预览已实现；专用内容语义、其他模态预览、图片/3D/其他协议待开发，生产认证待完成 |
 | M5 控制台与治理 | TypeScript 控制台、OIDC、模型/端点、策略/护栏、汇率、人民币统计、任务审计、经验/评测样本 | 页面使用真实 API；各维度账本一致；权限矩阵与审批审计 | 报表、OIDC BFF、配置管理、护栏监控、本人 JSON/隔离 MP4 审阅审批、逐轮次节点/调用/事件治理与 HTTPS edge 已实现；其他模态预览、经验候选/评测样本和其余统计维度待开发，真实 IdP/整链路/部署待认证 |
-| M6 Runtime、MCP 与生产认证 | Hermes Python / OpenClaw TypeScript Adapter、MCP 2026-07-28/Skills、通道认证、压测、故障演练、部署与回滚 | 指定版本完整调用/审批/恢复；MCP 官方 client/server 一致性；容量、RPO/RTO、凭据与真实费用边界达标 | Hermes 0.21.1 M6.1a/b 已实现工具输入强制门、受信 turn 绑定与原生审批通知；M6.2a 完成 MCP/Skills 安全内核，M6.2b1 完成连接与能力持久目录；wire/OAuth 网络流/MRTR/持久审批/官方认证、输出/产物发布、OpenClaw 仍待完成 |
+| M6 Runtime、MCP 与生产认证 | Hermes Python / OpenClaw TypeScript Adapter、MCP 2026-07-28/Skills、通道认证、压测、故障演练、部署与回滚 | 指定版本完整调用/审批/恢复；MCP 官方 client/server 一致性；容量、RPO/RTO、凭据与真实费用边界达标 | Hermes 0.21.1 M6.1a/b 已实现工具输入强制门、受信 turn 绑定与原生审批通知；M6.2a 完成 MCP/Skills 安全内核，M6.2b1 完成连接目录，M6.2b2a 完成 Streamable HTTP 上游发现及 OAuth/Secret/DNS 边界；stdio、下游 `/mcp`、MRTR/持久审批/官方认证、输出/产物发布、OpenClaw 仍待完成 |
 
 ## v0.3 已决定的实施契约
 
@@ -352,3 +352,13 @@ OAuth client credentials 配置固定 issuer/resource/audience 且 audience 必�
 新增 5 项 PostgreSQL 合约全部通过，覆盖并发幂等/冲突、跨租户、密文与 AAD、draft/启用/revision、OAuth 绑定、实际认证上下文变化、错误协议/resultType/传输/超限拒绝、cacheScope 分区、旧快照失效、stdio 路径逃逸、租户停用、审计故障回滚和真实受限角色正反权限。全量常规 Rust **209 项通过、0 失败**；4 项既有 MinIO/固定 ClamAV/FFmpeg 专项按本地闸门 ignored，必须由正式 CI 执行。fmt、Clippy `-D warnings` 和最终 release 全目标构建通过；正式 PR 状态以下方提交记录为准。
 
 未完成边界：本包没有增加未使用的 SDK 依赖，不进行网络发现，也不开放 `/mcp`。固定 `rmcp 3.4.0`、Secret resolver、OAuth metadata/token 校验、DNS/IP 固定、Streamable HTTP/stdio wire、Origin/标准头/SSE 和官方 client/server conformance 属于 M6.2b2；M6.2c–d 继续 Skill 持久审批、MRTR 与 Runtime 恢复认证。以上完成前仍不能宣传 MCP 兼容。
+
+## M6.2b2a：MCP Streamable HTTP 上游发现
+
+2026-09-20，在 M6.2b1 不可变连接目录上完成 [Streamable HTTP 发现执行边界](m6-mcp-http-discovery.md)。固定官方 `rmcp 3.4.0`，只采用 MCP `2026-07-28` Discover lifecycle；新增 `mcp-server-discover`，由 `brokerrouter_mcp_client` 读取 active revision、解密引用、经 DNS/IP 固定和受管私有 CA 发起真实 `server/discover`，再原子记录完整 snapshot/audit/receipt。
+
+凭据支持 none、Bearer 和 OAuth client credentials。Secret Manager URI 只通过显式 URI→注入环境变量映射解析；OAuth 禁止 legacy metadata fallback，精确核对 issuer 和 endpoint/resource/audience，并对 metadata/token 每个 URL 重做出站策略。JSON/SSE 发现响应限制 512 KiB，OAuth 响应限制 1 MiB；同源 metadata 重定向最多 5 次，Token 不重定向。private cache 指纹绑定实际凭据/token，operation 重试先读持久 receipt，已完成时不重复联网。
+
+本地真实 TCP wire 回归验证两次 discover 均携带标准头和 self-contained metadata、从不发送 initialize、Bearer 只到固定上游、超大响应在解析前失败；Secret/指纹和 receipt/server 绑定也有回归。未完成边界：stdio launcher、下游 `/mcp`/Origin/认证/工具路由、官方 client/server conformance、真实 HTTPS/OAuth/私有 CA 预生产认证仍属 M6.2b2b/LIVE-22；M6.2c–d 继续 Skill 持久审批、MRTR 与 Runtime 恢复。
+
+本地 fmt、Clippy（`-D warnings`）通过；最终 debug `--all-targets` 为 **214 项通过、0 失败、4 项按环境闸门 ignored**。release 全目标先以 213 项通过，最终 MIME 精确匹配加固后又以 release 定向复验 5 项 MCP client 测试。4 项 ignored 是既有隔离 S3 与固定 ClamAV/FFmpeg 专项，必须由正式 PR CI 补验；release 全目标包含真实 PostgreSQL 和本地 TCP wire 回归。没有连接付费模型供应商、调用模型或产生供应商费用。
