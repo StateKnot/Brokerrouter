@@ -22,6 +22,7 @@ mod judge;
 pub mod mcp;
 pub mod mcp_catalog;
 pub mod mcp_client;
+pub mod mcp_oauth;
 pub mod mcp_server;
 pub mod media;
 pub mod media_api;

@@ -262,6 +262,12 @@ enum Command {
         #[arg(long)]
         file: std::path::PathBuf,
     },
+    McpOauthPrincipalSet {
+        /// JSON `mcp_catalog::SetOauthPrincipal`. The issuer and subject are
+        /// exact verified access-token claims; the target key owns all grants.
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
     ServeMcp {
         #[arg(long, env = "BROKERROUTER_MCP_BIND", default_value = "127.0.0.1:8092")]
         bind: SocketAddr,
@@ -682,14 +688,23 @@ async fn main() -> anyhow::Result<()> {
                 brokerrouter::mcp_catalog::set_tool_grant(&pool, input).await?
             );
         }
+        Command::McpOauthPrincipalSet { file } => {
+            brokerrouter::check_schema(&pool).await?;
+            let input = serde_json::from_str(&std::fs::read_to_string(file)?)?;
+            println!(
+                "{}",
+                brokerrouter::mcp_catalog::set_oauth_principal(&pool, input).await?
+            );
+        }
         Command::ServeMcp { bind } => {
             brokerrouter::check_schema(&pool).await?;
             let config = brokerrouter::mcp_server::HttpConfig::from_env()?;
+            let oauth = brokerrouter::mcp_oauth::Verifier::optional_from_env().await?;
             let listener = tokio::net::TcpListener::bind(bind).await?;
-            tracing::info!(address=%bind,"stateless authenticated MCP catalog edge listening; tool execution remains governance fail-closed");
+            tracing::info!(address=%bind,oauth=oauth.is_some(),"stateless authenticated MCP catalog edge listening; tool execution remains governance fail-closed");
             axum::serve(
                 listener,
-                brokerrouter::mcp_server::router(pool.clone(), config),
+                brokerrouter::mcp_server::router(pool.clone(), config, oauth)?,
             )
             .with_graceful_shutdown(shutdown())
             .await?;

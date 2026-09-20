@@ -1,6 +1,6 @@
 # MCP 2026-07-28 与 Skills 接入契约
 
-状态：2026-09-20 已完成 M6.2a 安全契约、[M6.2b1 连接目录](m6-mcp-connection-catalog.md)、[M6.2b2a HTTP 上游发现](m6-mcp-http-discovery.md)、[M6.2b2b1 受管 stdio](m6-mcp-stdio-discovery.md)和 [M6.2b2b2a 下游只读工具目录](m6-mcp-downstream-catalog.md)。`POST /mcp` 已开放发现和 Key 专属 `tools/list`，但 `tools/call` 在持久治理恢复完成前失败关闭；因此仍不宣称 Brokerrouter 已完整兼容 MCP。
+状态：2026-09-20 已完成 M6.2a 安全契约、[M6.2b1 连接目录](m6-mcp-connection-catalog.md)、[M6.2b2a HTTP 上游发现](m6-mcp-http-discovery.md)、[M6.2b2b1 受管 stdio](m6-mcp-stdio-discovery.md)、[M6.2b2b2a 下游只读工具目录](m6-mcp-downstream-catalog.md)和 [M6.2b2b2b OAuth 资源认证](m6-mcp-oauth-resource.md)。`POST /mcp` 已开放受保护发现和 Key/OAuth 专属 `tools/list`，但 `tools/call` 在持久治理恢复完成前失败关闭；因此仍不宣称 Brokerrouter 已完整兼容 MCP。
 
 ## 规范基线
 
@@ -23,7 +23,7 @@
 | --- | --- | --- |
 | `server/discover`、逐请求 `_meta`、`resultType` | 未实现 | 未实现 |
 | 无状态 Streamable HTTP `/mcp`、Origin/Accept/标准头校验 | 未实现 | b2b2a 已实现目录入口 |
-| OAuth 2.1 资源服务器/客户端、issuer/resource/audience 绑定 | 未实现 | 未实现 |
+| OAuth 2.1 资源服务器/客户端、issuer/resource/audience 绑定 | 未实现 | 下游 JWT Protected Resource 与上游 client credentials 已实现；真实 IdP 认证待 LIVE-22 |
 | MRTR `input_required` 暂停与恢复 | 只有 Brokerrouter 自有审批协议 | 未实现协议映射 |
 | 上游 MCP server 注册、宿主分配身份和能力快照 | 未实现 | M6.2b1 已持久化；实际发现连接待 b2 |
 | `skills/list`、`skills/get`、`resources/read` | 未实现 | wire 方法未实现 |
@@ -68,7 +68,7 @@ M6.2a 的 `src/mcp.rs` 固定以下不变量：
 - b2a 已固定 `rmcp 3.4.0` 实现 2026-07-28 Streamable HTTP 上游 `server/discover`、Secret/OAuth 与出站边界；详见 [上游发现契约](m6-mcp-http-discovery.md)。
 - b2b1 已实现受管 stdio launcher 和真实 Discover lifecycle；详见 [stdio 发现契约](m6-mcp-stdio-discovery.md)。
 - b2b2a 已暴露单一 `/mcp` POST，完成 Host/Origin/标准头、虚拟 Key、描述摘要授权和租户工具目录；执行在治理恢复凭据完成前失败关闭。
-- b2b2b 接入 OAuth 资源认证及治理后的上游工具执行；不得把下游 token 转发到上游。
+- b2b2b 已接入 OAuth JWT 资源认证；治理后的上游工具执行仍失败关闭，且不得把下游 token 转发到上游。
 - 客户端和服务器 core 一致性测试必须全部通过；版本升级必须重新跑一致性与安全回归。
 
 ### M6.2c：Skill 注册、真人审批和隔离缓存

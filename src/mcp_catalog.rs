@@ -139,6 +139,21 @@ pub struct SetToolGrant {
     pub active: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetOauthPrincipal {
+    pub tenant_id: Uuid,
+    pub key_id: Uuid,
+    pub operation_id: Uuid,
+    pub actor: String,
+    pub reason: String,
+    /// Exact authorization-server issuer. It is compared byte-for-byte with
+    /// the verified JWT `iss` claim; no URL normalization occurs at runtime.
+    pub issuer: String,
+    pub subject: String,
+    pub active: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct AuthorizedTool {
     pub downstream_name: String,
@@ -981,6 +996,83 @@ pub async fn set_tool_grant(pool: &PgPool, input: SetToolGrant) -> Result<Value>
         input.operation_id,
         &input.actor,
         "tool_grant_set",
+        body_hash,
+        &response,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(response)
+}
+
+pub async fn set_oauth_principal(pool: &PgPool, input: SetOauthPrincipal) -> Result<Value> {
+    validate_common(&input.actor, Some(&input.reason), None)?;
+    let issuer =
+        Url::parse(&input.issuer).map_err(|_| Error::Invalid("invalid MCP OAuth issuer"))?;
+    if input.issuer.len() > 2048
+        || issuer.scheme() != "https"
+        || issuer.host_str().is_none()
+        || !issuer.username().is_empty()
+        || issuer.password().is_some()
+        || issuer.query().is_some()
+        || issuer.fragment().is_some()
+        || !valid_text(&input.subject, 512)
+    {
+        return Err(Error::Invalid("invalid MCP OAuth principal"));
+    }
+    let value =
+        serde_json::to_value(&input).map_err(|_| Error::Invalid("invalid MCP OAuth principal"))?;
+    let body_hash = governance::digest(&value)?;
+    let mut tx = begin(pool, input.tenant_id, input.operation_id).await?;
+    if let Some(response) =
+        previous(&mut tx, input.tenant_id, input.operation_id, &body_hash).await?
+    {
+        tx.commit().await?;
+        return Ok(response);
+    }
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(format!(
+            "mcp-oauth-principal:{}:{}:{}",
+            input.tenant_id, input.issuer, input.subject
+        ))
+        .execute(&mut *tx)
+        .await?;
+    let key_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM virtual_keys WHERE tenant_id=$1 AND id=$2 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>clock_timestamp()))")
+        .bind(input.tenant_id)
+        .bind(input.key_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if !key_exists {
+        return Err(Error::NotFound);
+    }
+    let before: Option<(Uuid, bool, i64)> = sqlx::query_as(
+        "SELECT key_id,active,revision FROM mcp_oauth_principals WHERE tenant_id=$1 AND issuer=$2 AND subject=$3 FOR UPDATE",
+    )
+    .bind(input.tenant_id)
+    .bind(&input.issuer)
+    .bind(&input.subject)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let revision: i64 = sqlx::query_scalar("INSERT INTO mcp_oauth_principals(tenant_id,issuer,subject,key_id,active) VALUES($1,$2,$3,$4,$5) ON CONFLICT(tenant_id,issuer,subject) DO UPDATE SET key_id=EXCLUDED.key_id,active=EXCLUDED.active RETURNING revision")
+        .bind(input.tenant_id)
+        .bind(&input.issuer)
+        .bind(&input.subject)
+        .bind(input.key_id)
+        .bind(input.active)
+        .fetch_one(&mut *tx)
+        .await?;
+    let response = json!({"operation_id":input.operation_id,"tenant_id":input.tenant_id,"key_id":input.key_id,"issuer":input.issuer,"subject":input.subject,"active":input.active,"revision":revision.to_string()});
+    sqlx::query("INSERT INTO audit_events(tenant_id,action,object_id,details) VALUES($1,'mcp.oauth_principal_set',$2,$3)")
+        .bind(input.tenant_id)
+        .bind(input.key_id.to_string())
+        .bind(json!({"actor":input.actor,"reason":input.reason,"operation_id":input.operation_id,"issuer":input.issuer,"subject":input.subject,"before":before.map(|(key_id,active,revision)|json!({"key_id":key_id,"active":active,"revision":revision.to_string()})),"after":{"key_id":input.key_id,"active":input.active,"revision":revision.to_string()}}))
+        .execute(&mut *tx)
+        .await?;
+    receipt(
+        &mut tx,
+        input.tenant_id,
+        input.operation_id,
+        &input.actor,
+        "oauth_principal_set",
         body_hash,
         &response,
     )
