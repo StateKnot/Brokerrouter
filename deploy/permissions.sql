@@ -306,6 +306,8 @@ GRANT SELECT ON mcp_discovery_snapshots,mcp_discovered_tools TO brokerrouter_mcp
 GRANT SELECT(tenant_id,id,revoked_at,expires_at) ON virtual_keys TO brokerrouter_mcp_catalog;
 GRANT SELECT,INSERT ON mcp_key_tool_grants TO brokerrouter_mcp_catalog;
 GRANT UPDATE(server_config_revision,descriptor_hash,active) ON mcp_key_tool_grants TO brokerrouter_mcp_catalog;
+GRANT SELECT,INSERT ON mcp_oauth_principals TO brokerrouter_mcp_catalog;
+GRANT UPDATE(key_id,active) ON mcp_oauth_principals TO brokerrouter_mcp_catalog;
 
 -- The downstream MCP server can authenticate virtual keys and read only
 -- current descriptors/grants. It cannot read upstream credential references,
@@ -313,6 +315,7 @@ GRANT UPDATE(server_config_revision,descriptor_hash,active) ON mcp_key_tool_gran
 GRANT SELECT(tenant_id,id,key_hash,revoked_at,expires_at) ON virtual_keys TO brokerrouter_mcp_server;
 GRANT SELECT(tenant_id,id,active,config_revision) ON mcp_servers TO brokerrouter_mcp_server;
 GRANT SELECT ON mcp_discovery_snapshots,mcp_discovered_tools,mcp_key_tool_grants TO brokerrouter_mcp_server;
+GRANT SELECT ON mcp_oauth_principals TO brokerrouter_mcp_server;
 GRANT INSERT ON audit_events TO brokerrouter_mcp_catalog,brokerrouter_mcp_client,brokerrouter_mcp_server;
 GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_mcp_catalog,brokerrouter_mcp_client,brokerrouter_mcp_server;
 COMMIT;

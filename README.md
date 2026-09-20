@@ -102,4 +102,6 @@ M6.2b2b1 完成 [MCP 受管 stdio 上游发现](docs/m6-mcp-stdio-discovery.md)�
 
 M6.2b2b2a 完成 [下游 MCP 目录边界](docs/m6-mcp-downstream-catalog.md)：单一无状态 `POST /mcp`、Host/Origin/标准头、虚拟 Key、租户隔离目录及绑定完整工具描述摘要的显式 grant。`tools/call` 在持久治理与恢复凭据完成前审计后失败关闭；OAuth 资源令牌、真实治理转发、MRTR 和官方 server conformance 仍待后续包。
 
+M6.2b2b2b 完成 [下游 MCP OAuth 资源认证](docs/m6-mcp-oauth-resource.md)：RFC 9728 path-specific metadata、带 `resource_metadata`/scope 的 challenge、预配 issuer 与有界 JWKS 轮换、严格 `at+jwt` issuer/audience/lifetime/scope 校验，以及 OAuth subject→租户虚拟 Key 的显式审计映射。真实 `tools/call` 治理转发、MRTR、Runtime 恢复与官方 conformance 仍待后续包。
+
 2026-09-14 已完成 [阿里云北京 4 模型真实冒烟](docs/live-aliyun-2026-09-14.md)，并记录工具原样回传、Embedding 端点限制和账单核对待办；不据此宣称全部供应商模型或完整生产认证通过。

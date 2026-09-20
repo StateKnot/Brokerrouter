@@ -10,7 +10,7 @@
 | M3 护栏与用户审批 | 用户身份与 Agent 分离、turn 权威生命周期、持久审批、输出隔离、当前 turn 豁免、恢复协议 | 代批失败、重复决定原子、迟到批准失效、重启不重复副作用 | 核心及文本语义连接器已实现；多模态/专用审核适配、检测质量与真实 BFF/Runtime 认证待完成 |
 | M4 多模态作业与资产 | 同步图像/异步视频/3D、连接器配置、持久 worker、提交不确定、私有资产、回调 | 接收后断线不重提、转存恢复、取消竞态、跨租户资产访问拒绝 | 资产/计费、文生视频作业、隔离转存、扫描与技术检测、资产策略及真人审批交付、隔离 MP4 预览已实现；专用内容语义、其他模态预览、图片/3D/其他协议待开发，生产认证待完成 |
 | M5 控制台与治理 | TypeScript 控制台、OIDC、模型/端点、策略/护栏、汇率、人民币统计、任务审计、经验/评测样本 | 页面使用真实 API；各维度账本一致；权限矩阵与审批审计 | 报表、OIDC BFF、配置管理、护栏监控、本人 JSON/隔离 MP4 审阅审批、逐轮次节点/调用/事件治理与 HTTPS edge 已实现；其他模态预览、经验候选/评测样本和其余统计维度待开发，真实 IdP/整链路/部署待认证 |
-| M6 Runtime、MCP 与生产认证 | Hermes Python / OpenClaw TypeScript Adapter、MCP 2026-07-28/Skills、通道认证、压测、故障演练、部署与回滚 | 指定版本完整调用/审批/恢复；MCP 官方 client/server 一致性；容量、RPO/RTO、凭据与真实费用边界达标 | Hermes 0.21.1 M6.1a/b 已实现工具输入强制门、受信 turn 绑定与原生审批通知；M6.2a 完成 MCP/Skills 安全内核，M6.2b1 完成连接目录，M6.2b2a/b2b1 完成 HTTP/stdio 上游发现，M6.2b2b2a 完成下游只读 `/mcp` 与 Key 工具摘要授权；OAuth 资源认证、真实治理转发、MRTR/持久 Skill 审批/官方认证、输出/产物发布、OpenClaw 仍待完成 |
+| M6 Runtime、MCP 与生产认证 | Hermes Python / OpenClaw TypeScript Adapter、MCP 2026-07-28/Skills、通道认证、压测、故障演练、部署与回滚 | 指定版本完整调用/审批/恢复；MCP 官方 client/server 一致性；容量、RPO/RTO、凭据与真实费用边界达标 | Hermes 0.21.1 M6.1a/b 已实现工具输入强制门、受信 turn 绑定与原生审批通知；M6.2a 完成 MCP/Skills 安全内核，M6.2b1 完成连接目录，M6.2b2a/b2b1 完成 HTTP/stdio 上游发现，M6.2b2b2a/b 完成下游只读 `/mcp`、Key 工具摘要授权和 OAuth JWT 资源认证；真实治理转发、MRTR/持久 Skill 审批/官方认证、输出/产物发布、OpenClaw 仍待完成 |
 
 ## v0.3 已决定的实施契约
 
@@ -376,3 +376,11 @@ OAuth client credentials 配置固定 issuer/resource/audience 且 audience 必�
 上游发现现在在同一认证生命周期内完整分页采集 `tools/list`，以 snapshot/revision/TTL/cacheScope 保存不可变目录。Key 工具 grant 绑定完整 descriptor SHA-256；上游更改描述、schema、annotations、icons 或 `_meta` 后旧授权自动失效。`tools/list` 只返回当前 Key 的明确授权；`tools/call` 重新鉴权并写参数摘要审计后返回 `governance_execution_unavailable`，不会直连上游或产生副作用。
 
 未完成边界：OAuth Protected Resource/JWT、治理后的真实上游调用、MRTR input_required、执行租约/回执、Hermes/OpenClaw 恢复和冻结官方 server conformance 仍属 M6.2b2b/M6.2d；因此本包是可部署的只读目录服务，不是完整 MCP 工具代理。
+
+## M6.2b2b2b：下游 MCP OAuth 资源认证
+
+2026-09-20，完成 [OAuth Protected Resource 边界](m6-mcp-oauth-resource.md)。新增 path-specific RFC 9728 metadata；401/403 challenge 携带 `resource_metadata` 和最小 scope。下游 JWT 只允许预配 issuer、非对称 `at+jwt`、严格单一 canonical resource audience、有界生命周期和标准 scope；拒绝 token 指定远程 key。远端 JWKS 经 DNS/IP 固定、无代理/重定向、大小/key 数/TTL/未知 kid 刷新限制获取，也支持部署固定公钥 JWKS。
+
+0022 迁移增加 OAuth issuer/subject/tenant 到虚拟 Key 的显式映射。签名 token 的自报租户不能直接授权；映射、Key、租户、scope 和工具 grant 每次请求都重新校验。配置通过幂等 operation、事务审计与专用 catalog/server 数据库权限发布。虚拟 Key 路径继续兼容，下游 token 从不转发到上游。
+
+本地 OAuth 单元测试 **3 项通过**；隔离 PostgreSQL 17 的 MCP catalog **6 项**和 server **2 项**通过，全仓常规回归 **224 项通过、0 失败、4 项环境专项 ignored**；fmt、Clippy `-D warnings` 通过。ignored 项由正式 CI 的 S3/固定 ClamAV/FFmpeg fixture 显式执行。真实 IdP/JWKS TLS/轮换、opaque introspection、容量和官方 conformance 仍在 LIVE-22。治理后的真实上游调用、MRTR `input_required`、执行 claim/receipt、Hermes/OpenClaw 恢复仍属后续包，因此 `tools/call` 继续审计后失败关闭。

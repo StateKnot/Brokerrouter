@@ -3,7 +3,7 @@ use brokerrouter::{
     error::Error,
     mcp_catalog::{
         self, Authentication, CacheScope, CredentialReference, RecordDiscovery, RegisterServer,
-        SetToolGrant, Transport, UpdateServer,
+        SetOauthPrincipal, SetToolGrant, Transport, UpdateServer,
     },
     store,
 };
@@ -417,6 +417,74 @@ async fn invalid_transport_oauth_version_metadata_and_stale_revision_fail_closed
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn oauth_principal_binding_is_idempotent_audited_and_tenant_scoped(pool: PgPool) {
+    let tenant_id = tenant(&pool, "mcp-oauth-principal").await;
+    store::put_model(&pool, tenant_id, "test/model", "Test model")
+        .await
+        .unwrap();
+    let (first_key, _) = store::create_key(
+        &pool,
+        tenant_id,
+        "First OAuth key",
+        0,
+        &["test/model".into()],
+        None,
+    )
+    .await
+    .unwrap();
+    let operation_id = Uuid::new_v4();
+    let input = SetOauthPrincipal {
+        tenant_id,
+        key_id: first_key,
+        operation_id,
+        actor: "operator:oauth".into(),
+        reason: "approved runtime subject mapping".into(),
+        issuer: "https://auth.example".into(),
+        subject: "runtime-subject".into(),
+        active: true,
+    };
+    let first = mcp_catalog::set_oauth_principal(&pool, input.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        first,
+        mcp_catalog::set_oauth_principal(&pool, input.clone())
+            .await
+            .unwrap()
+    );
+    let mut conflict = input.clone();
+    conflict.active = false;
+    assert!(matches!(
+        mcp_catalog::set_oauth_principal(&pool, conflict).await,
+        Err(Error::Conflict)
+    ));
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE tenant_id=$1 AND action='mcp.oauth_principal_set'",
+    )
+    .bind(tenant_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(audit_count, 1);
+
+    let other = tenant(&pool, "mcp-oauth-other").await;
+    store::put_model(&pool, other, "test/model", "Test model")
+        .await
+        .unwrap();
+    let (other_key, _) =
+        store::create_key(&pool, other, "Other key", 0, &["test/model".into()], None)
+            .await
+            .unwrap();
+    let mut cross_tenant = input;
+    cross_tenant.operation_id = Uuid::new_v4();
+    cross_tenant.key_id = other_key;
+    assert!(matches!(
+        mcp_catalog::set_oauth_principal(&pool, cross_tenant).await,
+        Err(Error::NotFound)
+    ));
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn catalog_audit_failure_rolls_back_configuration_and_receipt(pool: PgPool) {
     let tenant_id = tenant(&pool, "mcp-rollback").await;
     sqlx::raw_sql("CREATE FUNCTION fail_mcp_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action LIKE 'mcp.%' THEN RAISE EXCEPTION 'fixture'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_mcp_audit BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION fail_mcp_audit();")
@@ -512,6 +580,7 @@ async fn deployment_roles_separate_configuration_discovery_and_other_authority(p
     for sql in [
         "UPDATE mcp_servers SET active=false",
         "DELETE FROM mcp_discovery_snapshots",
+        "SELECT * FROM mcp_oauth_principals",
         "SELECT result_ciphertext FROM requests",
         "SELECT * FROM approvals",
         "SET ROLE brokerrouter_mcp_catalog",
@@ -545,6 +614,21 @@ async fn deployment_roles_separate_configuration_discovery_and_other_authority(p
     )
     .await
     .unwrap();
+    mcp_catalog::set_oauth_principal(
+        &catalog,
+        SetOauthPrincipal {
+            tenant_id,
+            key_id,
+            operation_id: Uuid::new_v4(),
+            actor: "operator:roles".into(),
+            reason: "OAuth role boundary fixture".into(),
+            issuer: "https://auth.example".into(),
+            subject: "runtime-roles".into(),
+            active: true,
+        },
+    )
+    .await
+    .unwrap();
     catalog.close().await;
 
     let server_role = scoped(&pool, "brokerrouter_mcp_server").await;
@@ -557,10 +641,22 @@ async fn deployment_roles_separate_configuration_discovery_and_other_authority(p
             .len(),
         1
     );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM mcp_oauth_principals WHERE tenant_id=$1 AND key_id=$2",
+        )
+        .bind(tenant_id)
+        .bind(key_id)
+        .fetch_one(&server_role)
+        .await
+        .unwrap(),
+        1
+    );
     for sql in [
         "SELECT credential_ref_ciphertext FROM mcp_servers",
         "SELECT * FROM approvals",
         "UPDATE mcp_key_tool_grants SET active=false",
+        "UPDATE mcp_oauth_principals SET active=false",
         "SET ROLE brokerrouter_mcp_client",
     ] {
         assert!(
