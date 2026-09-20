@@ -1,0 +1,22 @@
+{
+  "profile_name": "jiaclaw-local",
+  "tenant_budget_cny": "20",
+  "key_budget_cny": "20",
+  "key_ttl_hours": 168,
+  "model_id": "aliyun/qwen3-30b-a3b-instruct-2507",
+  "model_name": "Qwen3 30B A3B Instruct 2507",
+  "endpoint": {
+    "name": "aliyun-bailian-beijing",
+    "upstream_model": "qwen3-30b-a3b-instruct-2507",
+    "base_url": "https://YOUR_WORKSPACE.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+    "credential_env": "BROKERROUTER_PERSONAL_PROVIDER_KEY",
+    "allow_private": false,
+    "input_per_million_cny": "0.75",
+    "output_per_million_cny": "3",
+    "context_tokens": 131072,
+    "max_output_tokens": 32768,
+    "priority": 100,
+    "supports_tools": true,
+    "supports_streaming": false
+  }
+}

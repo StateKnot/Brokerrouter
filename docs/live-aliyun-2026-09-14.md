@@ -73,6 +73,8 @@
 
 供应商生成的 `message.tool_calls[0]` 带 `index: 0`，当前网关在响应校验后原样返回。客户端将这个 assistant message 直接放入下一次请求，网关在 [protocol.rs](../src/protocol.rs) 的工具调用字段白名单处拒绝，HTTP 400 `unsupported request field`。该失败未产生新 request/attempt/费用。
 
+2026-09-20 代码增量已在响应边界移除该供应商扩展字段，并在客户端原样回传时验证后同样规范化；本地两轮工具闭环回归已覆盖此路径。本文仍是 2026-09-14 的历史报告；当前提交尚需用真实阿里云端点执行新的 [认证工具](tool-roundtrip-certification.md)，才能把供应商路径从 experimental 改为 certified。
+
 本轮先完成只带 `id/type/function` 的标准字段回传（成功），随后保留 `index: 0` 重现失败。应在连接器的规范化边界处理供应商扩展字段，固定 SDK 的 response → request 往返需要补回归；不能要求业务客户端临时删字段并据此宣称生产兼容。本次只记录，不修改生产实现。
 
 ### ALI-LIVE-02：端点级 Embedding 批量上限缺失（代码/文档核对，未付费触发）

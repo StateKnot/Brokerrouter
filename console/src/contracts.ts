@@ -148,6 +148,7 @@ export const endpointSchema = z.object({
   priority: z.number().int().nonnegative(),
   operation: z.enum(["chat", "embedding"]),
   supports_tools: z.boolean(),
+  supports_streaming: z.boolean(),
   embedding_dimension: z.number().int().positive().nullable(),
 });
 export type Endpoint = z.infer<typeof endpointSchema>;

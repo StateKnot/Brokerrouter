@@ -1,6 +1,6 @@
 # M2：统一文本调用契约
 
-实现档位：`text-nonstream-v1`。这份清单是当前代码的支持边界，不等于完整 OpenAI API 兼容或真实供应商认证。主币种仍为 CNY。
+实现档位：`text-chat-v2`。这份清单是当前代码的支持边界，不等于完整 OpenAI API 兼容或真实供应商认证。主币种仍为 CNY。
 
 ## 接口与字段
 
@@ -8,7 +8,7 @@
 
 | 接口 | 当前支持 | 明确拒绝 |
 | --- | --- | --- |
-| `POST /v1/chat/completions` | 文本 system/user/assistant/tool 消息；`max_tokens`；temperature/top_p/stop；单个 choice；function tools/tool_choice/parallel_tool_calls；user | `stream:true`、多模态 content、`n>1`、Responses、response_format、strict tools、max_completion_tokens 及其他未列字段 |
+| `POST /v1/chat/completions` | 文本 system/user/assistant/tool 消息；`max_tokens`；temperature/top_p/stop；单个 choice；function tools/tool_choice/parallel_tool_calls；user；`stream:false`；经端点能力门禁的 `stream:true` OpenAI 兼容 SSE | 多模态 content、`n>1`、Responses、response_format、strict tools、max_completion_tokens 及其他未列字段 |
 | `POST /v1/embeddings` | 文本或 1–32 条非空文本数组；float 向量；已配置维度；user | token ID 数组、base64、未配置维度、音视频输入 |
 | `GET /v1/requests` | 当前 Key 的请求日志、人民币费用、游标分页；`before=<request UUID>`、`limit=1..100` | 跨 Key、跨租户日志；原文搜索 |
 | `GET /v1/requests/{id}` | 请求状态、各 attempt、端点 ID、HTTP 状态、错误类别、人民币费用、结果有效期 | 未授权请求、原始密钥、出网地址、请求正文 |
@@ -20,7 +20,7 @@ Chat 未传 `max_tokens` 时使用 1024；端点能力不足时拒绝，不静�
 
 ## 路由、幂等与费用
 
-1. 按 Key 授权模型，筛选操作类型、工具能力、输出上限、Embedding 维度和可用凭据引用。
+1. 按 Key 授权模型，筛选操作类型、工具/SSE 能力、输出上限、Embedding 维度和可用凭据引用。端点的 `supports_tools` / `supports_streaming` 默认均为 false；不满足时返回 `unsupported_model_capability`，不删字段降级转发。
 2. 按 `priority` 升序、endpoint ID 稳定排序，固定最多 3 个候选端点及其价格/汇率快照。后续配置变化不改已准入请求的价格。
 3. 预算预留使用候选中最大的可界定成本上限：Chat 按端点完整输入上下文上限 + 输出上限，Embedding 按每条输入上下文上限 × 批大小。这个保守上限不是实际用量，可能高于短请求最终费用。端点上下文上限必须与真实供应商一致。
 4. 每次 attempt 在发送前持久化，并重查 Key/租户/模型权限与端点启用状态。数据库条件更新保证多个实例和相同幂等键只有一个获得发送权。
@@ -28,6 +28,12 @@ Chat 未传 `max_tokens` 时使用 1024；端点能力不足时拒绝，不静�
 6. 已发送后的超时、断线、非 200 响应（包括 429）、无效 JSON、响应过大、用量缺失/越界进入 `submission_unknown`；不切端点、不把费用记为零、不释放预留。此通用档位不假定某个错误码代表未收费。
 7. 用供应商返回且校验通过的 token 量，按实际成功 attempt 的价格/汇率结算；原币金额、人民币精确金额与人民币微元写同一账本事务。请求的 `price_snapshot` 是最大预留上限所依据的快照，实际计费快照以 finalize 流水中的 `price_snapshot` 为准，候选全量快照保存在 `routing_snapshot`。
 8. 成功结果、attempt 成功和账本结算同事务提交。相同幂等键与相同请求重放仅读取结果；变更请求体则冲突。即使结果过期，也不能重新使用旧幂等键生成。
+
+### SSE 结算与失败语义
+
+`stream:true` 时网关强制上游返回最终 usage，校验每个事件并重建完整结果。总响应上限 4 MiB、最多 100000 个事件。下游断开后，已提交请求在受管后台中继续读取、验证、结算和加密持久化；不因客户端断开释放费用。
+
+在成功结果、attempt 和人民币账本已持久化之前，网关不发送 `[DONE]`。缺少或非法 JSON、usage、finish reason 或 `[DONE]`、上游断流与越界都是 `submission_unknown`；流已开始时用 SSE error 事件结束且不发 `[DONE]`。相同幂等键重放已成功请求时，从加密结果合成等价 SSE，不重调供应商。由于已发送 token 无法追回，命中 `post` 输出护栏的流式请求在出网前以 `streaming_requires_unbuffered_output` 失败关闭，必须改用非流式完整审查。
 
 当前费用是配置端点单价的计算值：输入 token 按统一 input 价，缓存折扣、阶梯价、供应商发票、补贴与客户加价未混为“真实成本”。原始 usage 明细另存，供应商对账后由有权人员核对。超过已准入上界的用量不会强行结算或伪装成免费成功。
 
@@ -76,6 +82,6 @@ brokerrouter request-reconcile --tenant <TENANT_UUID> --id <REQUEST_UUID> \
 
 本地测试使用真实 PostgreSQL 与真实 localhost HTTP 连接；覆盖成功、连接失败、已接收后超时、响应损坏、未知费用、并发幂等、客户端断开、进程状态恢复、数据库结算失败和受限数据库角色。它们证明网关协议/故障行为，不证明任意供应商模型可用。
 
-真实认证前须固定供应商/区域/模型版本、端点、单价和凭据引用，确认人民币测试上限，分别验证普通对话、工具往返、Embedding、用量口径和模型等价性。SSE、Responses、多模态与用户审批不在当前档位内，不对外承诺支持。
+真实认证前须固定供应商/区域/模型版本、端点、单价和凭据引用，确认人民币测试上限，分别验证普通对话、工具往返、SSE 分块/中断/用量、Embedding、账单口径和模型等价性。本地回归证明网关失败语义，不自动把某个真实端点标成已认证。Responses、多模态 Chat content 及分段输出审核不在当前档位内。
 
 参考接口来源：[Chat API](https://developers.openai.com/api/reference/resources/chat)、[Embedding API](https://developers.openai.com/api/reference/resources/embeddings/methods/create)。出网禁用重试/跳转等依据 [reqwest 0.12.28](https://docs.rs/reqwest/0.12.28/reqwest/struct.ClientBuilder.html)，加密采用 [RustCrypto AES-GCM](https://docs.rs/aes-gcm/0.10.3/aes_gcm/)；本项目只承诺上表列出的子集。

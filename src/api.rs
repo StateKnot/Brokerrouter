@@ -13,6 +13,7 @@ use axum::{
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use std::convert::Infallible;
 use uuid::Uuid;
 
 pub fn router(pool: PgPool) -> Router {
@@ -67,7 +68,11 @@ fn base_routes(pool: PgPool) -> Router {
 }
 
 async fn chat(State(g): State<Gateway>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
-    execute(g, headers, body, "chat").await
+    if body.get("stream") == Some(&Value::Bool(true)) {
+        stream_chat(g, headers, body).await
+    } else {
+        execute(g, headers, body, "chat").await
+    }
 }
 async fn embedding(
     State(g): State<Gateway>,
@@ -77,24 +82,9 @@ async fn embedding(
     execute(g, headers, body, "embedding").await
 }
 async fn execute(g: Gateway, headers: HeaderMap, body: Value, operation: &'static str) -> Response {
-    let who = match identity(&g.pool, &headers).await {
-        Ok(who) => who,
+    let (who, key, turn) = match execution_context(&g, &headers).await {
+        Ok(context) => context,
         Err(e) => return e.into_response(),
-    };
-    let Some(key) = headers
-        .get("idempotency-key")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-    else {
-        return Error::Invalid("Idempotency-Key header required for billable requests")
-            .into_response();
-    };
-    let turn = match headers.get("x-brokerrouter-turn-id") {
-        Some(value) => match value.to_str().ok().and_then(|s| s.parse::<Uuid>().ok()) {
-            Some(id) => Some(id),
-            None => return Error::Invalid("invalid trusted turn ID").into_response(),
-        },
-        None => None,
     };
     // Detached from client disconnect; bounded by Gateway capacity and its persisted deadline.
     let worker = g.clone();
@@ -121,6 +111,68 @@ async fn execute(g: Gateway, headers: HeaderMap, body: Value, operation: &'stati
         Ok(Err(error)) => error.into_response(),
         Err(_) => Error::UpstreamUnknown.into_response(),
     }
+}
+
+async fn execution_context(
+    g: &Gateway,
+    headers: &HeaderMap,
+) -> Result<(store::Identity, String, Option<Uuid>)> {
+    let who = identity(&g.pool, headers).await?;
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .ok_or(Error::Invalid(
+            "Idempotency-Key header required for billable requests",
+        ))?;
+    let turn = match headers.get("x-brokerrouter-turn-id") {
+        Some(value) => Some(
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<Uuid>().ok())
+                .ok_or(Error::Invalid("invalid trusted turn ID"))?,
+        ),
+        None => None,
+    };
+    Ok((who, key, turn))
+}
+
+async fn stream_chat(g: Gateway, headers: HeaderMap, body: Value) -> Response {
+    let (who, key, turn) = match execution_context(&g, &headers).await {
+        Ok(context) => context,
+        Err(error) => return error.into_response(),
+    };
+    let session = match g.execute_stream_in_turn(&who, &key, body, turn).await {
+        Ok(session) => session,
+        Err(error) => return error.into_response(),
+    };
+    let id = session.id;
+    let stream = futures_util::stream::unfold(session.receiver, |mut receiver| async move {
+        receiver
+            .recv()
+            .await
+            .map(|bytes| (Ok::<_, Infallible>(bytes), receiver))
+    });
+    let mut response = axum::body::Body::from_stream(stream).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        "text/event-stream; charset=utf-8"
+            .parse()
+            .expect("static header"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        "no-store".parse().expect("static header"),
+    );
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", "no".parse().expect("static header"));
+    response.headers_mut().insert(
+        "x-brokerrouter-request-id",
+        id.to_string().parse().expect("uuid header"),
+    );
+    response
 }
 async fn request_details(
     State(g): State<Gateway>,

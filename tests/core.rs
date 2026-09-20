@@ -16,6 +16,98 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+fn personal_profile(name: &str) -> store::PersonalProfile {
+    serde_json::from_value(json!({
+        "profile_name":name,
+        "tenant_budget_cny":"20",
+        "key_budget_cny":"10",
+        "key_ttl_hours":24,
+        "model_id":"jiaclaw/qwen",
+        "model_name":"JiaClaw Qwen",
+        "endpoint":{
+            "name":"local-compatible-provider",
+            "upstream_model":"qwen-fixture",
+            "base_url":"http://127.0.0.1:18080/v1",
+            "credential_env":"JIACLAW_PROVIDER_KEY",
+            "allow_private":true,
+            "input_per_million_cny":"0.3",
+            "output_per_million_cny":"0.6",
+            "context_tokens":4096,
+            "max_output_tokens":1024,
+            "supports_tools":true,
+            "supports_streaming":true
+        }
+    }))
+    .unwrap()
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn personal_profile_is_atomic_bounded_and_one_time(pool: PgPool) {
+    let created = store::init_personal(&pool, personal_profile("developer"))
+        .await
+        .unwrap();
+    let identity = store::authenticate(&pool, &created.key).await.unwrap();
+    assert_eq!(identity.tenant_id, created.tenant_id);
+    assert_eq!(identity.key_id, created.key_id);
+    assert!(created.expires_at > Utc::now());
+    let endpoints = store::endpoints(&pool, &identity, &created.model_id, 1024)
+        .await
+        .unwrap();
+    assert_eq!(endpoints.len(), 1);
+    assert!(endpoints[0].supports_tools);
+    assert!(endpoints[0].supports_streaming);
+    assert_eq!(endpoints[0].id, created.endpoint_id);
+    assert!(matches!(
+        store::init_personal(&pool, personal_profile("developer")).await,
+        Err(Error::PersonalProfileExists)
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tenants")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM audit_events WHERE tenant_id=$1",)
+            .bind(created.tenant_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        4
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn personal_profile_rolls_back_every_resource_when_audit_fails(pool: PgPool) {
+    sqlx::query("CREATE FUNCTION reject_personal_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.details->>'actor'='init_personal' THEN RAISE EXCEPTION 'fixture'; END IF; RETURN NEW; END $$")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER reject_personal_audit BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION reject_personal_audit()")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        store::init_personal(&pool, personal_profile("rollback"))
+            .await
+            .is_err()
+    );
+    for table in [
+        "tenants",
+        "models",
+        "endpoints",
+        "virtual_keys",
+        "key_models",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+}
+
 async fn fixture(pool: &PgPool, budget: i64) -> (store::Identity, String) {
     let tenant = store::create_tenant(pool, "test", budget).await.unwrap();
     store::put_model(pool, tenant, "test/model", "Model")
@@ -76,6 +168,7 @@ async fn tenant_isolation_key_revocation_and_fx_history(pool: PgPool) {
         priority: 10,
         operation: "chat".into(),
         supports_tools: false,
+        supports_streaming: false,
         embedding_dimension: None,
     };
     store::add_endpoint(&pool, &endpoint).await.unwrap();

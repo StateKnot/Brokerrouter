@@ -25,6 +25,8 @@ cargo run -- serve
 
 初始控制面是可信运维 CLI，运行端口不暴露管理员万能密钥。`cargo run -- --help` 查看命令。创建顺序为 tenant-create → model-put → endpoint-add → key-create。密钥仅创建时输出一次，命令输出应当按 Secret 管理。
 
+JiaClaw/单用户 Agent 的本地接入可使用事务化 `init-personal`，直接得到有期限虚拟 Key 与可粘贴的 TOML；它不会绕过预算、端点能力或结果加密要求，也不是生产认证。配置、请求字段、SSE、恢复和错误映射见 [JiaClaw 消费者指南](docs/jiaclaw-consumer-guide.md)，工具模型是否可作为默认路径见 [工具调用闭环认证矩阵](docs/tool-roundtrip-certification.md)。
+
 ## 人民币与美元
 
 平台预算、预留、消费和默认展示以人民币为主。支持按租户发布 USD/CNY 配置：
@@ -46,7 +48,7 @@ cargo run -- fx-history --tenant <TENANT_UUID> --limit 20
 - `GET /health/ready`：数据库可连接，且迁移版本和 checksum 与运行二进制一致。
 - `GET /v1/models`：只返回当前虚拟密钥被授权的活跃模型。
 - `GET /v1/exchange-rates`：当前租户汇率版本与人民币主币种。
-- `POST /v1/chat/completions`：非流式文本/工具调用协议。
+- `POST /v1/chat/completions`：文本/工具调用；端点明确声明能力时支持 OpenAI 兼容 SSE。
 - `POST /v1/embeddings`：文本向量，固定向量空间维度。
 - `GET /v1/requests`：当前虚拟密钥的请求日志及人民币金额。
 - `GET /v1/requests/{id}` 与 `/result`：查询逻辑请求/attempt 状态与原结果。

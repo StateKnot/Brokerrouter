@@ -46,6 +46,7 @@ impl Connection {
             priority: 100,
             operation: "chat".into(),
             supports_tools: false,
+            supports_streaming: false,
             embedding_dimension: None,
         }
     }
@@ -179,7 +180,7 @@ pub async fn endpoints(
     let mut tx = begin(pool, who, Permission::CatalogRead).await?;
     let model:Value=sqlx::query_scalar("SELECT jsonb_build_object('id',id,'name',name,'active',active,'revision',config_revision::text) FROM models WHERE tenant_id=$1 AND id=$2").bind(who.tenant_id).bind(&q.model_id).fetch_optional(&mut *tx).await?.ok_or(Error::NotFound)?;
     // Deliberately excludes URL, environment references and arbitrary JSON.
-    let mut rows:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',id,'name',name,'model_id',model_id,'upstream_model',upstream_model,'active',active,'revision',config_revision::text,'currency',currency,'input_per_million',input_per_million::text,'output_per_million',output_per_million::text,'context_tokens',context_tokens,'max_output_tokens',max_output_tokens,'priority',priority,'operation',operation,'supports_tools',supports_tools,'embedding_dimension',embedding_dimension,'connection',(SELECT jsonb_build_object('id',c.connection_id,'name',c.connection_name,'revision',c.connection_revision) FROM catalog_endpoint_connections c WHERE c.tenant_id=endpoints.tenant_id AND c.endpoint_id=endpoints.id)) FROM endpoints WHERE tenant_id=$1 AND model_id=$2 AND ($3::uuid IS NULL OR id>$3) ORDER BY id LIMIT $4")
+    let mut rows:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',id,'name',name,'model_id',model_id,'upstream_model',upstream_model,'active',active,'revision',config_revision::text,'currency',currency,'input_per_million',input_per_million::text,'output_per_million',output_per_million::text,'context_tokens',context_tokens,'max_output_tokens',max_output_tokens,'priority',priority,'operation',operation,'supports_tools',supports_tools,'supports_streaming',supports_streaming,'embedding_dimension',embedding_dimension,'connection',(SELECT jsonb_build_object('id',c.connection_id,'name',c.connection_name,'revision',c.connection_revision) FROM catalog_endpoint_connections c WHERE c.tenant_id=endpoints.tenant_id AND c.endpoint_id=endpoints.id)) FROM endpoints WHERE tenant_id=$1 AND model_id=$2 AND ($3::uuid IS NULL OR id>$3) ORDER BY id LIMIT $4")
         .bind(who.tenant_id).bind(&q.model_id).bind(q.after).bind(q.limit+1).fetch_all(&mut *tx).await?;
     let more = rows.len() > q.limit as usize;
     rows.truncate(q.limit as usize);
@@ -231,6 +232,7 @@ pub enum Change {
         priority: i32,
         operation: String,
         supports_tools: bool,
+        supports_streaming: bool,
         embedding_dimension: Option<i32>,
     },
     EndpointUpdate {
@@ -326,6 +328,7 @@ pub async fn apply(
             priority,
             operation,
             supports_tools,
+            supports_streaming,
             embedding_dimension,
         } => {
             let c = connections
@@ -347,6 +350,7 @@ pub async fn apply(
             e.priority = *priority;
             e.operation = operation.clone();
             e.supports_tools = *supports_tools;
+            e.supports_streaming = *supports_streaming;
             e.embedding_dimension = *embedding_dimension;
             store::insert_endpoint(&mut tx, &e).await?;
             sqlx::query("INSERT INTO catalog_endpoint_connections(tenant_id,endpoint_id,connection_id,connection_name,connection_revision) VALUES($1,$2,$3,$4,$5)").bind(who.tenant_id).bind(e.id).bind(&c.id).bind(&c.name).bind(connection_revision).execute(&mut *tx).await?;
@@ -357,7 +361,7 @@ pub async fn apply(
                 e.id.to_string(),
                 version,
                 Value::Null,
-                json!({"model_id":model_id,"connection_id":connection_id,"connection_revision":connection_revision,"name":name,"upstream_model":upstream_model,"currency":currency,"input_per_million":input_per_million,"output_per_million":output_per_million,"context_tokens":context_tokens,"max_output_tokens":max_output_tokens,"priority":priority,"operation":operation,"supports_tools":supports_tools,"embedding_dimension":embedding_dimension,"active":false}),
+                json!({"model_id":model_id,"connection_id":connection_id,"connection_revision":connection_revision,"name":name,"upstream_model":upstream_model,"currency":currency,"input_per_million":input_per_million,"output_per_million":output_per_million,"context_tokens":context_tokens,"max_output_tokens":max_output_tokens,"priority":priority,"operation":operation,"supports_tools":supports_tools,"supports_streaming":supports_streaming,"embedding_dimension":embedding_dimension,"active":false}),
             )
         }
         Change::EndpointUpdate {
