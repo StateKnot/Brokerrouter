@@ -8,9 +8,10 @@ use crate::{
     error::{Error, Result},
     governance, store,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, QueryBuilder, Transaction};
 use std::collections::HashSet;
 use url::Url;
 use uuid::Uuid;
@@ -18,7 +19,12 @@ use uuid::Uuid;
 pub const PROTOCOL_VERSION: &str = "2026-07-28";
 const MAX_CAPABILITIES_BYTES: usize = 256 * 1024;
 const MAX_SERVER_INFO_BYTES: usize = 16 * 1024;
+const MAX_TOOL_DESCRIPTOR_BYTES: usize = 512 * 1024;
+const MAX_TOOL_CATALOG_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TOOLS: usize = 1024;
 const MAX_JSON_DEPTH: usize = 32;
+type ObservedTool = (String, String, Value, Vec<u8>);
+type ReviewToolRow = (String, String, Value, Vec<u8>, DateTime<Utc>);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -104,10 +110,40 @@ pub struct RecordDiscovery {
     pub instructions: Option<String>,
     pub ttl_ms: i32,
     pub cache_scope: CacheScope,
+    /// Complete, bounded `tools/list` result observed in the same authenticated
+    /// lifecycle. Descriptors retain their upstream names; downstream names
+    /// are host-assigned while recording the immutable snapshot.
+    #[serde(default)]
+    pub tools: Vec<Value>,
+    pub tools_ttl_ms: Option<i32>,
+    pub tools_cache_scope: Option<CacheScope>,
     /// Lower-hex SHA-256 of the effective upstream auth context. The client
     /// derives it from the resolved credential/token; the credential itself is
     /// never persisted in this request or snapshot.
     pub authorization_context_fingerprint: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetToolGrant {
+    pub tenant_id: Uuid,
+    pub key_id: Uuid,
+    pub server_id: Uuid,
+    pub operation_id: Uuid,
+    pub actor: String,
+    pub reason: String,
+    pub downstream_name: String,
+    /// Lower-hex descriptor digest copied from the operator review view. A
+    /// changed descriptor therefore fails closed instead of inheriting access.
+    pub descriptor_sha256: String,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct AuthorizedTool {
+    pub downstream_name: String,
+    pub descriptor: Value,
+    pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -123,6 +159,133 @@ impl CacheScope {
             Self::Public => "public",
         }
     }
+}
+
+fn valid_tool_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+fn downstream_tool_name(server: Uuid, upstream: &str) -> String {
+    let digest = store::hash(upstream.as_bytes());
+    let suffix = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let readable = upstream.chars().take(60).collect::<String>();
+    format!("br.{}.{suffix}.{readable}", server.simple())
+}
+
+fn nested_header_annotation(value: &Value) -> bool {
+    value
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|properties| {
+            properties
+                .values()
+                .any(|value| value.get("x-mcp-header").is_some() || nested_header_annotation(value))
+        })
+}
+
+fn valid_param_header_annotations(schema: &Value) -> bool {
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return true;
+    };
+    let mut names = HashSet::new();
+    properties.iter().all(|(_, value)| {
+        if nested_header_annotation(value) {
+            return false;
+        }
+        let Some(annotation) = value.get("x-mcp-header") else {
+            return true;
+        };
+        annotation.as_str().is_some_and(|annotation| {
+            !annotation.is_empty()
+                && annotation.chars().all(|character| {
+                    character.is_ascii_alphanumeric()
+                        || matches!(
+                            character,
+                            '!' | '#'
+                                | '$'
+                                | '%'
+                                | '&'
+                                | '\''
+                                | '*'
+                                | '+'
+                                | '-'
+                                | '.'
+                                | '^'
+                                | '_'
+                                | '`'
+                                | '|'
+                                | '~'
+                        )
+                })
+                && names.insert(annotation.to_ascii_lowercase())
+                && matches!(
+                    value.get("type").and_then(Value::as_str),
+                    Some("string" | "integer" | "boolean")
+                )
+        })
+    })
+}
+
+fn validate_tools(input: &RecordDiscovery) -> Result<Vec<ObservedTool>> {
+    let advertised = input.capabilities.get("tools").is_some();
+    if input.tools.len() > MAX_TOOLS
+        || advertised != input.tools_ttl_ms.is_some()
+        || advertised != input.tools_cache_scope.is_some()
+        || (!advertised && !input.tools.is_empty())
+        || input
+            .tools_ttl_ms
+            .is_some_and(|ttl| !(0..=86_400_000).contains(&ttl))
+    {
+        return Err(Error::Invalid("invalid MCP tool catalog metadata"));
+    }
+    let mut total = 0usize;
+    let mut names = HashSet::with_capacity(input.tools.len());
+    let mut downstream = HashSet::with_capacity(input.tools.len());
+    let mut tools = Vec::with_capacity(input.tools.len());
+    for descriptor in &input.tools {
+        bounded_json(descriptor, MAX_TOOL_DESCRIPTOR_BYTES, true)?;
+        let bytes = serde_json::to_vec(descriptor)
+            .map_err(|_| Error::Invalid("invalid MCP tool descriptor"))?;
+        total = total
+            .checked_add(bytes.len())
+            .ok_or(Error::Invalid("MCP tool catalog is too large"))?;
+        if total > MAX_TOOL_CATALOG_BYTES {
+            return Err(Error::Invalid("MCP tool catalog is too large"));
+        }
+        let name = descriptor
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| valid_tool_name(name))
+            .ok_or(Error::Invalid("invalid MCP upstream tool name"))?;
+        if !descriptor.get("inputSchema").is_some_and(Value::is_object)
+            || descriptor
+                .get("outputSchema")
+                .is_some_and(|value| !value.is_object())
+            || !valid_param_header_annotations(&descriptor["inputSchema"])
+            || !names.insert(name.to_owned())
+        {
+            return Err(Error::Invalid("invalid MCP tool descriptor"));
+        }
+        let exposed = downstream_tool_name(input.server_id, name);
+        if !valid_tool_name(&exposed) || !downstream.insert(exposed.clone()) {
+            return Err(Error::Invalid("invalid MCP downstream tool identity"));
+        }
+        tools.push((
+            name.to_owned(),
+            exposed,
+            descriptor.clone(),
+            governance::digest(descriptor)?,
+        ));
+    }
+    tools.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(tools)
 }
 
 /// Internal connector view. The credential reference is decrypted only by a
@@ -612,6 +775,14 @@ pub async fn record_discovery(pool: &PgPool, input: RecordDiscovery) -> Result<V
         return Err(Error::Invalid("unsupported MCP protocol version"));
     }
     bounded_json(&input.capabilities, MAX_CAPABILITIES_BYTES, true)?;
+    if input
+        .capabilities
+        .get("tools")
+        .is_some_and(|value| !value.is_object())
+    {
+        return Err(Error::Invalid("invalid MCP tools capability"));
+    }
+    let tools = validate_tools(&input)?;
     if let Some(info) = &input.server_info {
         bounded_json(info, MAX_SERVER_INFO_BYTES, true)?;
     }
@@ -633,6 +804,9 @@ pub async fn record_discovery(pool: &PgPool, input: RecordDiscovery) -> Result<V
     let capability_hash = governance::digest(
         &json!({"supportedVersions":input.supported_versions,"capabilities":input.capabilities,"serverInfo":input.server_info,"instructions":input.instructions}),
     )?;
+    let tool_catalog_hash = governance::digest(&Value::Array(
+        tools.iter().map(|tool| tool.2.clone()).collect(),
+    ))?;
     let mut tx = begin(pool, input.tenant_id, input.operation_id).await?;
     if let Some(response) = previous(&mut tx, input.tenant_id, input.operation_id, &hash).await? {
         tx.commit().await?;
@@ -671,11 +845,44 @@ pub async fn record_discovery(pool: &PgPool, input: RecordDiscovery) -> Result<V
         None
     };
     let id = Uuid::new_v4();
-    sqlx::query("INSERT INTO mcp_discovery_snapshots(tenant_id,id,server_id,server_config_revision,protocol_version,result_type,supported_versions,capabilities,server_info,instructions,capability_hash,ttl_ms,cache_scope,authorization_context_hash,expires_at) VALUES($1,$2,$3,$4,$5,'complete',$6,$7,$8,$9,$10,$11,$12,$13,clock_timestamp()+($11::bigint*interval '1 millisecond'))")
-        .bind(input.tenant_id).bind(id).bind(input.server_id).bind(revision).bind(PROTOCOL_VERSION).bind(json!(input.supported_versions)).bind(&input.capabilities).bind(&input.server_info).bind(&input.instructions).bind(&capability_hash).bind(input.ttl_ms).bind(input.cache_scope.name()).bind(auth_context).execute(&mut *tx).await?;
-    let response = json!({"operation_id":input.operation_id,"snapshot_id":id,"server_id":input.server_id,"server_revision":revision.to_string(),"protocol_version":PROTOCOL_VERSION,"capability_hash":governance::hex(&capability_hash),"ttl_ms":input.ttl_ms,"cache_scope":input.cache_scope.name()});
+    let snapshot_expires_at:DateTime<Utc>=sqlx::query_scalar("INSERT INTO mcp_discovery_snapshots(tenant_id,id,server_id,server_config_revision,protocol_version,result_type,supported_versions,capabilities,server_info,instructions,capability_hash,ttl_ms,cache_scope,authorization_context_hash,expires_at) VALUES($1,$2,$3,$4,$5,'complete',$6,$7,$8,$9,$10,$11,$12,$13,clock_timestamp()+($11::bigint*interval '1 millisecond')) RETURNING expires_at")
+        .bind(input.tenant_id).bind(id).bind(input.server_id).bind(revision).bind(PROTOCOL_VERSION).bind(json!(input.supported_versions)).bind(&input.capabilities).bind(&input.server_info).bind(&input.instructions).bind(&capability_hash).bind(input.ttl_ms).bind(input.cache_scope.name()).bind(auth_context).fetch_one(&mut *tx).await?;
+    if !tools.is_empty() {
+        let tools_ttl_ms = input.tools_ttl_ms.expect("validated tools TTL");
+        let tools_expires_at: DateTime<Utc> = sqlx::query_scalar(
+            "SELECT LEAST($1::timestamptz,clock_timestamp()+($2::bigint*interval '1 millisecond'))",
+        )
+        .bind(snapshot_expires_at)
+        .bind(tools_ttl_ms)
+        .fetch_one(&mut *tx)
+        .await?;
+        let effective_scope = if matches!(input.cache_scope, CacheScope::Private)
+            || matches!(input.tools_cache_scope, Some(CacheScope::Private))
+        {
+            "private"
+        } else {
+            "public"
+        };
+        let mut query = QueryBuilder::<Postgres>::new(
+            "INSERT INTO mcp_discovered_tools(tenant_id,discovery_snapshot_id,server_id,ordinal,upstream_name,downstream_name,descriptor,descriptor_hash,cache_scope,expires_at) ",
+        );
+        query.push_values(tools.iter().enumerate(), |mut row, (ordinal, tool)| {
+            row.push_bind(input.tenant_id)
+                .push_bind(id)
+                .push_bind(input.server_id)
+                .push_bind(i32::try_from(ordinal).expect("bounded tool ordinal"))
+                .push_bind(&tool.0)
+                .push_bind(&tool.1)
+                .push_bind(&tool.2)
+                .push_bind(&tool.3)
+                .push_bind(effective_scope)
+                .push_bind(tools_expires_at);
+        });
+        query.build().execute(&mut *tx).await?;
+    }
+    let response = json!({"operation_id":input.operation_id,"snapshot_id":id,"server_id":input.server_id,"server_revision":revision.to_string(),"protocol_version":PROTOCOL_VERSION,"capability_hash":governance::hex(&capability_hash),"tool_catalog_hash":governance::hex(&tool_catalog_hash),"tool_count":tools.len(),"ttl_ms":input.ttl_ms,"cache_scope":input.cache_scope.name()});
     sqlx::query("INSERT INTO audit_events(tenant_id,action,object_id,details) VALUES($1,'mcp.discovery_recorded',$2,$3)")
-        .bind(input.tenant_id).bind(input.server_id.to_string()).bind(json!({"actor":input.actor,"operation_id":input.operation_id,"snapshot_id":id,"server_revision":revision.to_string(),"protocol_version":PROTOCOL_VERSION,"capability_hash":governance::hex(&capability_hash),"ttl_ms":input.ttl_ms,"cache_scope":input.cache_scope.name()})).execute(&mut *tx).await?;
+        .bind(input.tenant_id).bind(input.server_id.to_string()).bind(json!({"actor":input.actor,"operation_id":input.operation_id,"snapshot_id":id,"server_revision":revision.to_string(),"protocol_version":PROTOCOL_VERSION,"capability_hash":governance::hex(&capability_hash),"tool_catalog_hash":governance::hex(&tool_catalog_hash),"tool_count":tools.len(),"ttl_ms":input.ttl_ms,"cache_scope":input.cache_scope.name()})).execute(&mut *tx).await?;
     receipt(
         &mut tx,
         input.tenant_id,
@@ -717,4 +924,109 @@ pub async fn current_discovery(
         }
     }
     Ok(view)
+}
+
+pub async fn review_tools(pool: &PgPool, tenant: Uuid, server: Uuid) -> Result<Value> {
+    let rows:Vec<ReviewToolRow>=sqlx::query_as("SELECT t.upstream_name,t.downstream_name,t.descriptor,t.descriptor_hash,t.expires_at FROM mcp_servers s JOIN tenants x ON x.id=s.tenant_id AND x.active JOIN LATERAL(SELECT d.id FROM mcp_discovery_snapshots d WHERE d.tenant_id=s.tenant_id AND d.server_id=s.id AND d.server_config_revision=s.config_revision AND d.expires_at>clock_timestamp() ORDER BY d.observed_at DESC,d.id DESC LIMIT 1)d ON true JOIN mcp_discovered_tools t ON t.tenant_id=s.tenant_id AND t.discovery_snapshot_id=d.id AND t.server_id=s.id AND t.expires_at>clock_timestamp() WHERE s.tenant_id=$1 AND s.id=$2 AND s.active ORDER BY t.upstream_name")
+        .bind(tenant).bind(server).fetch_all(pool).await?;
+    if rows.is_empty() {
+        return Err(Error::NotFound);
+    }
+    Ok(
+        json!({"server_id":server,"tools":rows.into_iter().map(|(upstream_name,downstream_name,descriptor,hash,expires_at)|json!({"upstream_name":upstream_name,"downstream_name":downstream_name,"descriptor":descriptor,"descriptor_sha256":governance::hex(&hash),"expires_at":expires_at})).collect::<Vec<_>>() }),
+    )
+}
+
+pub async fn set_tool_grant(pool: &PgPool, input: SetToolGrant) -> Result<Value> {
+    validate_common(&input.actor, Some(&input.reason), None)?;
+    if !valid_tool_name(&input.downstream_name) || !valid_fingerprint(&input.descriptor_sha256) {
+        return Err(Error::Invalid("invalid MCP tool grant"));
+    }
+    let value =
+        serde_json::to_value(&input).map_err(|_| Error::Invalid("invalid MCP tool grant"))?;
+    let body_hash = governance::digest(&value)?;
+    let mut tx = begin(pool, input.tenant_id, input.operation_id).await?;
+    if let Some(response) =
+        previous(&mut tx, input.tenant_id, input.operation_id, &body_hash).await?
+    {
+        tx.commit().await?;
+        return Ok(response);
+    }
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(format!(
+            "mcp-tool-grant:{}:{}:{}",
+            input.tenant_id, input.key_id, input.downstream_name
+        ))
+        .execute(&mut *tx)
+        .await?;
+    let key_exists:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM virtual_keys WHERE tenant_id=$1 AND id=$2 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>clock_timestamp()))")
+        .bind(input.tenant_id).bind(input.key_id).fetch_one(&mut *tx).await?;
+    if !key_exists {
+        return Err(Error::NotFound);
+    }
+    let observed:Option<(String,Vec<u8>,i64)>=sqlx::query_as("SELECT t.upstream_name,t.descriptor_hash,s.config_revision FROM mcp_servers s JOIN LATERAL(SELECT d.id FROM mcp_discovery_snapshots d WHERE d.tenant_id=s.tenant_id AND d.server_id=s.id AND d.server_config_revision=s.config_revision AND d.expires_at>clock_timestamp() ORDER BY d.observed_at DESC,d.id DESC LIMIT 1)d ON true JOIN mcp_discovered_tools t ON t.tenant_id=s.tenant_id AND t.discovery_snapshot_id=d.id AND t.server_id=s.id AND t.expires_at>clock_timestamp() WHERE s.tenant_id=$1 AND s.id=$2 AND s.active AND t.downstream_name=$3")
+        .bind(input.tenant_id).bind(input.server_id).bind(&input.downstream_name).fetch_optional(&mut *tx).await?;
+    let (upstream_name, descriptor_hash, server_revision) = observed.ok_or(Error::NotFound)?;
+    if governance::hex(&descriptor_hash) != input.descriptor_sha256 {
+        return Err(Error::ConfigConflict);
+    }
+    let revision:i64=sqlx::query_scalar("INSERT INTO mcp_key_tool_grants(tenant_id,key_id,server_id,server_config_revision,upstream_name,descriptor_hash,active) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(tenant_id,key_id,server_id,upstream_name) DO UPDATE SET server_config_revision=EXCLUDED.server_config_revision,descriptor_hash=EXCLUDED.descriptor_hash,active=EXCLUDED.active RETURNING revision")
+        .bind(input.tenant_id).bind(input.key_id).bind(input.server_id).bind(server_revision).bind(&upstream_name).bind(&descriptor_hash).bind(input.active).fetch_one(&mut *tx).await?;
+    let response = json!({"operation_id":input.operation_id,"key_id":input.key_id,"server_id":input.server_id,"server_revision":server_revision.to_string(),"upstream_name":upstream_name,"downstream_name":input.downstream_name,"descriptor_sha256":input.descriptor_sha256,"active":input.active,"revision":revision.to_string()});
+    sqlx::query("INSERT INTO audit_events(tenant_id,action,object_id,details) VALUES($1,'mcp.tool_grant_set',$2,$3)")
+        .bind(input.tenant_id).bind(input.key_id.to_string()).bind(json!({"actor":input.actor,"reason":input.reason,"operation_id":input.operation_id,"server_id":input.server_id,"server_revision":server_revision.to_string(),"upstream_name":upstream_name,"downstream_name":input.downstream_name,"descriptor_sha256":input.descriptor_sha256,"active":input.active,"revision":revision.to_string()})).execute(&mut *tx).await?;
+    receipt(
+        &mut tx,
+        input.tenant_id,
+        input.operation_id,
+        &input.actor,
+        "tool_grant_set",
+        body_hash,
+        &response,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(response)
+}
+
+pub async fn authorized_tools(
+    pool: &PgPool,
+    who: &store::Identity,
+    after: Option<&str>,
+    limit: i64,
+) -> Result<Vec<AuthorizedTool>> {
+    if !(1..=101).contains(&limit) || after.is_some_and(|value| !valid_tool_name(value)) {
+        return Err(Error::Invalid("invalid MCP tool cursor"));
+    }
+    type Row = (String, Value, DateTime<Utc>);
+    let rows:Vec<Row>=sqlx::query_as("SELECT t.downstream_name,t.descriptor,t.expires_at FROM virtual_keys k JOIN tenants x ON x.id=k.tenant_id AND x.active JOIN mcp_servers s ON s.tenant_id=k.tenant_id AND s.active JOIN LATERAL(SELECT d.id,d.server_config_revision FROM mcp_discovery_snapshots d WHERE d.tenant_id=s.tenant_id AND d.server_id=s.id AND d.server_config_revision=s.config_revision AND d.expires_at>clock_timestamp() ORDER BY d.observed_at DESC,d.id DESC LIMIT 1)d ON true JOIN mcp_discovered_tools t ON t.tenant_id=s.tenant_id AND t.discovery_snapshot_id=d.id AND t.server_id=s.id AND t.expires_at>clock_timestamp() JOIN mcp_key_tool_grants g ON g.tenant_id=t.tenant_id AND g.key_id=k.id AND g.server_id=t.server_id AND g.server_config_revision=d.server_config_revision AND g.upstream_name=t.upstream_name AND g.descriptor_hash=t.descriptor_hash AND g.active WHERE k.tenant_id=$1 AND k.id=$2 AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>clock_timestamp()) AND ($3::text IS NULL OR t.downstream_name>$3) ORDER BY t.downstream_name LIMIT $4")
+        .bind(who.tenant_id).bind(who.key_id).bind(after).bind(limit).fetch_all(pool).await?;
+    Ok(rows
+        .into_iter()
+        .map(|(downstream_name, descriptor, expires_at)| AuthorizedTool {
+            downstream_name,
+            descriptor,
+            expires_at,
+        })
+        .collect())
+}
+
+pub async fn authorized_tool(
+    pool: &PgPool,
+    who: &store::Identity,
+    name: &str,
+) -> Result<Option<AuthorizedTool>> {
+    if !valid_tool_name(name) {
+        return Ok(None);
+    }
+    type Row = (String, Value, DateTime<Utc>);
+    let row:Option<Row>=sqlx::query_as("SELECT t.downstream_name,t.descriptor,t.expires_at FROM virtual_keys k JOIN tenants x ON x.id=k.tenant_id AND x.active JOIN mcp_servers s ON s.tenant_id=k.tenant_id AND s.active JOIN LATERAL(SELECT d.id,d.server_config_revision FROM mcp_discovery_snapshots d WHERE d.tenant_id=s.tenant_id AND d.server_id=s.id AND d.server_config_revision=s.config_revision AND d.expires_at>clock_timestamp() ORDER BY d.observed_at DESC,d.id DESC LIMIT 1)d ON true JOIN mcp_discovered_tools t ON t.tenant_id=s.tenant_id AND t.discovery_snapshot_id=d.id AND t.server_id=s.id AND t.expires_at>clock_timestamp() JOIN mcp_key_tool_grants g ON g.tenant_id=t.tenant_id AND g.key_id=k.id AND g.server_id=t.server_id AND g.server_config_revision=d.server_config_revision AND g.upstream_name=t.upstream_name AND g.descriptor_hash=t.descriptor_hash AND g.active WHERE k.tenant_id=$1 AND k.id=$2 AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>clock_timestamp()) AND t.downstream_name=$3")
+        .bind(who.tenant_id).bind(who.key_id).bind(name).fetch_optional(pool).await?;
+    Ok(
+        row.map(|(downstream_name, descriptor, expires_at)| AuthorizedTool {
+            downstream_name,
+            descriptor,
+            expires_at,
+        }),
+    )
 }

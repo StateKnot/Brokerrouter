@@ -250,6 +250,22 @@ enum Command {
         #[arg(long)]
         actor: String,
     },
+    McpToolsList {
+        #[arg(long)]
+        tenant: Uuid,
+        #[arg(long)]
+        server: Uuid,
+    },
+    McpToolGrantSet {
+        /// JSON `mcp_catalog::SetToolGrant`; the descriptor digest must come
+        /// from a fresh `mcp-tools-list` review.
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+    ServeMcp {
+        #[arg(long, env = "BROKERROUTER_MCP_BIND", default_value = "127.0.0.1:8092")]
+        bind: SocketAddr,
+    },
     KeyCreate {
         #[arg(long)]
         tenant: Uuid,
@@ -650,6 +666,33 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?
             );
+        }
+        Command::McpToolsList { tenant, server } => {
+            brokerrouter::check_schema(&pool).await?;
+            println!(
+                "{}",
+                brokerrouter::mcp_catalog::review_tools(&pool, tenant, server).await?
+            );
+        }
+        Command::McpToolGrantSet { file } => {
+            brokerrouter::check_schema(&pool).await?;
+            let input = serde_json::from_str(&std::fs::read_to_string(file)?)?;
+            println!(
+                "{}",
+                brokerrouter::mcp_catalog::set_tool_grant(&pool, input).await?
+            );
+        }
+        Command::ServeMcp { bind } => {
+            brokerrouter::check_schema(&pool).await?;
+            let config = brokerrouter::mcp_server::HttpConfig::from_env()?;
+            let listener = tokio::net::TcpListener::bind(bind).await?;
+            tracing::info!(address=%bind,"stateless authenticated MCP catalog edge listening; tool execution remains governance fail-closed");
+            axum::serve(
+                listener,
+                brokerrouter::mcp_server::router(pool.clone(), config),
+            )
+            .with_graceful_shutdown(shutdown())
+            .await?;
         }
         Command::RuntimeBind {
             tenant,

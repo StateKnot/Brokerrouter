@@ -284,20 +284,35 @@ DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_mcp_client') THEN
         CREATE ROLE brokerrouter_mcp_client NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_mcp_server') THEN
+        CREATE ROLE brokerrouter_mcp_server NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
 END $$;
-GRANT USAGE ON SCHEMA public TO brokerrouter_mcp_catalog,brokerrouter_mcp_client;
-GRANT SELECT ON _sqlx_migrations TO brokerrouter_mcp_catalog,brokerrouter_mcp_client;
-GRANT SELECT(id,active) ON tenants TO brokerrouter_mcp_catalog,brokerrouter_mcp_client;
+GRANT USAGE ON SCHEMA public TO brokerrouter_mcp_catalog,brokerrouter_mcp_client,brokerrouter_mcp_server;
+GRANT SELECT ON _sqlx_migrations TO brokerrouter_mcp_catalog,brokerrouter_mcp_client,brokerrouter_mcp_server;
+GRANT SELECT(id,active) ON tenants TO brokerrouter_mcp_catalog,brokerrouter_mcp_client,brokerrouter_mcp_server;
 -- Harmless lock column enables SELECT ... FOR SHARE so tenant revocation is
 -- serialized with a catalog/discovery commit without granting state changes.
 GRANT UPDATE(governance_lock) ON tenants TO brokerrouter_mcp_catalog,brokerrouter_mcp_client;
 GRANT SELECT,INSERT ON mcp_catalog_mutations TO brokerrouter_mcp_catalog,brokerrouter_mcp_client;
 GRANT SELECT,INSERT ON mcp_discovery_snapshots TO brokerrouter_mcp_client;
+GRANT SELECT,INSERT ON mcp_discovered_tools TO brokerrouter_mcp_client;
 GRANT SELECT,INSERT ON mcp_servers TO brokerrouter_mcp_catalog;
 GRANT UPDATE(display_name,transport,endpoint_url,stdio_profile,allow_private,auth_mode,
     credential_ref_kind,credential_ref_ciphertext,oauth_issuer,oauth_resource,oauth_audience,active)
     ON mcp_servers TO brokerrouter_mcp_catalog;
 GRANT SELECT ON mcp_servers TO brokerrouter_mcp_client;
-GRANT INSERT ON audit_events TO brokerrouter_mcp_catalog,brokerrouter_mcp_client;
-GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_mcp_catalog,brokerrouter_mcp_client;
+GRANT SELECT ON mcp_discovery_snapshots,mcp_discovered_tools TO brokerrouter_mcp_catalog;
+GRANT SELECT(tenant_id,id,revoked_at,expires_at) ON virtual_keys TO brokerrouter_mcp_catalog;
+GRANT SELECT,INSERT ON mcp_key_tool_grants TO brokerrouter_mcp_catalog;
+GRANT UPDATE(server_config_revision,descriptor_hash,active) ON mcp_key_tool_grants TO brokerrouter_mcp_catalog;
+
+-- The downstream MCP server can authenticate virtual keys and read only
+-- current descriptors/grants. It cannot read upstream credential references,
+-- mutate grants, invoke connectors, or access governance approvals.
+GRANT SELECT(tenant_id,id,key_hash,revoked_at,expires_at) ON virtual_keys TO brokerrouter_mcp_server;
+GRANT SELECT(tenant_id,id,active,config_revision) ON mcp_servers TO brokerrouter_mcp_server;
+GRANT SELECT ON mcp_discovery_snapshots,mcp_discovered_tools,mcp_key_tool_grants TO brokerrouter_mcp_server;
+GRANT INSERT ON audit_events TO brokerrouter_mcp_catalog,brokerrouter_mcp_client,brokerrouter_mcp_server;
+GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_mcp_catalog,brokerrouter_mcp_client,brokerrouter_mcp_server;
 COMMIT;

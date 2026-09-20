@@ -19,10 +19,11 @@ rsa = "0.9"
 object_store = { version = "=0.13.2", default-features = false, features = ["aws", "tls-webpki-roots"] }
 openidconnect = { version = "=4.0.1", default-features = false }
 bytes = "1"
+base64 = "0.22"
 futures-util = "0.3"
 http = "1"
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json", "stream"] }
-rmcp = { version = "=3.4.0", default-features = false, features = ["auth", "client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "=3.4.0", default-features = false, features = ["auth", "client", "server", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
 rust_decimal = { version = "1.37", features = ["serde-with-str"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
@@ -40,7 +41,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1"
 
 [dev-dependencies]
-base64 = "0.22"
 async-trait = "0.1"
 http-body-util = "0.1"
 tower = { version = "0.5.2", features = ["util"] }

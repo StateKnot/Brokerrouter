@@ -3,7 +3,7 @@ use brokerrouter::{
     error::Error,
     mcp_catalog::{
         self, Authentication, CacheScope, CredentialReference, RecordDiscovery, RegisterServer,
-        Transport, UpdateServer,
+        SetToolGrant, Transport, UpdateServer,
     },
     store,
 };
@@ -84,6 +84,13 @@ fn discovery(tenant_id: Uuid, server_id: Uuid, revision: i64) -> RecordDiscovery
         instructions: Some("Untrusted display instructions only.".into()),
         ttl_ms: 60_000,
         cache_scope: CacheScope::Private,
+        tools: vec![json!({
+            "name":"read_record",
+            "description":"Read one reviewed record",
+            "inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}
+        })],
+        tools_ttl_ms: Some(30_000),
+        tools_cache_scope: Some(CacheScope::Private),
         authorization_context_fingerprint: Some(AUTH_CONTEXT.into()),
     }
 }
@@ -211,6 +218,68 @@ async fn oauth_revision_discovery_cache_and_self_report_are_not_identity(pool: P
     .unwrap();
     assert_eq!(context.unwrap().len(), 32);
 
+    let review = mcp_catalog::review_tools(&pool, tenant_id, server_id)
+        .await
+        .unwrap();
+    let downstream_name = review["tools"][0]["downstream_name"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let descriptor_sha256 = review["tools"][0]["descriptor_sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    store::put_model(&pool, tenant_id, "test/model", "Test model")
+        .await
+        .unwrap();
+    let (key_id, _) = store::create_key(
+        &pool,
+        tenant_id,
+        "MCP tool key",
+        0,
+        &["test/model".into()],
+        None,
+    )
+    .await
+    .unwrap();
+    mcp_catalog::set_tool_grant(
+        &pool,
+        SetToolGrant {
+            tenant_id,
+            key_id,
+            server_id,
+            operation_id: Uuid::new_v4(),
+            actor: "operator:alice".into(),
+            reason: "reviewed exact tool descriptor".into(),
+            downstream_name: downstream_name.clone(),
+            descriptor_sha256,
+            active: true,
+        },
+    )
+    .await
+    .unwrap();
+    let who = store::Identity { tenant_id, key_id };
+    assert_eq!(
+        mcp_catalog::authorized_tools(&pool, &who, None, 101)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let mut changed_descriptor = discovery(tenant_id, server_id, 2);
+    changed_descriptor.tools[0]["description"] = json!("Changed upstream meaning");
+    mcp_catalog::record_discovery(&pool, changed_descriptor)
+        .await
+        .unwrap();
+    assert!(
+        mcp_catalog::authorized_tools(&pool, &who, None, 101)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a changed descriptor must not inherit the old grant"
+    );
+
     let changed = UpdateServer {
         expected_revision: 2,
         reason: "disable after review".into(),
@@ -307,6 +376,12 @@ async fn invalid_transport_oauth_version_metadata_and_stale_revision_fail_closed
         mcp_catalog::record_discovery(&pool, oversized).await,
         Err(Error::Invalid(_))
     ));
+    let mut invalid_header = discovery(tenant_id, server_id, 2);
+    invalid_header.tools[0]["inputSchema"]["properties"]["id"]["x-mcp-header"] = json!("not valid");
+    assert!(matches!(
+        mcp_catalog::record_discovery(&pool, invalid_header).await,
+        Err(Error::Invalid(_))
+    ));
     let mut stale = discovery(tenant_id, server_id, 1);
     assert!(matches!(
         mcp_catalog::record_discovery(&pool, stale.clone()).await,
@@ -393,6 +468,19 @@ async fn deployment_roles_separate_configuration_discovery_and_other_authority(p
         .await
         .unwrap();
     let tenant_id = tenant(&pool, "mcp-roles").await;
+    store::put_model(&pool, tenant_id, "test/model", "Test model")
+        .await
+        .unwrap();
+    let (key_id, token) = store::create_key(
+        &pool,
+        tenant_id,
+        "MCP edge key",
+        0,
+        &["test/model".into()],
+        None,
+    )
+    .await
+    .unwrap();
     let catalog = scoped(&pool, "brokerrouter_mcp_catalog").await;
     brokerrouter::check_schema(&catalog).await.unwrap();
     let registered = mcp_catalog::register_server(&catalog, &cipher(), registration(tenant_id))
@@ -413,8 +501,6 @@ async fn deployment_roles_separate_configuration_discovery_and_other_authority(p
     ] {
         assert!(sqlx::query(sql).execute(&catalog).await.is_err(), "{sql}");
     }
-    catalog.close().await;
-
     let client = scoped(&pool, "brokerrouter_mcp_client").await;
     brokerrouter::check_schema(&client).await.unwrap();
     mcp_catalog::connector_server(&client, &cipher(), tenant_id, server_id)
@@ -433,4 +519,53 @@ async fn deployment_roles_separate_configuration_discovery_and_other_authority(p
         assert!(sqlx::query(sql).execute(&client).await.is_err(), "{sql}");
     }
     client.close().await;
+
+    let reviewed = mcp_catalog::review_tools(&catalog, tenant_id, server_id)
+        .await
+        .unwrap();
+    mcp_catalog::set_tool_grant(
+        &catalog,
+        SetToolGrant {
+            tenant_id,
+            key_id,
+            server_id,
+            operation_id: Uuid::new_v4(),
+            actor: "operator:roles".into(),
+            reason: "role boundary fixture".into(),
+            downstream_name: reviewed["tools"][0]["downstream_name"]
+                .as_str()
+                .unwrap()
+                .into(),
+            descriptor_sha256: reviewed["tools"][0]["descriptor_sha256"]
+                .as_str()
+                .unwrap()
+                .into(),
+            active: true,
+        },
+    )
+    .await
+    .unwrap();
+    catalog.close().await;
+
+    let server_role = scoped(&pool, "brokerrouter_mcp_server").await;
+    brokerrouter::check_schema(&server_role).await.unwrap();
+    let who = store::authenticate(&server_role, &token).await.unwrap();
+    assert_eq!(
+        mcp_catalog::authorized_tools(&server_role, &who, None, 101)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    for sql in [
+        "SELECT credential_ref_ciphertext FROM mcp_servers",
+        "SELECT * FROM approvals",
+        "UPDATE mcp_key_tool_grants SET active=false",
+        "SET ROLE brokerrouter_mcp_client",
+    ] {
+        assert!(
+            sqlx::query(sql).execute(&server_role).await.is_err(),
+            "{sql}"
+        );
+    }
 }
