@@ -96,6 +96,8 @@ M6.2a 完成 [MCP 2026-07-28 与 Skills 兼容性评审及安全契约](docs/m6-
 
 M6.2b1 完成 [MCP 连接与能力目录](docs/m6-mcp-connection-catalog.md)：租户隔离的宿主 UUID、HTTPS/stdio launcher profile、独立密钥环加密 credential reference、OAuth issuer/resource/audience 绑定、draft/revision、不可变 `server/discover` 能力快照和 catalog/client 数据库分权。该包不发送网络请求；`rmcp` wire、OAuth/Secret resolver、`/mcp` 与官方一致性仍由 M6.2b2 阻断。
 
-M6.2b2a 完成 [MCP Streamable HTTP 上游发现](docs/m6-mcp-http-discovery.md)：固定官方 `rmcp 3.4.0` 与 MCP `2026-07-28` Discover lifecycle，增加 Secret 注入引用解析、Bearer/OAuth client credentials、issuer/resource/audience 精确绑定、DNS/IP 固定、私有 CA、受限 JSON/SSE 和幂等发现入库。stdio、下游 `/mcp`、MRTR/Skill 持久审批及官方一致性仍未完成，当前仍不宣称完整 MCP 兼容。
+M6.2b2a 完成 [MCP Streamable HTTP 上游发现](docs/m6-mcp-http-discovery.md)：固定官方 `rmcp 3.4.0` 与 MCP `2026-07-28` Discover lifecycle，增加 Secret 注入引用解析、Bearer/OAuth client credentials、issuer/resource/audience 精确绑定、DNS/IP 固定、私有 CA、受限 JSON/SSE 和幂等发现入库。
+
+M6.2b2b1 完成 [MCP 受管 stdio 上游发现](docs/m6-mcp-stdio-discovery.md)：部署侧版本化 launcher profile、绝对路径与权限校验、无 shell 启动、清空继承环境、显式 Secret 环境映射、超时终止及授权上下文缓存分区。下游 `/mcp`、工具治理转发、MRTR/Skill 持久审批及官方一致性仍未完成，当前仍不宣称完整 MCP 兼容。
 
 2026-09-14 已完成 [阿里云北京 4 模型真实冒烟](docs/live-aliyun-2026-09-14.md)，并记录工具原样回传、Embedding 端点限制和账单核对待办；不据此宣称全部供应商模型或完整生产认证通过。

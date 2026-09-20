@@ -278,6 +278,11 @@ fn validate_config(transport: &Transport, auth: &Authentication) -> Result<Valid
             )
         }
     };
+    if transport_name == "stdio" && auth_mode != "none" {
+        return Err(Error::Invalid(
+            "stdio credentials must be injected by the deployment launcher profile",
+        ));
+    }
     Ok(ValidatedConfig {
         transport: transport_name,
         endpoint_url,

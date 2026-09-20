@@ -259,6 +259,16 @@ async fn invalid_transport_oauth_version_metadata_and_stale_revision_fail_closed
     mcp_catalog::register_server(&pool, &cipher(), stdio)
         .await
         .unwrap();
+    let mut stdio_with_http_auth = registration(tenant_id);
+    stdio_with_http_auth.operation_id = Uuid::new_v4();
+    stdio_with_http_auth.display_name = "Ambiguous stdio credentials".into();
+    stdio_with_http_auth.transport = Transport::Stdio {
+        launcher_profile: "approved/toolset-v1".into(),
+    };
+    assert!(matches!(
+        mcp_catalog::register_server(&pool, &cipher(), stdio_with_http_auth).await,
+        Err(Error::Invalid(_))
+    ));
     let mut invalid = registration(tenant_id);
     invalid.authentication = Authentication::OauthClientCredentials {
         credential_reference: CredentialReference::Environment {
