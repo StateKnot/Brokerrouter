@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "name": "filesystem/read-only-v1",
+      "program": "/opt/brokerrouter/mcp/bin/filesystem-mcp-sandbox",
+      "program_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "working_directory": "/var/lib/brokerrouter/mcp/filesystem",
+      "arguments": [
+        "--stdio",
+        "--read-only"
+      ],
+      "environment": [
+        {
+          "target": "FILESYSTEM_ROOT",
+          "source_environment": "BROKERROUTER_MCP_FILESYSTEM_ROOT"
+        }
+      ],
+      "timeout_ms": 20000
+    }
+  ]
+}

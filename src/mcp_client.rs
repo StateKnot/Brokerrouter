@@ -22,7 +22,7 @@ use rmcp::{
         Implementation, ProtocolVersion, RequestMetaObject, ServerJsonRpcMessage,
     },
     transport::{
-        StreamableHttpClientTransport,
+        StreamableHttpClientTransport, TokioChildProcess,
         auth::{
             AuthClient, AuthorizationManager, AuthorizationMetadataSource, ClientCredentialsConfig,
             OAuthHttpClient, OAuthHttpClientError, OAuthHttpClientFuture, OAuthHttpRedirectPolicy,
@@ -34,7 +34,7 @@ use rmcp::{
         },
     },
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -42,6 +42,8 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     io::Read,
+    path::{Path, PathBuf},
+    process::Stdio,
     sync::Arc,
     time::Duration,
 };
@@ -56,6 +58,11 @@ const MAX_OAUTH_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
 const MAX_OAUTH_REDIRECTS: usize = 5;
 const MAX_CA_BUNDLE_BYTES: usize = 1024 * 1024;
+const MAX_STDIO_LAUNCHERS_BYTES: usize = 1024 * 1024;
+const MAX_STDIO_PROFILES: usize = 256;
+const MAX_STDIO_ARGUMENTS: usize = 128;
+const MAX_STDIO_ENVIRONMENT: usize = 128;
+const MAX_STDIO_PROGRAM_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DiscoveryError {
@@ -75,6 +82,10 @@ pub enum DiscoveryError {
     OAuth,
     #[error("MCP OAuth metadata did not match the pinned issuer/resource/audience")]
     OAuthBinding,
+    #[error("the MCP stdio launcher registry or selected profile is invalid")]
+    StdioConfiguration,
+    #[error("the MCP stdio child process could not be started")]
+    StdioLaunch,
 }
 
 impl From<GatewayError> for DiscoveryError {
@@ -206,6 +217,257 @@ impl InjectedCredentialResolver {
         }
         Ok(value)
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StdioLauncherRegistry {
+    version: u32,
+    profiles: Vec<StdioLauncherProfile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StdioLauncherProfile {
+    name: String,
+    program: PathBuf,
+    program_sha256: String,
+    working_directory: PathBuf,
+    #[serde(default)]
+    arguments: Vec<String>,
+    #[serde(default)]
+    environment: Vec<StdioEnvironmentBinding>,
+    timeout_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StdioEnvironmentBinding {
+    target: String,
+    source_environment: String,
+}
+
+struct ResolvedStdioEnvironment {
+    values: Vec<(String, Zeroizing<String>)>,
+    fingerprint: String,
+}
+
+fn valid_launcher_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 200
+        && !value.starts_with('/')
+        && !value
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'-' | b'_' | b'.' | b'/')
+        })
+}
+
+fn valid_process_value(value: &str, max: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max
+        && !value.contains('\0')
+        && !value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\t' | '\n' | '\r'))
+}
+
+#[cfg(unix)]
+fn safe_file_mode(metadata: &std::fs::Metadata, executable: bool) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = metadata.permissions().mode();
+    mode & 0o6022 == 0 && (!executable || mode & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn safe_file_mode(_metadata: &std::fs::Metadata, _executable: bool) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn safe_parent_directories(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.parent().is_some_and(|parent| {
+        parent.ancestors().all(|directory| {
+            std::fs::metadata(directory).is_ok_and(|metadata| {
+                metadata.is_dir() && metadata.permissions().mode() & 0o022 == 0
+            })
+        })
+    })
+}
+
+#[cfg(not(unix))]
+fn safe_parent_directories(_path: &Path) -> bool {
+    false
+}
+
+fn canonical_regular_file(path: &Path, executable: bool) -> Result<PathBuf, DiscoveryError> {
+    if !path.is_absolute() {
+        return Err(DiscoveryError::StdioConfiguration);
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|_| DiscoveryError::StdioConfiguration)?;
+    let metadata = std::fs::metadata(&canonical).map_err(|_| DiscoveryError::StdioConfiguration)?;
+    if !metadata.is_file()
+        || !safe_file_mode(&metadata, executable)
+        || !safe_parent_directories(&canonical)
+    {
+        return Err(DiscoveryError::StdioConfiguration);
+    }
+    Ok(canonical)
+}
+
+fn file_sha256(path: &Path) -> Result<String, DiscoveryError> {
+    let metadata = std::fs::metadata(path).map_err(|_| DiscoveryError::StdioConfiguration)?;
+    if metadata.len() == 0 || metadata.len() > MAX_STDIO_PROGRAM_BYTES {
+        return Err(DiscoveryError::StdioConfiguration);
+    }
+    let mut file = std::fs::File::open(path).map_err(|_| DiscoveryError::StdioConfiguration)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| DiscoveryError::StdioConfiguration)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or(DiscoveryError::StdioConfiguration)?;
+        if total > MAX_STDIO_PROGRAM_BYTES {
+            return Err(DiscoveryError::StdioConfiguration);
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn valid_lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_stdio_profile(
+    mut profile: StdioLauncherProfile,
+) -> Result<StdioLauncherProfile, DiscoveryError> {
+    if !valid_launcher_name(&profile.name)
+        || !valid_lower_hex_digest(&profile.program_sha256)
+        || profile.arguments.len() > MAX_STDIO_ARGUMENTS
+        || profile.environment.len() > MAX_STDIO_ENVIRONMENT
+        || !(1_000..=60_000).contains(&profile.timeout_ms)
+        || profile
+            .arguments
+            .iter()
+            .any(|value| !valid_process_value(value, 4096))
+        || !profile.working_directory.is_absolute()
+    {
+        return Err(DiscoveryError::StdioConfiguration);
+    }
+    profile.program = canonical_regular_file(&profile.program, true)?;
+    if file_sha256(&profile.program)? != profile.program_sha256 {
+        return Err(DiscoveryError::StdioConfiguration);
+    }
+    profile.working_directory = std::fs::canonicalize(&profile.working_directory)
+        .map_err(|_| DiscoveryError::StdioConfiguration)?;
+    if !std::fs::metadata(&profile.working_directory)
+        .map_err(|_| DiscoveryError::StdioConfiguration)?
+        .is_dir()
+    {
+        return Err(DiscoveryError::StdioConfiguration);
+    }
+    let mut targets = HashSet::with_capacity(profile.environment.len());
+    if profile.environment.iter().any(|binding| {
+        !valid_environment_name(&binding.target)
+            || !valid_environment_name(&binding.source_environment)
+            || !targets.insert(binding.target.as_str())
+    }) {
+        return Err(DiscoveryError::StdioConfiguration);
+    }
+    Ok(profile)
+}
+
+fn parse_stdio_registry(bytes: &[u8]) -> Result<StdioLauncherRegistry, DiscoveryError> {
+    if bytes.is_empty() || bytes.len() > MAX_STDIO_LAUNCHERS_BYTES {
+        return Err(DiscoveryError::StdioConfiguration);
+    }
+    let mut registry: StdioLauncherRegistry =
+        serde_json::from_slice(bytes).map_err(|_| DiscoveryError::StdioConfiguration)?;
+    if registry.version != 1
+        || registry.profiles.is_empty()
+        || registry.profiles.len() > MAX_STDIO_PROFILES
+    {
+        return Err(DiscoveryError::StdioConfiguration);
+    }
+    let mut names = HashSet::with_capacity(registry.profiles.len());
+    let mut validated = Vec::with_capacity(registry.profiles.len());
+    for profile in registry.profiles {
+        let profile = validate_stdio_profile(profile)?;
+        if !names.insert(profile.name.clone()) {
+            return Err(DiscoveryError::StdioConfiguration);
+        }
+        validated.push(profile);
+    }
+    registry.profiles = validated;
+    Ok(registry)
+}
+
+fn load_stdio_profile(name: &str) -> Result<StdioLauncherProfile, DiscoveryError> {
+    if !valid_launcher_name(name) {
+        return Err(DiscoveryError::StdioConfiguration);
+    }
+    let path = std::env::var_os("BROKERROUTER_MCP_STDIO_LAUNCHERS_FILE")
+        .map(PathBuf::from)
+        .ok_or(DiscoveryError::StdioConfiguration)?;
+    let path = canonical_regular_file(&path, false)?;
+    let metadata = std::fs::metadata(&path).map_err(|_| DiscoveryError::StdioConfiguration)?;
+    if metadata.len() == 0 || metadata.len() > MAX_STDIO_LAUNCHERS_BYTES as u64 {
+        return Err(DiscoveryError::StdioConfiguration);
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::fs::File::open(path)
+        .map_err(|_| DiscoveryError::StdioConfiguration)?
+        .take((MAX_STDIO_LAUNCHERS_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| DiscoveryError::StdioConfiguration)?;
+    let registry = parse_stdio_registry(&bytes)?;
+    registry
+        .profiles
+        .into_iter()
+        .find(|profile| profile.name == name)
+        .ok_or(DiscoveryError::StdioConfiguration)
+}
+
+fn resolve_stdio_environment(
+    profile: &StdioLauncherProfile,
+) -> Result<ResolvedStdioEnvironment, DiscoveryError> {
+    let manifest = serde_json::to_vec(profile).map_err(|_| DiscoveryError::StdioConfiguration)?;
+    let mut environment = Vec::with_capacity(profile.environment.len());
+    for binding in &profile.environment {
+        let value = std::env::var(&binding.source_environment)
+            .map(Zeroizing::new)
+            .map_err(|_| DiscoveryError::CredentialUnavailable)?;
+        if value.is_empty() || value.len() > MAX_CREDENTIAL_BYTES || value.contains('\0') {
+            return Err(DiscoveryError::InvalidCredential);
+        }
+        environment.push((binding.target.clone(), value));
+    }
+    let mut fingerprint_parts = vec![b"stdio".as_slice(), manifest.as_slice()];
+    for (binding, (_, value)) in profile.environment.iter().zip(&environment) {
+        fingerprint_parts.push(binding.target.as_bytes());
+        fingerprint_parts.push(binding.source_environment.as_bytes());
+        fingerprint_parts.push(value.as_bytes());
+    }
+    let fingerprint = authorization_fingerprint(&fingerprint_parts);
+    Ok(ResolvedStdioEnvironment {
+        values: environment,
+        fingerprint,
+    })
 }
 
 fn valid_environment_name(value: &str) -> bool {
@@ -745,6 +1007,53 @@ where
     result
 }
 
+async fn discover_stdio_wire(
+    profile: &StdioLauncherProfile,
+) -> Result<(DiscoverResult, String), DiscoveryError> {
+    let environment = resolve_stdio_environment(profile)?;
+    let mut command = tokio::process::Command::new(&profile.program);
+    command
+        .args(&profile.arguments)
+        .current_dir(&profile.working_directory)
+        .env_clear()
+        .kill_on_drop(true);
+    for (name, value) in &environment.values {
+        command.env(name, value.as_str());
+    }
+    let (transport, _) = TokioChildProcess::builder(command)
+        // Child stderr can contain tool inputs or credentials. Production
+        // launchers must emit structured diagnostics to their own isolated
+        // sink; the gateway never inherits or stores it.
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| DiscoveryError::StdioLaunch)?;
+    let timeout = Duration::from_millis(profile.timeout_ms);
+    let config = client_config();
+    let mut running = tokio::time::timeout(
+        timeout,
+        config.clone().serve_with_lifecycle(
+            transport,
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            },
+        ),
+    )
+    .await
+    .map_err(|_| DiscoveryError::Protocol)?
+    .map_err(|_| DiscoveryError::Protocol)?;
+    let meta = RequestMetaObject::with_client_context(
+        ProtocolVersion::V_2026_07_28,
+        config.client_info,
+        config.capabilities,
+    );
+    let result = tokio::time::timeout(timeout, running.discover(meta))
+        .await
+        .map_err(|_| DiscoveryError::Protocol)?
+        .map_err(|_| DiscoveryError::Protocol);
+    let _ = running.close_with_timeout(SHUTDOWN_TIMEOUT).await;
+    Ok((result?, environment.fingerprint))
+}
+
 fn discovery_record(
     input: &DiscoverServer,
     server: &ConnectorServer,
@@ -802,6 +1111,25 @@ pub async fn discover_and_record(
     }
     let server =
         mcp_catalog::connector_server(pool, cipher, input.tenant_id, input.server_id).await?;
+    if server.transport == "stdio" {
+        if server.auth_mode != "none"
+            || server.credential_reference.is_some()
+            || server.endpoint_url.is_some()
+        {
+            return Err(DiscoveryError::InvalidCredential);
+        }
+        let profile = load_stdio_profile(
+            server
+                .stdio_profile
+                .as_deref()
+                .ok_or(DiscoveryError::UnsupportedTransport)?,
+        )?;
+        let (result, fingerprint) = discover_stdio_wire(&profile).await?;
+        let record = discovery_record(&input, &server, result, fingerprint)?;
+        return mcp_catalog::record_discovery(pool, record)
+            .await
+            .map_err(DiscoveryError::Catalog);
+    }
     if server.transport != "streamable_http" || server.stdio_profile.is_some() {
         return Err(DiscoveryError::UnsupportedTransport);
     }
@@ -1064,6 +1392,100 @@ mod tests {
             HeaderValue::from_static("application/jsonx"),
         );
         assert!(!has_content_type(&headers, "application/json"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_registry_is_versioned_pre_registered_and_duplicate_free() {
+        let directory = std::env::temp_dir();
+        let program_sha256 = file_sha256(Path::new("/bin/sh")).unwrap();
+        let document = serde_json::to_vec(&json!({
+            "version": 1,
+            "profiles": [{
+                "name": "fixture/read-only",
+                "program": "/bin/sh",
+                "program_sha256": program_sha256,
+                "working_directory": directory,
+                "arguments": ["-c", "exit 0"],
+                "environment": [],
+                "timeout_ms": 5000
+            }]
+        }))
+        .unwrap();
+        let registry = parse_stdio_registry(&document).unwrap();
+        assert_eq!(registry.profiles[0].name, "fixture/read-only");
+        assert!(registry.profiles[0].program.is_absolute());
+
+        let duplicate = serde_json::to_vec(&json!({
+            "version": 1,
+            "profiles": [
+                {
+                    "name": "duplicate",
+                    "program": "/bin/sh",
+                    "program_sha256": file_sha256(Path::new("/bin/sh")).unwrap(),
+                    "working_directory": std::env::temp_dir(),
+                    "arguments": ["-c", "exit 0"],
+                    "environment": [],
+                    "timeout_ms": 5000
+                },
+                {
+                    "name": "duplicate",
+                    "program": "/bin/sh",
+                    "program_sha256": file_sha256(Path::new("/bin/sh")).unwrap(),
+                    "working_directory": std::env::temp_dir(),
+                    "arguments": ["-c", "exit 0"],
+                    "environment": [],
+                    "timeout_ms": 5000
+                }
+            ]
+        }))
+        .unwrap();
+        assert!(parse_stdio_registry(&duplicate).is_err());
+
+        let digest_mismatch = serde_json::to_vec(&json!({
+            "version": 1,
+            "profiles": [{
+                "name": "tampered",
+                "program": "/bin/sh",
+                "program_sha256": "00".repeat(32),
+                "working_directory": std::env::temp_dir(),
+                "arguments": ["-c", "exit 0"],
+                "environment": [],
+                "timeout_ms": 5000
+            }]
+        }))
+        .unwrap();
+        assert!(parse_stdio_registry(&digest_mismatch).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn official_discover_lifecycle_runs_over_managed_stdio() {
+        let script = format!(
+            r#"while IFS= read -r line; do
+id=$(printf '%s\n' "$line" | /usr/bin/sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"resultType":"complete","supportedVersions":["{}"],"capabilities":{{"tools":{{"listChanged":false}}}},"ttlMs":1000,"cacheScope":"private","_meta":{{"io.modelcontextprotocol/serverInfo":{{"name":"stdio-fixture","version":"1.0.0"}}}}}}}}'
+done"#,
+            mcp_catalog::PROTOCOL_VERSION
+        );
+        let profile = validate_stdio_profile(StdioLauncherProfile {
+            name: "fixture".into(),
+            program: PathBuf::from("/bin/sh"),
+            program_sha256: file_sha256(Path::new("/bin/sh")).unwrap(),
+            working_directory: std::env::temp_dir(),
+            arguments: vec!["-c".into(), script],
+            environment: Vec::new(),
+            timeout_ms: 5_000,
+        })
+        .unwrap();
+        let (result, fingerprint) = discover_stdio_wire(&profile).await.unwrap();
+        assert_eq!(
+            result.supported_versions,
+            vec![ProtocolVersion::V_2026_07_28]
+        );
+        assert_eq!(result.cache_scope, RmcpCacheScope::Private);
+        assert_eq!(result.ttl_ms, 1_000);
+        assert_eq!(fingerprint.len(), 64);
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 # MCP Streamable HTTP 上游发现（M6.2b2a）
 
-状态：2026-09-20 完成可独立部署的 M6.2b2a。Brokerrouter 现在可以由隔离的 MCP client 进程读取 M6.2b1 active 连接，解析凭据引用，经官方 `rmcp 3.4.0` 执行 MCP `2026-07-28` `server/discover`，并把完整结果写入不可变能力快照。**本包不是完整 MCP 网关**：stdio、下游 `/mcp`、工具调用/MRTR、Skill 持久审批和官方 client/server conformance 仍未完成。
+状态：2026-09-20 完成可独立部署的 M6.2b2a。Brokerrouter 现在可以由隔离的 MCP client 进程读取 M6.2b1 active 连接，解析凭据引用，经官方 `rmcp 3.4.0` 执行 MCP `2026-07-28` `server/discover`，并把完整结果写入不可变能力快照。后续 [M6.2b2b1](m6-mcp-stdio-discovery.md) 已补充受管 stdio 真实发现。**当前仍不是完整 MCP 网关**：下游 `/mcp`、工具调用/MRTR、Skill 持久审批和官方 client/server conformance 尚未完成。
 
 ## 固定协议与网络边界
 
@@ -55,4 +55,4 @@ brokerrouter --database-url "$DATABASE_URL" mcp-server-discover \
 
 本包测试覆盖严格 Secret 绑定/凭据格式、无歧义认证指纹、真实本机 TCP Streamable HTTP discover、两次请求均无 `initialize`、标准头、self-contained metadata、Bearer 注入、超大 JSON 提前拒绝，以及 PostgreSQL receipt/server 绑定。全仓 fmt、clippy、debug/release 测试继续作为 PR 闸门。
 
-LIVE-22 仍阻断发布声明：需要预生产 HTTPS/OAuth/私有 CA 真实服务认证、官方 conformance 固定版本；M6.2b2b 还需实现预注册 stdio launcher 与统一下游 `/mcp` server（Origin、认证、工具路由），随后 M6.2c–d 完成 Skill 持久审批、MRTR 和 Hermes/OpenClaw 恢复。
+LIVE-22 仍阻断发布声明：需要预生产 HTTPS/OAuth/私有 CA 真实服务认证、官方 conformance 固定版本；M6.2b2b1 已完成预注册 stdio launcher，M6.2b2b2 还需实现统一下游 `/mcp` server（Origin、认证、工具治理路由），随后 M6.2c–d 完成 Skill 持久审批、MRTR 和 Hermes/OpenClaw 恢复。

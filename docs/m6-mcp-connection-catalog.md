@@ -1,6 +1,6 @@
 # MCP 连接与能力目录（M6.2b1）
 
-状态：2026-09-18 完成 M6.2b 的第一个可独立上线切片。该切片建立连接配置和 `server/discover` 结果的生产级持久边界。后续 [M6.2b2a](m6-mcp-http-discovery.md) 已在 2026-09-20 增加 Streamable HTTP 真实网络发现；下游 `/mcp`、stdio、工具调用/MRTR 和官方一致性仍未完成，不能宣称 Brokerrouter 已完整兼容 MCP。
+状态：2026-09-18 完成 M6.2b 的第一个可独立上线切片。该切片建立连接配置和 `server/discover` 结果的生产级持久边界。后续 [M6.2b2a](m6-mcp-http-discovery.md) 增加 Streamable HTTP 真实网络发现，[M6.2b2b1](m6-mcp-stdio-discovery.md) 增加受管 stdio 真实发现；下游 `/mcp`、工具调用/MRTR 和官方一致性仍未完成，不能宣称 Brokerrouter 已完整兼容 MCP。
 
 ## 已实现的不变量
 
@@ -66,4 +66,4 @@ BROKERROUTER_MCP_CONFIG_KEYS={"<KEY_ID>":"<64_HEX_CHARACTERS>"}
 
 新增 PostgreSQL 合约覆盖：并发幂等与冲突、宿主身份、跨租户、密文/AAD、draft/启用/revision、OAuth 三元绑定、非 HTTPS/超大元数据/错误协议/resultType 拒绝、private/public 缓存分区、配置变化后旧快照失效、审计故障原子回滚，以及两个真实受限数据库角色的正反权限。
 
-M6.2b2a 已完成 `rmcp 3.4.0` 固定依赖、Streamable HTTP `server/discover`、Secret 注入 resolver、OAuth metadata/token、issuer/resource/audience 响应验证、DNS/IP 固定、标准头和受限 JSON/SSE。仍未完成：stdio 实际连接、单一 `/mcp` server、下游 Origin/认证/工具路由和官方 client/server conformance；它们继续属于 M6.2b2b/LIVE-22，不能用本地 fixture 替代。
+M6.2b2a 已完成 `rmcp 3.4.0` 固定依赖、Streamable HTTP `server/discover`、Secret 注入 resolver、OAuth metadata/token、issuer/resource/audience 响应验证、DNS/IP 固定、标准头和受限 JSON/SSE；M6.2b2b1 已完成预注册 stdio launcher 和真实 wire。仍未完成：单一 `/mcp` server、下游 Origin/认证/工具治理路由和官方 client/server conformance；它们继续属于 M6.2b2b2/LIVE-22，不能用本地 fixture 替代。
