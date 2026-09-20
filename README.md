@@ -100,4 +100,6 @@ M6.2b2a 完成 [MCP Streamable HTTP 上游发现](docs/m6-mcp-http-discovery.md)
 
 M6.2b2b1 完成 [MCP 受管 stdio 上游发现](docs/m6-mcp-stdio-discovery.md)：部署侧版本化 launcher profile、绝对路径与权限校验、无 shell 启动、清空继承环境、显式 Secret 环境映射、超时终止及授权上下文缓存分区。下游 `/mcp`、工具治理转发、MRTR/Skill 持久审批及官方一致性仍未完成，当前仍不宣称完整 MCP 兼容。
 
+M6.2b2b2a 完成 [下游 MCP 目录边界](docs/m6-mcp-downstream-catalog.md)：单一无状态 `POST /mcp`、Host/Origin/标准头、虚拟 Key、租户隔离目录及绑定完整工具描述摘要的显式 grant。`tools/call` 在持久治理与恢复凭据完成前审计后失败关闭；OAuth 资源令牌、真实治理转发、MRTR 和官方 server conformance 仍待后续包。
+
 2026-09-14 已完成 [阿里云北京 4 模型真实冒烟](docs/live-aliyun-2026-09-14.md)，并记录工具原样回传、Embedding 端点限制和账单核对待办；不据此宣称全部供应商模型或完整生产认证通过。

@@ -1,0 +1,518 @@
+//! Authenticated, stateless downstream MCP catalog edge.
+//!
+//! This first downstream slice deliberately does not execute tools. It exposes
+//! only descriptors explicitly granted to the calling virtual key and records
+//! attempted calls before returning a fail-closed governance error. Execution
+//! is enabled only when M6.2d can bind the operation to a durable turn,
+//! approval and runtime resume credential.
+
+use crate::{
+    error::Error,
+    governance, mcp_catalog,
+    store::{self, Identity},
+};
+use axum::{
+    Router,
+    body::Body,
+    http::{HeaderMap, Request, StatusCode, header, request::Parts},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::post_service,
+};
+use base64::{Engine, prelude::BASE64_STANDARD};
+use chrono::Utc;
+use rmcp::{
+    ErrorData as McpError, RoleServer, ServerHandler,
+    model::{
+        CacheScope, CallToolRequestParams, CallToolResponse, Implementation,
+        InitializeRequestParams, InitializeResult, ListToolsResult, PaginatedRequestParams,
+        ProtocolVersion, ServerCapabilities, ServerConfig, Tool,
+    },
+    service::RequestContext,
+    transport::{
+        StreamableHttpServerConfig, StreamableHttpService,
+        streamable_http_server::session::never::NeverSessionManager,
+    },
+};
+use serde_json::{Value, json};
+use sqlx::PgPool;
+use std::{borrow::Cow, collections::HashSet, sync::Arc};
+use url::Url;
+
+const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+const PAGE_SIZE: i64 = 100;
+
+#[derive(Clone, Debug)]
+pub struct HttpConfig {
+    allowed_hosts: Vec<String>,
+    allowed_origins: Vec<String>,
+}
+
+#[derive(Clone)]
+struct Boundary {
+    allowed_hosts: Arc<HashSet<String>>,
+    allowed_origins: Arc<HashSet<String>>,
+}
+
+impl HttpConfig {
+    pub fn from_env() -> Result<Self, Error> {
+        let hosts =
+            std::env::var("BROKERROUTER_MCP_ALLOWED_HOSTS").map_err(|_| Error::Configuration)?;
+        let origins =
+            std::env::var("BROKERROUTER_MCP_ALLOWED_ORIGINS").unwrap_or_else(|_| "[]".to_owned());
+        Self::new(parse_string_array(&hosts)?, parse_string_array(&origins)?)
+    }
+
+    pub fn new(allowed_hosts: Vec<String>, allowed_origins: Vec<String>) -> Result<Self, Error> {
+        if allowed_hosts.is_empty() || allowed_hosts.len() > 64 || allowed_origins.len() > 64 {
+            return Err(Error::Configuration);
+        }
+        let mut hosts = HashSet::new();
+        for value in allowed_hosts {
+            let normalized = normalize_authority(&value).ok_or(Error::Configuration)?;
+            if !hosts.insert(normalized) {
+                return Err(Error::Configuration);
+            }
+        }
+        let mut origins = HashSet::new();
+        for value in allowed_origins {
+            let normalized = normalize_origin(&value).ok_or(Error::Configuration)?;
+            if !origins.insert(normalized) {
+                return Err(Error::Configuration);
+            }
+        }
+        Ok(Self {
+            allowed_hosts: hosts.into_iter().collect(),
+            allowed_origins: origins.into_iter().collect(),
+        })
+    }
+}
+
+fn parse_string_array(raw: &str) -> Result<Vec<String>, Error> {
+    let values: Vec<String> = serde_json::from_str(raw).map_err(|_| Error::Configuration)?;
+    if values
+        .iter()
+        .any(|value| value.is_empty() || value.len() > 512)
+    {
+        return Err(Error::Configuration);
+    }
+    Ok(values)
+}
+
+fn normalize_authority(value: &str) -> Option<String> {
+    let authority = value.parse::<http::uri::Authority>().ok()?;
+    let host = authority
+        .host()
+        .trim_matches(['[', ']'])
+        .to_ascii_lowercase();
+    if host.is_empty() || host.contains('*') {
+        return None;
+    }
+    Some(match authority.port_u16() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
+}
+
+fn normalize_origin(value: &str) -> Option<String> {
+    if value == "null" {
+        return Some(value.to_owned());
+    }
+    let parsed = Url::parse(value).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() != "/"
+    {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    Some(match parsed.port() {
+        Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+        None => format!("{}://{host}", parsed.scheme()),
+    })
+}
+
+pub fn router(pool: PgPool, config: HttpConfig) -> Router {
+    let boundary = Boundary {
+        allowed_hosts: Arc::new(config.allowed_hosts.iter().cloned().collect()),
+        allowed_origins: Arc::new(config.allowed_origins.iter().cloned().collect()),
+    };
+    let sdk = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_allowed_hosts(config.allowed_hosts)
+        .with_allowed_origins(config.allowed_origins)
+        .enforce_origin_validation()
+        .with_max_request_body_bytes(MAX_REQUEST_BODY_BYTES)
+        .with_stateless_protocol_metadata_required(true);
+    let handler_pool = pool.clone();
+    let service = StreamableHttpService::new(
+        move || {
+            Ok(CatalogServer {
+                pool: handler_pool.clone(),
+            })
+        },
+        Arc::new(NeverSessionManager::default()),
+        sdk,
+    );
+    Router::new()
+        .route("/mcp", post_service(service))
+        .fallback(|| async { Error::NotFound })
+        .layer(middleware::from_fn_with_state(pool, authenticate))
+        .layer(middleware::from_fn_with_state(boundary, validate_boundary))
+        .layer(middleware::from_fn(reject_legacy_headers))
+}
+
+async fn reject_legacy_headers(request: Request<Body>, next: Next) -> Response {
+    if request.headers().contains_key("mcp-session-id")
+        || request.headers().contains_key("last-event-id")
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error":{"code":"legacy_mcp_session_rejected","message":"MCP 2026-07-28 is stateless"}})),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+async fn validate_boundary(
+    axum::extract::State(boundary): axum::extract::State<Boundary>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(normalize_authority);
+    let host_allowed = host.as_ref().is_some_and(|host| {
+        boundary.allowed_hosts.contains(host)
+            || host
+                .rsplit_once(':')
+                .is_some_and(|(without_port, _)| boundary.allowed_hosts.contains(without_port))
+    });
+    let origin_allowed = match request.headers().get(header::ORIGIN) {
+        None => true,
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(normalize_origin)
+            .is_some_and(|origin| boundary.allowed_origins.contains(&origin)),
+    };
+    if !host_allowed || !origin_allowed {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    next.run(request).await
+}
+
+async fn authenticate(
+    axum::extract::State(pool): axum::extract::State<PgPool>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    let mut values = request.headers().get_all(header::AUTHORIZATION).iter();
+    let token = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if values.next().is_some() || token.is_none_or(|token| token.contains(char::is_whitespace)) {
+        return unauthorized();
+    }
+    match store::authenticate(&pool, token.expect("validated bearer token")).await {
+        Ok(identity) => {
+            request.extensions_mut().insert(identity);
+            next.run(request).await
+        }
+        Err(Error::Unauthorized) => unauthorized(),
+        Err(error) => error.into_response(),
+    }
+}
+
+fn unauthorized() -> Response {
+    let mut response = Error::Unauthorized.into_response();
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        "Bearer realm=\"brokerrouter-mcp\", error=\"invalid_token\""
+            .parse()
+            .expect("static challenge"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        "no-store".parse().expect("static header"),
+    );
+    response
+}
+
+#[derive(Clone)]
+struct CatalogServer {
+    pool: PgPool,
+}
+
+fn identity(context: &RequestContext<RoleServer>) -> Result<Identity, McpError> {
+    context
+        .extensions
+        .get::<Parts>()
+        .and_then(|parts| parts.extensions.get::<Identity>())
+        .cloned()
+        .ok_or_else(|| McpError::internal_error("Authenticated identity is unavailable", None))
+}
+
+fn primitive(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn decoded_header(value: &str) -> Option<String> {
+    match value
+        .strip_prefix("=?base64?")
+        .and_then(|value| value.strip_suffix("?="))
+    {
+        Some(value) => String::from_utf8(BASE64_STANDARD.decode(value).ok()?).ok(),
+        None => Some(value.to_owned()),
+    }
+}
+
+fn validate_param_headers(
+    headers: &HeaderMap,
+    schema: &serde_json::Map<String, Value>,
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let mut names = HashSet::new();
+    for (property, schema) in properties {
+        let Some(annotation) = schema.get("x-mcp-header") else {
+            continue;
+        };
+        let annotation = annotation
+            .as_str()
+            .filter(|value| {
+                !value.is_empty()
+                    && value.chars().all(|character| {
+                        character.is_ascii_alphanumeric()
+                            || matches!(
+                                character,
+                                '!' | '#'
+                                    | '$'
+                                    | '%'
+                                    | '&'
+                                    | '\''
+                                    | '*'
+                                    | '+'
+                                    | '-'
+                                    | '.'
+                                    | '^'
+                                    | '_'
+                                    | '`'
+                                    | '|'
+                                    | '~'
+                            )
+                    })
+            })
+            .ok_or_else(|| format!("invalid x-mcp-header annotation for `{property}`"))?;
+        if !names.insert(annotation.to_ascii_lowercase())
+            || !matches!(
+                schema.get("type").and_then(Value::as_str),
+                Some("string" | "integer" | "boolean")
+            )
+        {
+            return Err(format!("invalid x-mcp-header annotation for `{property}`"));
+        }
+        let full = format!("mcp-param-{annotation}");
+        let supplied = headers.get(&full).and_then(|value| value.to_str().ok());
+        let expected = arguments
+            .get(property)
+            .filter(|value| !value.is_null())
+            .and_then(primitive);
+        match (supplied, expected) {
+            (None, None) => {}
+            (Some(_), None) => return Err(format!("unexpected {full} header")),
+            (None, Some(_)) => return Err(format!("missing {full} header")),
+            (Some(supplied), Some(expected)) => {
+                if decoded_header(supplied).as_deref() != Some(expected.as_str()) {
+                    return Err(format!("{full} header does not match body"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+impl ServerHandler for CatalogServer {
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Owned(vec![ProtocolVersion::V_2026_07_28])
+    }
+
+    async fn initialize(
+        &self,
+        _request: InitializeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        Err(McpError::invalid_request(
+            "initialize is not supported by the stateless 2026-07-28 endpoint",
+            None,
+        ))
+    }
+
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::V_2026_07_28)
+            .with_server_info(Implementation::new(
+                "brokerrouter",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
+                "Only virtual-key-authorized tool descriptors are listed. Tool execution remains fail-closed until durable governance resume binding is enabled.",
+            )
+    }
+
+    async fn list_tools(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let who = identity(&context)?;
+        let cursor = request.and_then(|request| request.cursor);
+        let mut rows =
+            mcp_catalog::authorized_tools(&self.pool, &who, cursor.as_deref(), PAGE_SIZE + 1)
+                .await
+                .map_err(|_| McpError::internal_error("Tool catalog is unavailable", None))?;
+        let has_more = rows.len() > PAGE_SIZE as usize;
+        if has_more {
+            rows.truncate(PAGE_SIZE as usize);
+        }
+        let next_cursor = has_more
+            .then(|| rows.last().map(|tool| tool.downstream_name.clone()))
+            .flatten();
+        let ttl_ms = rows
+            .iter()
+            .map(|tool| (tool.expires_at - Utc::now()).num_milliseconds().max(0) as u64)
+            .min()
+            .unwrap_or(0);
+        let mut tools = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut tool: Tool = serde_json::from_value(row.descriptor)
+                .map_err(|_| McpError::internal_error("Stored tool descriptor is invalid", None))?;
+            tool.name = Cow::Owned(row.downstream_name);
+            tools.push(tool);
+        }
+        let mut result = ListToolsResult::with_all_items(tools)
+            .with_ttl_ms(ttl_ms)
+            .with_cache_scope(CacheScope::Private);
+        result.next_cursor = next_cursor;
+        Ok(result)
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let who = identity(&context)?;
+        let tool = mcp_catalog::authorized_tool(&self.pool, &who, request.name.as_ref())
+            .await
+            .map_err(|_| McpError::internal_error("Tool authorization is unavailable", None))?
+            .ok_or_else(|| McpError::invalid_params("Unknown or unauthorized tool", None))?;
+        let arguments = request.arguments.unwrap_or_default();
+        let headers = context
+            .extensions
+            .get::<Parts>()
+            .map(|parts| &parts.headers)
+            .ok_or_else(|| {
+                McpError::internal_error("HTTP request metadata is unavailable", None)
+            })?;
+        let input_schema = tool
+            .descriptor
+            .get("inputSchema")
+            .and_then(Value::as_object)
+            .ok_or_else(|| McpError::internal_error("Stored tool schema is invalid", None))?;
+        validate_param_headers(headers, input_schema, &arguments)
+            .map_err(|reason| McpError::header_mismatch(reason, None))?;
+        let arguments = Value::Object(arguments);
+        let arguments_hash = governance::digest(&arguments)
+            .map_err(|_| McpError::invalid_params("Tool arguments are invalid", None))?;
+        sqlx::query("INSERT INTO audit_events(tenant_id,action,object_id,details) VALUES($1,'mcp.tool_call_blocked',$2,$3)")
+            .bind(who.tenant_id)
+            .bind(tool.downstream_name.clone())
+            .bind(json!({"key_id":who.key_id,"arguments_sha256":governance::hex(&arguments_hash),"reason":"durable_governance_binding_required"}))
+            .execute(&self.pool)
+            .await
+            .map_err(|_| McpError::internal_error("Tool call audit could not be persisted", None))?;
+        Err(McpError::invalid_request(
+            "Tool execution requires a durable governed turn and resume credential",
+            Some(json!({
+                "code":"governance_execution_unavailable",
+                "tool":tool.downstream_name,
+                "argumentsSha256":governance::hex(&arguments_hash)
+            })),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configuration_requires_exact_hosts_and_origins() {
+        assert!(HttpConfig::new(vec![], vec![]).is_err());
+        assert!(HttpConfig::new(vec!["*.example.com".into()], vec![]).is_err());
+        assert!(
+            HttpConfig::new(
+                vec!["Gateway.Example:8443".into()],
+                vec!["https://console.example".into()]
+            )
+            .is_ok()
+        );
+        assert!(
+            HttpConfig::new(
+                vec!["gateway.example".into()],
+                vec!["https://console.example/path".into()]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn annotated_parameter_headers_must_match_body() {
+        let schema = json!({
+            "type":"object",
+            "properties":{"id":{"type":"string","x-mcp-header":"Record-Id"}}
+        });
+        let arguments = json!({"id":"记录-1"});
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "mcp-param-record-id",
+            format!("=?base64?{}?=", BASE64_STANDARD.encode("记录-1"))
+                .parse()
+                .unwrap(),
+        );
+        assert!(
+            validate_param_headers(
+                &headers,
+                schema.as_object().unwrap(),
+                arguments.as_object().unwrap()
+            )
+            .is_ok()
+        );
+        headers.insert("mcp-param-record-id", "different".parse().unwrap());
+        assert!(
+            validate_param_headers(
+                &headers,
+                schema.as_object().unwrap(),
+                arguments.as_object().unwrap()
+            )
+            .is_err()
+        );
+    }
+}

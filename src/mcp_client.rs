@@ -19,8 +19,10 @@ use rmcp::{
     ClientLifecycleMode, ClientServiceExt,
     model::{
         CacheScope as RmcpCacheScope, ClientCapabilities, ClientConfig, DiscoverResult,
-        Implementation, ProtocolVersion, RequestMetaObject, ServerJsonRpcMessage,
+        Implementation, PaginatedRequestParams, ProtocolVersion, RequestMetaObject,
+        ServerJsonRpcMessage, Tool,
     },
+    service::{Peer, RoleClient},
     transport::{
         StreamableHttpClientTransport, TokioChildProcess,
         auth::{
@@ -63,6 +65,16 @@ const MAX_STDIO_PROFILES: usize = 256;
 const MAX_STDIO_ARGUMENTS: usize = 128;
 const MAX_STDIO_ENVIRONMENT: usize = 128;
 const MAX_STDIO_PROGRAM_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_DISCOVERED_TOOLS: usize = 1024;
+const MAX_TOOL_LIST_PAGES: usize = 128;
+
+#[derive(Debug)]
+struct WireDiscovery {
+    result: DiscoverResult,
+    tools: Vec<Tool>,
+    tools_ttl_ms: Option<u64>,
+    tools_cache_scope: Option<RmcpCacheScope>,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DiscoveryError {
@@ -960,11 +972,76 @@ fn client_config() -> ClientConfig {
     .with_protocol_version(ProtocolVersion::V_2026_07_28)
 }
 
+async fn discover_tools(
+    peer: &Peer<RoleClient>,
+    discovery: &DiscoverResult,
+    timeout: Duration,
+) -> Result<(Vec<Tool>, Option<u64>, Option<RmcpCacheScope>), DiscoveryError> {
+    if discovery.capabilities.tools.is_none() {
+        return Ok((Vec::new(), None, None));
+    }
+    let mut tools = Vec::new();
+    let mut cursor = None;
+    let mut cursors = HashSet::new();
+    let mut ttl_ms: Option<u64> = None;
+    let mut cache_scope: Option<RmcpCacheScope> = None;
+    let mut complete = false;
+    for _ in 0..MAX_TOOL_LIST_PAGES {
+        let page = tokio::time::timeout(
+            timeout,
+            peer.list_tools(Some(
+                PaginatedRequestParams::default().with_cursor(cursor.clone()),
+            )),
+        )
+        .await
+        .map_err(|_| DiscoveryError::Protocol)?
+        .map_err(|_| DiscoveryError::Protocol)?;
+        if page
+            .result_type
+            .as_ref()
+            .is_none_or(|kind| kind.as_str() != "complete")
+        {
+            return Err(DiscoveryError::Protocol);
+        }
+        let page_ttl = page.ttl_ms.ok_or(DiscoveryError::Protocol)?;
+        let page_scope = page.cache_scope.ok_or(DiscoveryError::Protocol)?;
+        ttl_ms = Some(ttl_ms.map_or(page_ttl, |current| current.min(page_ttl)));
+        cache_scope = Some(match (cache_scope, page_scope) {
+            (Some(RmcpCacheScope::Private), _) | (_, RmcpCacheScope::Private) => {
+                RmcpCacheScope::Private
+            }
+            (Some(RmcpCacheScope::Public), RmcpCacheScope::Public)
+            | (None, RmcpCacheScope::Public) => RmcpCacheScope::Public,
+            _ => return Err(DiscoveryError::Protocol),
+        });
+        if page.tools.len() > MAX_DISCOVERED_TOOLS.saturating_sub(tools.len()) {
+            return Err(DiscoveryError::Protocol);
+        }
+        tools.extend(page.tools);
+        let Some(next) = page.next_cursor else {
+            complete = true;
+            break;
+        };
+        if next.is_empty() || !cursors.insert(next.clone()) {
+            return Err(DiscoveryError::Protocol);
+        }
+        cursor = Some(next);
+    }
+    if !complete {
+        return Err(DiscoveryError::Protocol);
+    }
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    if tools.windows(2).any(|pair| pair[0].name == pair[1].name) {
+        return Err(DiscoveryError::Protocol);
+    }
+    Ok((tools, ttl_ms, cache_scope))
+}
+
 async fn discover_wire<C>(
     client: C,
     endpoint: &str,
     auth_header: Option<String>,
-) -> Result<DiscoverResult, DiscoveryError>
+) -> Result<WireDiscovery, DiscoveryError>
 where
     C: StreamableHttpClient + Sync,
 {
@@ -1002,14 +1079,21 @@ where
     let result = tokio::time::timeout(DISCOVERY_TIMEOUT, running.discover(meta))
         .await
         .map_err(|_| DiscoveryError::Protocol)?
-        .map_err(|_| DiscoveryError::Protocol);
+        .map_err(|_| DiscoveryError::Protocol)?;
+    let (tools, tools_ttl_ms, tools_cache_scope) =
+        discover_tools(running.peer(), &result, DISCOVERY_TIMEOUT).await?;
     let _ = running.close_with_timeout(SHUTDOWN_TIMEOUT).await;
-    result
+    Ok(WireDiscovery {
+        result,
+        tools,
+        tools_ttl_ms,
+        tools_cache_scope,
+    })
 }
 
 async fn discover_stdio_wire(
     profile: &StdioLauncherProfile,
-) -> Result<(DiscoverResult, String), DiscoveryError> {
+) -> Result<(WireDiscovery, String), DiscoveryError> {
     let environment = resolve_stdio_environment(profile)?;
     let mut command = tokio::process::Command::new(&profile.program);
     command
@@ -1049,17 +1133,33 @@ async fn discover_stdio_wire(
     let result = tokio::time::timeout(timeout, running.discover(meta))
         .await
         .map_err(|_| DiscoveryError::Protocol)?
-        .map_err(|_| DiscoveryError::Protocol);
+        .map_err(|_| DiscoveryError::Protocol)?;
+    let (tools, tools_ttl_ms, tools_cache_scope) =
+        discover_tools(running.peer(), &result, timeout).await?;
     let _ = running.close_with_timeout(SHUTDOWN_TIMEOUT).await;
-    Ok((result?, environment.fingerprint))
+    Ok((
+        WireDiscovery {
+            result,
+            tools,
+            tools_ttl_ms,
+            tools_cache_scope,
+        },
+        environment.fingerprint,
+    ))
 }
 
 fn discovery_record(
     input: &DiscoverServer,
     server: &ConnectorServer,
-    result: DiscoverResult,
+    observed: WireDiscovery,
     fingerprint: String,
 ) -> Result<RecordDiscovery, DiscoveryError> {
+    let WireDiscovery {
+        result,
+        tools,
+        tools_ttl_ms,
+        tools_cache_scope,
+    } = observed;
     let ttl_ms = i32::try_from(result.ttl_ms).map_err(|_| DiscoveryError::Protocol)?;
     let server_info = result
         .server_info()
@@ -1091,6 +1191,22 @@ fn discovery_record(
         instructions: result.instructions,
         ttl_ms,
         cache_scope,
+        tools: tools
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| DiscoveryError::Protocol)?,
+        tools_ttl_ms: tools_ttl_ms
+            .map(i32::try_from)
+            .transpose()
+            .map_err(|_| DiscoveryError::Protocol)?,
+        tools_cache_scope: tools_cache_scope
+            .map(|scope| match scope {
+                RmcpCacheScope::Private => Ok(mcp_catalog::CacheScope::Private),
+                RmcpCacheScope::Public => Ok(mcp_catalog::CacheScope::Public),
+                _ => Err(DiscoveryError::Protocol),
+            })
+            .transpose()?,
         authorization_context_fingerprint: matches!(cache_scope, mcp_catalog::CacheScope::Private)
             .then_some(fingerprint),
     })
@@ -1284,11 +1400,12 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some(mcp_catalog::PROTOCOL_VERSION)
         );
+        let method = request["method"].as_str().unwrap();
         assert_eq!(
             headers
                 .get("mcp-method")
                 .and_then(|value| value.to_str().ok()),
-            Some("server/discover")
+            Some(method)
         );
         assert_eq!(
             headers
@@ -1299,10 +1416,15 @@ mod tests {
         let instructions = state
             .oversized
             .then(|| "x".repeat(MAX_DISCOVERY_RESPONSE_BYTES + 1));
-        let response = json!({
-            "jsonrpc":"2.0",
-            "id":request["id"],
-            "result":{
+        let result = if method == "tools/list" {
+            json!({
+                "resultType":"complete",
+                "tools":[{"name":"lookup","description":"Lookup","inputSchema":{"type":"object","properties":{}}}],
+                "ttlMs":15000,
+                "cacheScope":"private"
+            })
+        } else {
+            json!({
                 "resultType":"complete",
                 "supportedVersions":[mcp_catalog::PROTOCOL_VERSION],
                 "capabilities":{"tools":{"listChanged":true}},
@@ -1310,8 +1432,9 @@ mod tests {
                 "ttlMs":30000,
                 "cacheScope":"private",
                 "_meta":{"io.modelcontextprotocol/serverInfo":{"name":"fixture","version":"1.0.0"}}
-            }
-        });
+            })
+        };
+        let response = json!({"jsonrpc":"2.0","id":request["id"],"result":result});
         (StatusCode::OK, HeaderMap::new(), Json(response))
     }
 
@@ -1464,7 +1587,7 @@ mod tests {
         let script = format!(
             r#"while IFS= read -r line; do
 id=$(printf '%s\n' "$line" | /usr/bin/sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"resultType":"complete","supportedVersions":["{}"],"capabilities":{{"tools":{{"listChanged":false}}}},"ttlMs":1000,"cacheScope":"private","_meta":{{"io.modelcontextprotocol/serverInfo":{{"name":"stdio-fixture","version":"1.0.0"}}}}}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"resultType":"complete","supportedVersions":["{}"],"capabilities":{{}},"ttlMs":1000,"cacheScope":"private","_meta":{{"io.modelcontextprotocol/serverInfo":{{"name":"stdio-fixture","version":"1.0.0"}}}}}}}}'
 done"#,
             mcp_catalog::PROTOCOL_VERSION
         );
@@ -1480,11 +1603,12 @@ done"#,
         .unwrap();
         let (result, fingerprint) = discover_stdio_wire(&profile).await.unwrap();
         assert_eq!(
-            result.supported_versions,
+            result.result.supported_versions,
             vec![ProtocolVersion::V_2026_07_28]
         );
-        assert_eq!(result.cache_scope, RmcpCacheScope::Private);
-        assert_eq!(result.ttl_ms, 1_000);
+        assert_eq!(result.result.cache_scope, RmcpCacheScope::Private);
+        assert_eq!(result.result.ttl_ms, 1_000);
+        assert!(result.tools.is_empty());
         assert_eq!(fingerprint.len(), 64);
     }
 
@@ -1501,25 +1625,41 @@ done"#,
             .await
             .unwrap();
         server.abort();
-        assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 3);
         assert_eq!(
-            result.supported_versions,
+            result.result.supported_versions,
             vec![ProtocolVersion::V_2026_07_28]
         );
-        assert_eq!(result.ttl_ms, 30_000);
-        assert_eq!(result.cache_scope, RmcpCacheScope::Private);
+        assert_eq!(result.result.ttl_ms, 30_000);
+        assert_eq!(result.result.cache_scope, RmcpCacheScope::Private);
+        assert_eq!(result.tools.len(), 1);
+        assert_eq!(result.tools_ttl_ms, Some(15_000));
         let requests = fixture.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "server/discover")
+                .count(),
+            2
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "tools/list")
+                .count(),
+            1
+        );
         assert!(
             requests
                 .iter()
-                .all(|request| request["method"] == "server/discover")
+                .filter(|request| request["method"] == "server/discover")
+                .all(|request| {
+                    request["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"]
+                        == mcp_catalog::PROTOCOL_VERSION
+                        && request["params"]["_meta"]["io.modelcontextprotocol/clientInfo"]["name"]
+                            == "brokerrouter"
+                })
         );
-        assert!(requests.iter().all(|request| {
-            request["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"]
-                == mcp_catalog::PROTOCOL_VERSION
-                && request["params"]["_meta"]["io.modelcontextprotocol/clientInfo"]["name"]
-                    == "brokerrouter"
-        }));
     }
 
     #[tokio::test]

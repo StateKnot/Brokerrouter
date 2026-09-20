@@ -10,7 +10,7 @@
 | M3 护栏与用户审批 | 用户身份与 Agent 分离、turn 权威生命周期、持久审批、输出隔离、当前 turn 豁免、恢复协议 | 代批失败、重复决定原子、迟到批准失效、重启不重复副作用 | 核心及文本语义连接器已实现；多模态/专用审核适配、检测质量与真实 BFF/Runtime 认证待完成 |
 | M4 多模态作业与资产 | 同步图像/异步视频/3D、连接器配置、持久 worker、提交不确定、私有资产、回调 | 接收后断线不重提、转存恢复、取消竞态、跨租户资产访问拒绝 | 资产/计费、文生视频作业、隔离转存、扫描与技术检测、资产策略及真人审批交付、隔离 MP4 预览已实现；专用内容语义、其他模态预览、图片/3D/其他协议待开发，生产认证待完成 |
 | M5 控制台与治理 | TypeScript 控制台、OIDC、模型/端点、策略/护栏、汇率、人民币统计、任务审计、经验/评测样本 | 页面使用真实 API；各维度账本一致；权限矩阵与审批审计 | 报表、OIDC BFF、配置管理、护栏监控、本人 JSON/隔离 MP4 审阅审批、逐轮次节点/调用/事件治理与 HTTPS edge 已实现；其他模态预览、经验候选/评测样本和其余统计维度待开发，真实 IdP/整链路/部署待认证 |
-| M6 Runtime、MCP 与生产认证 | Hermes Python / OpenClaw TypeScript Adapter、MCP 2026-07-28/Skills、通道认证、压测、故障演练、部署与回滚 | 指定版本完整调用/审批/恢复；MCP 官方 client/server 一致性；容量、RPO/RTO、凭据与真实费用边界达标 | Hermes 0.21.1 M6.1a/b 已实现工具输入强制门、受信 turn 绑定与原生审批通知；M6.2a 完成 MCP/Skills 安全内核，M6.2b1 完成连接目录，M6.2b2a 完成 Streamable HTTP 上游发现，M6.2b2b1 完成受管 stdio 上游发现；下游 `/mcp`、MRTR/持久审批/官方认证、输出/产物发布、OpenClaw 仍待完成 |
+| M6 Runtime、MCP 与生产认证 | Hermes Python / OpenClaw TypeScript Adapter、MCP 2026-07-28/Skills、通道认证、压测、故障演练、部署与回滚 | 指定版本完整调用/审批/恢复；MCP 官方 client/server 一致性；容量、RPO/RTO、凭据与真实费用边界达标 | Hermes 0.21.1 M6.1a/b 已实现工具输入强制门、受信 turn 绑定与原生审批通知；M6.2a 完成 MCP/Skills 安全内核，M6.2b1 完成连接目录，M6.2b2a/b2b1 完成 HTTP/stdio 上游发现，M6.2b2b2a 完成下游只读 `/mcp` 与 Key 工具摘要授权；OAuth 资源认证、真实治理转发、MRTR/持久 Skill 审批/官方认证、输出/产物发布、OpenClaw 仍待完成 |
 
 ## v0.3 已决定的实施契约
 
@@ -368,3 +368,11 @@ OAuth client credentials 配置固定 issuer/resource/audience 且 audience 必�
 2026-09-20，完成 [受管 stdio 发现执行边界](m6-mcp-stdio-discovery.md)。部署侧使用版本化只读 launcher registry；租户仅能引用 profile 名称。connector 对 registry/program 绝对规范路径、Unix 权限、参数/环境/数量/超时做严格校验，以无 shell、清空环境、显式环境映射和丢弃 stderr 的方式启动官方 `rmcp 3.4.0` child transport。stdio 禁止配置 HTTP Bearer/OAuth，private cache 绑定完整 launcher manifest 与注入环境值。
 
 真实 stdio wire fixture 验证两次 2026-07-28 discover、版本选择、可执行文件摘要、私有缓存指纹与关闭路径通过；新增依赖固定进 lockfile。常规 Rust **216 项通过、0 失败**；首次全量运行有 1 个既有媒体并发用例在 1 秒等待窗超时，隔离复跑通过；4 个既有 MinIO/固定 ClamAV/FFmpeg 专项按 CI 闸门 ignored。fmt、Clippy `-D warnings` 和 release 锁定依赖构建通过。未完成边界：统一下游 `/mcp`、虚拟密钥/OAuth 资源认证、Host/Origin/标准头、租户工具目录与治理后转发仍属 M6.2b2b2；Skill 持久审批、MRTR、Hermes/OpenClaw 恢复与官方冻结 conformance/预生产认证继续由 M6.2c–d/LIVE-22 阻断。
+
+## M6.2b2b2a：下游 MCP 目录与摘要授权
+
+2026-09-20，完成 [下游 MCP 目录边界](m6-mcp-downstream-catalog.md)。新增单一无状态 `POST /mcp`，固定官方 `rmcp 3.4.0`/协议 `2026-07-28`，强制 Host、Origin、Accept、协议版本、逐请求元数据和标准头，拒绝 initialize、旧 session/Last-Event-ID 与 GET。当前使用虚拟 Key 鉴权，独立 `brokerrouter_mcp_server` 角色不能读取上游 credential、审批或修改 grant。
+
+上游发现现在在同一认证生命周期内完整分页采集 `tools/list`，以 snapshot/revision/TTL/cacheScope 保存不可变目录。Key 工具 grant 绑定完整 descriptor SHA-256；上游更改描述、schema、annotations、icons 或 `_meta` 后旧授权自动失效。`tools/list` 只返回当前 Key 的明确授权；`tools/call` 重新鉴权并写参数摘要审计后返回 `governance_execution_unavailable`，不会直连上游或产生副作用。
+
+未完成边界：OAuth Protected Resource/JWT、治理后的真实上游调用、MRTR input_required、执行租约/回执、Hermes/OpenClaw 恢复和冻结官方 server conformance 仍属 M6.2b2b/M6.2d；因此本包是可部署的只读目录服务，不是完整 MCP 工具代理。
