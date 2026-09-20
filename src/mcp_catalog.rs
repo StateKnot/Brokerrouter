@@ -555,6 +555,37 @@ pub async fn connector_server(
     })
 }
 
+/// Return a completed discovery receipt before any retry performs network I/O.
+/// The operation must already belong to the same tenant, server and mutation
+/// kind; otherwise it is an idempotency conflict rather than a cache hit.
+pub async fn discovery_receipt(
+    pool: &PgPool,
+    tenant: Uuid,
+    server: Uuid,
+    operation: Uuid,
+) -> Result<Option<Value>> {
+    let row: Option<(String, Value)> = sqlx::query_as(
+        "SELECT m.kind,m.response FROM mcp_catalog_mutations m JOIN tenants t ON t.id=m.tenant_id AND t.active WHERE m.tenant_id=$1 AND m.operation_id=$2",
+    )
+    .bind(tenant)
+    .bind(operation)
+    .fetch_optional(pool)
+    .await?;
+    let Some((kind, response)) = row else {
+        return Ok(None);
+    };
+    if kind != "discovery_record"
+        || response
+            .get("server_id")
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            != Some(server)
+    {
+        return Err(Error::Conflict);
+    }
+    Ok(Some(response))
+}
+
 pub async fn record_discovery(pool: &PgPool, input: RecordDiscovery) -> Result<Value> {
     validate_common(&input.actor, None, None)?;
     if input.expected_server_revision < 1

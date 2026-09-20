@@ -239,6 +239,17 @@ enum Command {
         #[arg(long)]
         file: std::path::PathBuf,
     },
+    McpServerDiscover {
+        #[arg(long)]
+        tenant: Uuid,
+        #[arg(long)]
+        server: Uuid,
+        /// Durable idempotency identity; reuse the same value after an uncertain CLI result.
+        #[arg(long)]
+        operation: Uuid,
+        #[arg(long)]
+        actor: String,
+    },
     KeyCreate {
         #[arg(long)]
         tenant: Uuid,
@@ -612,6 +623,30 @@ async fn main() -> anyhow::Result<()> {
                     &pool,
                     &brokerrouter::cipher::ResultCipher::from_mcp_env()?,
                     input,
+                )
+                .await?
+            );
+        }
+        Command::McpServerDiscover {
+            tenant,
+            server,
+            operation,
+            actor,
+        } => {
+            brokerrouter::check_schema(&pool).await?;
+            let resolver = brokerrouter::mcp_client::InjectedCredentialResolver::from_env()?;
+            println!(
+                "{}",
+                brokerrouter::mcp_client::discover_and_record(
+                    &pool,
+                    &brokerrouter::cipher::ResultCipher::from_mcp_env()?,
+                    &resolver,
+                    brokerrouter::mcp_client::DiscoverServer {
+                        tenant_id: tenant,
+                        server_id: server,
+                        operation_id: operation,
+                        actor,
+                    },
                 )
                 .await?
             );

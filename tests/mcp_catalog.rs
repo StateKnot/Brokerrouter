@@ -159,6 +159,7 @@ async fn oauth_revision_discovery_cache_and_self_report_are_not_identity(pool: P
     );
 
     let observation = discovery(tenant_id, server_id, 2);
+    let discovery_operation = observation.operation_id;
     let first = mcp_catalog::record_discovery(&pool, observation.clone())
         .await
         .unwrap();
@@ -168,6 +169,16 @@ async fn oauth_revision_discovery_cache_and_self_report_are_not_identity(pool: P
             .await
             .unwrap()
     );
+    assert_eq!(
+        mcp_catalog::discovery_receipt(&pool, tenant_id, server_id, discovery_operation)
+            .await
+            .unwrap(),
+        Some(first.clone())
+    );
+    assert!(matches!(
+        mcp_catalog::discovery_receipt(&pool, tenant_id, Uuid::new_v4(), discovery_operation).await,
+        Err(Error::Conflict)
+    ));
     assert!(matches!(
         mcp_catalog::current_discovery(&pool, tenant_id, server_id, None).await,
         Err(Error::NotFound)

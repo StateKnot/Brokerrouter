@@ -21,6 +21,7 @@ pub mod human;
 mod judge;
 pub mod mcp;
 pub mod mcp_catalog;
+pub mod mcp_client;
 pub mod media;
 pub mod media_api;
 pub mod media_protocol;

@@ -36,6 +36,23 @@ fn public_ip(ip: IpAddr) -> bool {
     }
 }
 
+fn allowed_ip(ip: IpAddr, allow_private: bool) -> bool {
+    if public_ip(ip) {
+        return true;
+    }
+    if !allow_private {
+        return false;
+    }
+    // Private mode is deliberately narrower than "allow anything": ordinary
+    // RFC1918/ULA and loopback targets are valid deployment choices, but link
+    // local metadata, multicast, unspecified, transition and benchmark ranges
+    // never are.
+    match ip {
+        IpAddr::V4(value) => value.is_private() || value.is_loopback(),
+        IpAddr::V6(value) => value.is_loopback() || value.segments()[0] & 0xfe00 == 0xfc00,
+    }
+}
+
 pub async fn client(e: &Endpoint, timeout: Duration) -> Result<(Client, url::Url)> {
     e.validate()?;
     let path = if e.operation == "chat" {
@@ -53,6 +70,15 @@ pub(crate) async fn pinned_client(
     url: &url::Url,
     allow_private: bool,
     timeout: Duration,
+) -> Result<Client> {
+    pinned_client_with_roots(url, allow_private, timeout, &[]).await
+}
+
+pub(crate) async fn pinned_client_with_roots(
+    url: &url::Url,
+    allow_private: bool,
+    timeout: Duration,
+    roots: &[reqwest::Certificate],
 ) -> Result<Client> {
     let host = url.host_str().ok_or(Error::Configuration)?;
     let port = url.port_or_known_default().ok_or(Error::Configuration)?;
@@ -72,11 +98,14 @@ pub(crate) async fn pinned_client(
     if addrs.is_empty() {
         return Err(Error::NotSubmitted);
     }
-    if !allow_private && addrs.iter().any(|a| !public_ip(a.ip())) {
+    if addrs
+        .iter()
+        .any(|address| !allowed_ip(address.ip(), allow_private))
+    {
         return Err(Error::Invalid("endpoint resolves to a prohibited network"));
     }
     // Resolve once, validate, then pin these addresses. No redirects or implicit retries/proxies.
-    let client = Client::builder()
+    let mut builder = Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
@@ -87,9 +116,11 @@ pub(crate) async fn pinned_client(
         .no_deflate()
         .no_zstd()
         .referer(false)
-        .resolve_to_addrs(host, &addrs)
-        .build()
-        .map_err(|_| Error::Configuration)?;
+        .resolve_to_addrs(host, &addrs);
+    for root in roots {
+        builder = builder.add_root_certificate(root.clone());
+    }
+    let client = builder.build().map_err(|_| Error::Configuration)?;
     Ok(client)
 }
 
@@ -117,6 +148,20 @@ mod tests {
         }
         for ip in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
             assert!(public_ip(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["127.0.0.1", "10.0.0.1", "::1", "fd00::1"] {
+            assert!(allowed_ip(ip.parse().unwrap(), true), "{ip}");
+        }
+        for ip in [
+            "169.254.169.254",
+            "100.64.0.1",
+            "198.19.0.1",
+            "224.0.0.1",
+            "0.0.0.0",
+            "fe80::1",
+            "2002:7f00:1::",
+        ] {
+            assert!(!allowed_ip(ip.parse().unwrap(), true), "{ip}");
         }
     }
 }
