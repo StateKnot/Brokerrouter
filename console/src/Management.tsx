@@ -744,6 +744,8 @@ function EndpointCreate({
           operation,
           supports_tools:
             operation === "chat" && value(f, "supports_tools") === "true",
+          supports_streaming:
+            operation === "chat" && value(f, "supports_streaming") === "true",
           embedding_dimension:
             operation === "embedding" ? number(f, "embedding_dimension") : null,
         };
@@ -812,13 +814,22 @@ function EndpointCreate({
           />
         </label>
       ) : (
-        <label>
-          支持工具调用
-          <select name="supports_tools" defaultValue="false">
-            <option value="false">否</option>
-            <option value="true">是</option>
-          </select>
-        </label>
+        <>
+          <label>
+            支持工具调用
+            <select name="supports_tools" defaultValue="false">
+              <option value="false">否</option>
+              <option value="true">是</option>
+            </select>
+          </label>
+          <label>
+            支持 SSE 流式响应
+            <select name="supports_streaming" defaultValue="false">
+              <option value="false">否</option>
+              <option value="true">是（需完成端点联调认证）</option>
+            </select>
+          </label>
+        </>
       )}
       <PriceFields />
     </MutationForm>
@@ -1031,9 +1042,10 @@ function ModelDetail({
                     </dd>
                   </div>
                   <div>
-                    <dt>工具调用 / 向量维度</dt>
+                    <dt>工具调用 / SSE / 向量维度</dt>
                     <dd>
                       {e.supports_tools ? "支持" : "不支持"} /{" "}
+                      {e.supports_streaming ? "支持" : "不支持"} /{" "}
                       {e.embedding_dimension ?? "不适用"}
                     </dd>
                   </div>

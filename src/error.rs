@@ -19,6 +19,10 @@ pub enum Error {
     Conflict,
     #[error("configuration changed; reload and review before saving")]
     ConfigConflict,
+    #[error(
+        "a personal profile with this name already exists; revoke or rotate its key explicitly"
+    )]
+    PersonalProfileExists,
     #[error("no effective USD/CNY exchange rate is configured")]
     MissingFx,
     #[error("operation is already in progress or awaiting reconciliation")]
@@ -27,6 +31,10 @@ pub enum Error {
     SchemaMismatch,
     #[error("no authorized endpoint satisfies this request")]
     NoEndpoint,
+    #[error("the selected logical model has no active endpoint certified for {0}")]
+    UnsupportedCapability(&'static str),
+    #[error("SSE streaming is unavailable while a matching post-output guardrail is active")]
+    StreamingGuardrail,
     #[error("upstream outcome is uncertain; inspect the request before taking further action")]
     UpstreamUnknown,
     #[error("all candidate endpoints failed before submission")]
@@ -84,10 +92,18 @@ impl IntoResponse for Error {
             Self::Budget => (StatusCode::TOO_MANY_REQUESTS, "budget_exceeded"),
             Self::Conflict => (StatusCode::CONFLICT, "idempotency_conflict"),
             Self::ConfigConflict => (StatusCode::CONFLICT, "configuration_conflict"),
+            Self::PersonalProfileExists => (StatusCode::CONFLICT, "personal_profile_exists"),
             Self::MissingFx => (StatusCode::SERVICE_UNAVAILABLE, "exchange_rate_missing"),
             Self::InProgress => (StatusCode::CONFLICT, "operation_in_progress"),
             Self::SchemaMismatch => (StatusCode::SERVICE_UNAVAILABLE, "schema_mismatch"),
             Self::NoEndpoint => (StatusCode::BAD_REQUEST, "no_compatible_endpoint"),
+            Self::UnsupportedCapability(_) => {
+                (StatusCode::BAD_REQUEST, "unsupported_model_capability")
+            }
+            Self::StreamingGuardrail => (
+                StatusCode::BAD_REQUEST,
+                "streaming_requires_unbuffered_output",
+            ),
             Self::UpstreamUnknown => (StatusCode::BAD_GATEWAY, "submission_unknown"),
             Self::NotSubmitted => (StatusCode::BAD_GATEWAY, "not_submitted"),
             Self::Configuration => (StatusCode::SERVICE_UNAVAILABLE, "configuration_error"),

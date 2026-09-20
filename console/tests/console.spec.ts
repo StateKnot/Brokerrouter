@@ -29,6 +29,7 @@ const catalogEndpoint = {
   priority: 100,
   operation: "chat",
   supports_tools: false,
+  supports_streaming: false,
   embedding_dimension: null,
   connection: {
     id: "approved",

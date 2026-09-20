@@ -108,7 +108,7 @@ async fn endpoint_change(pool: &PgPool, f: &Fixture) -> Value {
     assert_eq!(s, StatusCode::OK, "{r}");
     assert!(!r.to_string().contains("credential_env"));
     assert!(!r.to_string().contains("provider.example"));
-    json!({"kind":"endpoint_create","model_id":"test/model","connection_id":"approved","connection_revision":r["connections"][0]["revision"],"name":"Provider 1","upstream_model":"upstream-v1","currency":"CNY","input_per_million":"0.000000000001","output_per_million":"2.50","context_tokens":4096,"max_output_tokens":1024,"priority":100,"operation":"chat","supports_tools":false,"embedding_dimension":null})
+    json!({"kind":"endpoint_create","model_id":"test/model","connection_id":"approved","connection_revision":r["connections"][0]["revision"],"name":"Provider 1","upstream_model":"upstream-v1","currency":"CNY","input_per_million":"0.000000000001","output_per_million":"2.50","context_tokens":4096,"max_output_tokens":1024,"priority":100,"operation":"chat","supports_tools":false,"supports_streaming":false,"embedding_dimension":null})
 }
 #[sqlx::test(migrations = "./migrations")]
 async fn catalog_permissions_purpose_tenant_and_no_secret_boundary(pool: PgPool) {

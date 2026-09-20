@@ -1,10 +1,10 @@
 # 未完成验收清单
 
-更新：2026-09-18。此清单是发布闸门，不是允许跳过测试的豁免。仅本地 fixture/故障注入通过不能关闭真实认证项；只有补充版本、环境、证据、执行日期和结果后才能标为通过。用户此前要求先开发、后期统一测试；2026-09-14 已授权阿里云北京真实多模型联调，费用上限 ¥20，结果见 [本轮报告](live-aliyun-2026-09-14.md)。其他供应商/BFF/Runtime 仍按需获取条件，不因此关闭发布闸门。
+更新：2026-09-20。此清单是发布闸门，不是允许跳过测试的豁免。仅本地 fixture/故障注入通过不能关闭真实认证项；只有补充版本、环境、证据、执行日期和结果后才能标为通过。用户此前要求先开发、后期统一测试；2026-09-14 已授权阿里云北京真实多模型联调，费用上限 ¥20，结果见 [本轮报告](live-aliyun-2026-09-14.md)。其他供应商/BFF/Runtime 仍按需获取条件，不因此关闭发布闸门。
 
 | ID | 里程碑 | 未完成验证 | 需要的条件 | 状态 |
 | --- | --- | --- | --- | --- |
-| LIVE-01 | M2 | 首批国内供应商 Chat、工具调用、Embedding 协议及真实 usage/费用核对 | 供应商、区域、固定模型版本、凭据环境变量/Secret 引用、人民币费用上限 | 阿里云北京 4 模型/6 调用冒烟及配置价记账通过；工具原样回传缺陷、Embedding 端点上限及真实账单核对待完成，发布阻断；见 [报告](live-aliyun-2026-09-14.md) |
+| LIVE-01 | M2 | 首批国内供应商 Chat、工具调用、SSE、Embedding 协议及真实 usage/费用核对 | 供应商、区域、固定模型版本、凭据环境变量/Secret 引用、人民币费用上限 | 阿里云北京 4 模型/6 调用冒烟及配置价记账通过；工具 `index` 规范化已在当前代码修复并有本地精确往返回归，但真实两轮复验、SSE 真实中断/用量、Embedding 端点上限及真实账单核对仍待完成，发布阻断；见 [报告](live-aliyun-2026-09-14.md) |
 | LIVE-02 | M2 | 同逻辑模型多供应商语义和能力一致性；Embedding 向量空间相容 | 两家实际端点、固定测试集；不能仅凭维度相同认证 | 待联调，发布阻断 |
 | LIVE-03 | M2 | 固定 Python/JavaScript SDK 的幂等键、409 与禁止重试响应、超时/重连行为 | 固定 SDK 版本、真实网关环境 | 待认证，发布阻断 |
 | LIVE-04 | M2 | 供应商错误响应、断线后受理/计费状态查询及人工费用核对流程 | 供应商可查账记录、故障场景、审计证据 | 待联调，发布阻断 |
@@ -26,11 +26,11 @@
 | LIVE-20 | M5/M4/M6 | 浏览器→实际 IdP/MFA→BFF→media-review/approvals→私有产物→Runtime 下载/关轮整链路；独立可注册域名/DNS/TLS/无凭据静态发布链、受管浏览器及 codec/内存/人工感知、64 MiB 峰值/跨副本撤权/失联/签名解密轮换、GetObject-only 与最小 DB 角色、0018 升级/恢复/审计留存容量/人工键盘读屏 | 预生产双站点/IdP/MFA/受管终端、私有存储与固定 Runtime、明确 SLO/归档制度；先用合成视频和零费用任务，不先索取供应商密钥 | [隔离 MP4 审阅与审批](m5-isolated-media-review.md)已实现，本地合约不替代真实部署/质量认证；发布阻断，其他模态预览与原生 Runtime 仍需开发 |
 
 | LIVE-21 | M5/M6 | 逐节点治理真实 IdP→BFF→console 分权/读取中撤权、组织审计范围、0019 索引维护窗口/恢复、实际规模查询计划/容量/留存、迟到入账与供应商对账、人工读屏；Hermes 强制入口/持久暂停点/版本与 claim 丢响应/副作用后崩溃演练 | 生产等价数据和 SLO、实际部署角色/IdP、Hermes 固定可重建代码/镜像、独立零费用工具环境；Claw 需明确项目与版本 | [逐节点治理](m5-node-call-governance.md)已实现；[Hermes M6.1a/b](m6-hermes-native-integration.md)已完成固定三文件 overlay、启动完整性校验、受信 turn 绑定、原生审批通知、加密检查点及 claim/崩溃防重派发本地合约。实际部署、输出/产物隔离发布、规模与进程终止演练仍待完成，不能关闭此闸门 |
-| LIVE-22 | M6 | MCP 2026-07-28 client/server、Streamable HTTP 标准头/Origin、OAuth issuer/resource/audience、MRTR、Skills 来源/完整性/缓存/审批，以及 Hermes/OpenClaw 原生整链路 | 固定 `rmcp 3.4.0`、官方 conformance 版本、预生产 HTTPS/OAuth、至少两个受控 MCP server、零费用工具/Skill fixture、生产等价多副本和 SLO | [M6.2a 协议评审与 Skill 安全内核](m6-mcp-2026-skills.md)、[M6.2b1 连接/能力持久目录](m6-mcp-connection-catalog.md)、[M6.2b2a Streamable HTTP 上游发现](m6-mcp-http-discovery.md)及 [M6.2b2b1 受管 stdio 上游发现](m6-mcp-stdio-discovery.md)已完成；下游 `/mcp`/Origin/工具治理路由、持久 Skill 审批、MRTR、官方 conformance 和预生产 HTTPS/OAuth 认证仍未完成，发布阻断 |
+| LIVE-22 | M6 | MCP 2026-07-28 client/server、Streamable HTTP 标准头/Origin、OAuth issuer/resource/audience、MRTR、Skills 来源/完整性/缓存/审批，以及 Hermes/OpenClaw 原生整链路 | 固定 `rmcp 3.4.0`、官方 conformance 版本、预生产 HTTPS/OAuth、至少两个受控 MCP server、零费用工具/Skill fixture、生产等价多副本和 SLO | 安全内核、连接目录、HTTP/stdio 上游发现、下游无状态 `/mcp`、工具摘要授权与 OAuth JWT 资源认证已实现；治理后真实 `tools/call`、持久 Skill 审批、MRTR、官方 conformance 和预生产 HTTPS/OAuth 认证仍未完成，发布阻断 |
 
 记录格式：测试 ID、代码提交、供应商/Runtime/SDK 版本、配置版本、输入样本引用（不提交敏感正文）、脱敏证据、人民币实际费用、通过/失败、问题单。真实密钥不得进入本文或仓库。
 
-SSE、Responses、图片/3D/其他多模态连接器及相应预览、Hermes 输出/产物隔离发布、OpenClaw 原生 Runtime 和控制台剩余治理页面仍属后续开发，不混记为已实现能力的“待测”；本人文本/工具 JSON 审阅 BFF 已在 M5.4a 实现，MP4 隔离审阅与媒体审批在 M5.4b 实现，Hermes 受信 turn/工具输入暂停与审批通知已在 M6.1a/b 实现。
+Chat SSE 已实现且有本地中断/结算/重放故障回归，真实供应商能力仍属 LIVE-01。Responses、图片/3D/其他多模态连接器及相应预览、Hermes 输出/产物隔离发布、OpenClaw 原生 Runtime 和控制台剩余治理页面仍属后续开发，不混记为已实现能力的“待测”；本人文本/工具 JSON 审阅 BFF 已在 M5.4a 实现，MP4 隔离审阅与媒体审批在 M5.4b 实现，Hermes 受信 turn/工具输入暂停与审批通知已在 M6.1a/b 实现。
 
 ## M3 新增待办与明确未开放能力
 

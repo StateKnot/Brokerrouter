@@ -1,6 +1,6 @@
 use crate::{
     error::{Error, Result},
-    money::PriceSnapshot,
+    money::{self, PriceSnapshot},
 };
 use chrono::{DateTime, Utc};
 use rand::RngCore;
@@ -67,6 +67,189 @@ pub async fn create_tenant(pool: &PgPool, name: &str, budget: i64) -> Result<Uui
     Ok(id)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersonalProfile {
+    pub profile_name: String,
+    pub tenant_budget_cny: String,
+    pub key_budget_cny: String,
+    #[serde(default = "default_personal_key_ttl_hours")]
+    pub key_ttl_hours: i64,
+    pub model_id: String,
+    pub model_name: String,
+    pub endpoint: PersonalEndpoint,
+}
+
+fn default_personal_key_ttl_hours() -> i64 {
+    720
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersonalEndpoint {
+    pub name: String,
+    pub upstream_model: String,
+    pub base_url: String,
+    pub credential_env: String,
+    #[serde(default)]
+    pub allow_private: bool,
+    pub input_per_million_cny: String,
+    pub output_per_million_cny: String,
+    pub context_tokens: i32,
+    pub max_output_tokens: i32,
+    #[serde(default = "default_endpoint_priority")]
+    pub priority: i32,
+    #[serde(default)]
+    pub supports_tools: bool,
+    #[serde(default)]
+    pub supports_streaming: bool,
+}
+
+fn default_endpoint_priority() -> i32 {
+    100
+}
+
+#[derive(Debug, Serialize)]
+pub struct PersonalBootstrap {
+    pub tenant_id: Uuid,
+    pub key_id: Uuid,
+    pub endpoint_id: Uuid,
+    pub model_id: String,
+    pub key: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+fn new_virtual_key() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    format!(
+        "sk_br_{}",
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
+pub async fn init_personal(pool: &PgPool, profile: PersonalProfile) -> Result<PersonalBootstrap> {
+    if !crate::governance::valid_text(&profile.profile_name, 100)
+        || !crate::governance::valid_text(&profile.model_id, 200)
+        || !crate::governance::valid_text(&profile.model_name, 200)
+        || !(1..=8_760).contains(&profile.key_ttl_hours)
+    {
+        return Err(Error::Invalid(
+            "invalid personal profile identity or key TTL",
+        ));
+    }
+    let tenant_budget = money::cny_micros(&profile.tenant_budget_cny)?;
+    let key_budget = money::cny_micros(&profile.key_budget_cny)?;
+    if key_budget > tenant_budget {
+        return Err(Error::Invalid(
+            "personal key budget cannot exceed tenant budget",
+        ));
+    }
+    let tenant_id = Uuid::new_v4();
+    let key_id = Uuid::new_v4();
+    let token = new_virtual_key();
+    let expires_at = Utc::now() + chrono::Duration::hours(profile.key_ttl_hours);
+    let tenant_name = format!("personal:{}", profile.profile_name);
+    let endpoint = Endpoint {
+        id: Uuid::new_v4(),
+        tenant_id,
+        model_id: profile.model_id.clone(),
+        name: profile.endpoint.name,
+        upstream_model: profile.endpoint.upstream_model,
+        base_url: profile.endpoint.base_url,
+        credential_env: profile.endpoint.credential_env,
+        allow_private: profile.endpoint.allow_private,
+        currency: "CNY".into(),
+        input_per_million: money::nonnegative(&profile.endpoint.input_per_million_cny)?,
+        output_per_million: money::nonnegative(&profile.endpoint.output_per_million_cny)?,
+        context_tokens: profile.endpoint.context_tokens,
+        max_output_tokens: profile.endpoint.max_output_tokens,
+        priority: profile.endpoint.priority,
+        operation: "chat".into(),
+        supports_tools: profile.endpoint.supports_tools,
+        supports_streaming: profile.endpoint.supports_streaming,
+        embedding_dimension: None,
+    };
+    endpoint.validate()?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(format!("brokerrouter-personal:{tenant_name}"))
+        .execute(&mut *tx)
+        .await?;
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tenants WHERE name=$1)")
+        .bind(&tenant_name)
+        .fetch_one(&mut *tx)
+        .await?;
+    if exists {
+        return Err(Error::PersonalProfileExists);
+    }
+    sqlx::query("INSERT INTO tenants(id,name,budget_micros) VALUES($1,$2,$3)")
+        .bind(tenant_id)
+        .bind(&tenant_name)
+        .bind(tenant_budget)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO models(tenant_id,id,name) VALUES($1,$2,$3)")
+        .bind(tenant_id)
+        .bind(&profile.model_id)
+        .bind(&profile.model_name)
+        .execute(&mut *tx)
+        .await?;
+    insert_endpoint(&mut tx, &endpoint).await?;
+    sqlx::query("INSERT INTO virtual_keys(id,tenant_id,name,key_hash,key_prefix,budget_micros,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7)")
+        .bind(key_id)
+        .bind(tenant_id)
+        .bind(format!("{}-jiaclaw", profile.profile_name))
+        .bind(hash(token.as_bytes()))
+        .bind(&token[..14])
+        .bind(key_budget)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO key_models(tenant_id,key_id,model_id) VALUES($1,$2,$3)")
+        .bind(tenant_id)
+        .bind(key_id)
+        .bind(&profile.model_id)
+        .execute(&mut *tx)
+        .await?;
+    for (action, object, details) in [
+        (
+            "tenant.created",
+            tenant_id.to_string(),
+            json!({"actor":"init_personal","profile":profile.profile_name}),
+        ),
+        (
+            "model.updated",
+            profile.model_id.clone(),
+            json!({"actor":"init_personal"}),
+        ),
+        (
+            "endpoint.created",
+            endpoint.id.to_string(),
+            json!({"actor":"init_personal","model":profile.model_id}),
+        ),
+        (
+            "key.created",
+            key_id.to_string(),
+            json!({"actor":"init_personal","models":[profile.model_id],"expires_at":expires_at}),
+        ),
+    ] {
+        audit(&mut tx, tenant_id, action, &object, details).await?;
+    }
+    tx.commit().await?;
+    Ok(PersonalBootstrap {
+        tenant_id,
+        key_id,
+        endpoint_id: endpoint.id,
+        model_id: endpoint.model_id,
+        key: token,
+        expires_at,
+    })
+}
+
 pub async fn put_model(pool: &PgPool, tenant: Uuid, id: &str, name: &str) -> Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query("INSERT INTO models(tenant_id,id,name) VALUES($1,$2,$3) ON CONFLICT(tenant_id,id) DO UPDATE SET name=EXCLUDED.name").bind(tenant).bind(id).bind(name).execute(&mut *tx).await?;
@@ -96,12 +279,7 @@ pub async fn create_key(
     if expires.is_some_and(|e| e <= Utc::now()) {
         return Err(Error::Invalid("expiry must be in the future"));
     }
-    let mut bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
-    let token = format!(
-        "sk_br_{}",
-        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
-    );
+    let token = new_virtual_key();
     let id = Uuid::new_v4();
     let mut tx = pool.begin().await?;
     sqlx::query("INSERT INTO virtual_keys(id,tenant_id,name,key_hash,key_prefix,budget_micros,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7)").bind(id).bind(tenant).bind(name).bind(hash(token.as_bytes())).bind(&token[..14]).bind(budget).bind(expires).execute(&mut *tx).await?;
@@ -226,6 +404,7 @@ pub struct Endpoint {
     pub priority: i32,
     pub operation: String,
     pub supports_tools: bool,
+    pub supports_streaming: bool,
     pub embedding_dimension: Option<i32>,
 }
 
@@ -282,6 +461,7 @@ impl Endpoint {
             || (self.operation == "chat" && self.embedding_dimension.is_some())
             || (self.operation == "embedding"
                 && (self.supports_tools
+                    || self.supports_streaming
                     || !self
                         .embedding_dimension
                         .is_some_and(|n| (1..=65536).contains(&n))))
@@ -343,8 +523,8 @@ pub(crate) async fn insert_endpoint(
             "logical model operation and embedding space dimension must be consistent",
         ));
     }
-    sqlx::query("INSERT INTO endpoints(id,tenant_id,model_id,name,upstream_model,base_url,credential_env,allow_private,currency,input_per_million,output_per_million,context_tokens,max_output_tokens,priority,operation,supports_tools,embedding_dimension) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)")
-        .bind(e.id).bind(e.tenant_id).bind(&e.model_id).bind(&e.name).bind(&e.upstream_model).bind(&e.base_url).bind(&e.credential_env).bind(e.allow_private).bind(&e.currency).bind(e.input_per_million).bind(e.output_per_million).bind(e.context_tokens).bind(e.max_output_tokens).bind(e.priority).bind(&e.operation).bind(e.supports_tools).bind(e.embedding_dimension).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO endpoints(id,tenant_id,model_id,name,upstream_model,base_url,credential_env,allow_private,currency,input_per_million,output_per_million,context_tokens,max_output_tokens,priority,operation,supports_tools,supports_streaming,embedding_dimension) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)")
+        .bind(e.id).bind(e.tenant_id).bind(&e.model_id).bind(&e.name).bind(&e.upstream_model).bind(&e.base_url).bind(&e.credential_env).bind(e.allow_private).bind(&e.currency).bind(e.input_per_million).bind(e.output_per_million).bind(e.context_tokens).bind(e.max_output_tokens).bind(e.priority).bind(&e.operation).bind(e.supports_tools).bind(e.supports_streaming).bind(e.embedding_dimension).execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -354,7 +534,7 @@ pub async fn endpoints(
     model: &str,
     max_output: i32,
 ) -> Result<Vec<Endpoint>> {
-    Ok(sqlx::query_as("SELECT e.id,e.tenant_id,e.model_id,e.name,e.upstream_model,e.base_url,e.credential_env,e.allow_private,e.currency,e.input_per_million,e.output_per_million,e.context_tokens,e.max_output_tokens,e.priority,e.operation,e.supports_tools,e.embedding_dimension FROM endpoints e JOIN models m ON m.tenant_id=e.tenant_id AND m.id=e.model_id JOIN key_models k ON k.tenant_id=e.tenant_id AND k.model_id=e.model_id WHERE e.tenant_id=$1 AND k.key_id=$2 AND e.model_id=$3 AND e.active AND m.active AND e.max_output_tokens>=$4 ORDER BY e.priority,e.id")
+    Ok(sqlx::query_as("SELECT e.id,e.tenant_id,e.model_id,e.name,e.upstream_model,e.base_url,e.credential_env,e.allow_private,e.currency,e.input_per_million,e.output_per_million,e.context_tokens,e.max_output_tokens,e.priority,e.operation,e.supports_tools,e.supports_streaming,e.embedding_dimension FROM endpoints e JOIN models m ON m.tenant_id=e.tenant_id AND m.id=e.model_id JOIN key_models k ON k.tenant_id=e.tenant_id AND k.model_id=e.model_id WHERE e.tenant_id=$1 AND k.key_id=$2 AND e.model_id=$3 AND e.active AND m.active AND e.max_output_tokens>=$4 ORDER BY e.priority,e.id")
         .bind(identity.tenant_id).bind(identity.key_id).bind(model).bind(max_output).fetch_all(pool).await?)
 }
 

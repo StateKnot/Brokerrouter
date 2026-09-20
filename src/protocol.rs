@@ -11,6 +11,7 @@ pub struct ValidatedRequest {
     pub max_output: i32,
     pub batch_size: u32,
     pub needs_tools: bool,
+    pub stream: bool,
 }
 
 fn fields(value: &Value, allowed: &[&str]) -> Result<()> {
@@ -79,6 +80,7 @@ pub fn validate(mut body: Value, operation: &'static str) -> Result<ValidatedReq
             max_output: 0,
             batch_size,
             needs_tools: false,
+            stream: false,
         });
     }
     fields(
@@ -98,11 +100,15 @@ pub fn validate(mut body: Value, operation: &'static str) -> Result<ValidatedReq
             "user",
         ],
     )?;
-    if body.get("stream").is_some_and(|v| v != false) {
-        return Err(Error::Invalid(
-            "streaming is not supported by this connector profile",
-        ));
-    }
+    let stream = body
+        .get("stream")
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or(Error::Invalid("stream must be a boolean"))
+        })
+        .transpose()?
+        .unwrap_or(false);
     integer(body.get("n"), 1, 1, 1)?;
     let max_output = integer(body.get("max_tokens"), 1024, 1, 1_000_000)?;
     for (name, min, max) in [("temperature", 0.0, 2.0), ("top_p", 0.0, 1.0)] {
@@ -171,7 +177,13 @@ pub fn validate(mut body: Value, operation: &'static str) -> Result<ValidatedReq
                 .filter(|a| !a.is_empty() && a.len() <= 128)
                 .ok_or(Error::Invalid("invalid tool_calls"))?
             {
-                fields(call, &["id", "type", "function"])?;
+                fields(call, &["id", "type", "function", "index"])?;
+                if call
+                    .get("index")
+                    .is_some_and(|value| value.as_u64().is_none())
+                {
+                    return Err(Error::Invalid("invalid tool call index"));
+                }
                 text(
                     call.get("id")
                         .ok_or(Error::Invalid("tool call id required"))?,
@@ -229,7 +241,8 @@ pub fn validate(mut body: Value, operation: &'static str) -> Result<ValidatedReq
         text(v)?;
     }
     body["max_tokens"] = max_output.into();
-    body["stream"] = false.into();
+    normalize_tool_call_extensions(&mut body);
+    body["stream"] = stream.into();
     body["n"] = 1.into();
     Ok(ValidatedRequest {
         body,
@@ -238,18 +251,59 @@ pub fn validate(mut body: Value, operation: &'static str) -> Result<ValidatedReq
         max_output,
         batch_size: 1,
         needs_tools,
+        stream,
     })
 }
+
+fn normalize_tool_call_extensions(body: &mut Value) {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages {
+        let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for call in calls {
+            if let Some(object) = call.as_object_mut() {
+                object.remove("index");
+            }
+        }
+    }
+}
+
 impl ValidatedRequest {
-    pub fn matches(&self, e: &Endpoint) -> bool {
+    fn basic_matches(&self, e: &Endpoint) -> bool {
         e.operation == self.operation
             && e.max_output_tokens >= self.max_output
-            && (!self.needs_tools || e.supports_tools)
             && (self.operation != "embedding"
                 || self
                     .body
                     .get("dimensions")
                     .is_none_or(|v| v.as_i64() == e.embedding_dimension.map(i64::from)))
+    }
+    pub fn matches(&self, e: &Endpoint) -> bool {
+        self.basic_matches(e)
+            && (!self.needs_tools || e.supports_tools)
+            && (!self.stream || e.supports_streaming)
+    }
+    pub fn unsupported_capability(&self, endpoints: &[Endpoint]) -> Option<&'static str> {
+        let matching: Vec<&Endpoint> = endpoints
+            .iter()
+            .filter(|endpoint| self.basic_matches(endpoint))
+            .collect();
+        if matching.is_empty() || matching.iter().any(|endpoint| self.matches(endpoint)) {
+            return None;
+        }
+        if self.needs_tools && self.stream {
+            return Some("function tool roundtrips with SSE streaming");
+        }
+        if self.needs_tools && !matching.iter().any(|endpoint| endpoint.supports_tools) {
+            return Some("function tool roundtrips");
+        }
+        if self.stream && !matching.iter().any(|endpoint| endpoint.supports_streaming) {
+            return Some("SSE streaming");
+        }
+        None
     }
     pub fn maximum_input(&self, e: &Endpoint) -> u64 {
         e.context_tokens as u64 * u64::from(self.batch_size)
@@ -257,7 +311,7 @@ impl ValidatedRequest {
 }
 
 pub fn validate_response(
-    body: &Value,
+    body: &mut Value,
     request: &ValidatedRequest,
     e: &Endpoint,
 ) -> Result<(u64, u64)> {
@@ -303,7 +357,15 @@ pub fn validate_response(
                 .filter(|a| !a.is_empty() && a.len() <= 128)
                 .ok_or_else(invalid)?;
             let mut ids = std::collections::HashSet::new();
-            for call in calls {
+            for (ordinal, call) in calls.iter().enumerate() {
+                fields(call, &["id", "type", "function", "index"]).map_err(|_| invalid())?;
+                if call
+                    .get("index")
+                    .is_some_and(|index| index.as_u64() != Some(ordinal as u64))
+                {
+                    return Err(invalid());
+                }
+                fields(&call["function"], &["name", "arguments"]).map_err(|_| invalid())?;
                 let id = call["id"]
                     .as_str()
                     .filter(|s| !s.is_empty())
@@ -314,6 +376,16 @@ pub fn validate_response(
                     || !call["function"]["arguments"].is_string()
                 {
                     return Err(invalid());
+                }
+            }
+        }
+        if let Some(calls) = body["choices"][0]["message"]
+            .get_mut("tool_calls")
+            .and_then(Value::as_array_mut)
+        {
+            for call in calls {
+                if let Some(object) = call.as_object_mut() {
+                    object.remove("index");
                 }
             }
         }

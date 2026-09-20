@@ -29,6 +29,10 @@ enum Reply {
     Http(u16),
     Slow,
     Tool,
+    ToolRoundtrip,
+    Stream,
+    StreamBroken,
+    StreamNoUsage,
     Judge(&'static str),
     JudgeSlow,
     SmartJudge,
@@ -78,6 +82,29 @@ async fn mock(
     match state.reply {
         Reply::Http(status)=>(StatusCode::from_u16(status).unwrap(),[("location","http://127.0.0.1:9/secret")],"not a billable-success response").into_response(),
         Reply::Embedding=>Json(json!({"object":"list","model":"upstream","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2,0.3]}],"usage":{"prompt_tokens":3,"total_tokens":3}})).into_response(),
+        reply @ (Reply::Stream | Reply::StreamBroken | Reply::StreamNoUsage) => {
+            let mut events = vec![
+                json!({"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"upstream","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null,"logprobs":null}],"usage":null}),
+                json!({"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"upstream","choices":[{"index":0,"delta":{"content":"private answer"},"finish_reason":null,"logprobs":null}],"usage":null}),
+                json!({"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"upstream","choices":[{"index":0,"delta":{},"finish_reason":"stop","logprobs":null}],"usage":null}),
+            ];
+            if !matches!(reply, Reply::StreamNoUsage) {
+                events.push(json!({"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"upstream","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}));
+            }
+            let mut text = events
+                .into_iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+            if !matches!(reply, Reply::StreamBroken) {
+                text.push_str("data: [DONE]\n\n");
+            }
+            (
+                StatusCode::OK,
+                [("content-type", "text/event-stream; charset=utf-8")],
+                text,
+            )
+                .into_response()
+        }
         reply=>{
             if matches!(reply,Reply::Slow){tokio::time::sleep(Duration::from_millis(1300)).await;}
             if matches!(reply,Reply::JudgeSlow){tokio::time::sleep(Duration::from_millis(1300)).await;}
@@ -86,6 +113,14 @@ async fn mock(
             if matches!(reply,Reply::JudgeSlow) || (matches!(reply,Reply::SmartJudge) && body["messages"][0]["content"].as_str().is_some_and(|s|s.starts_with("You are a security classifier"))) {value["choices"][0]["message"]["content"]="{\"decision\":\"pass\"}".into();}
             if matches!(reply,Reply::MissingUsage){value.as_object_mut().unwrap().remove("usage");}
             if matches!(reply,Reply::Tool){value["choices"][0]["message"]=json!({"role":"assistant","content":null,"tool_calls":[{"id":"call_fixture","type":"function","function":{"name":"lookup","arguments":"{}"}}]});value["choices"][0]["finish_reason"]="tool_calls".into();}
+            if matches!(reply,Reply::ToolRoundtrip) {
+                if body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message| message["role"] == "tool")) {
+                    value["choices"][0]["message"]["content"]="42".into();
+                } else {
+                    value["choices"][0]["message"]=json!({"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_fixture","type":"function","function":{"name":"add","arguments":"{\"a\":17,\"b\":25}"}}]});
+                    value["choices"][0]["finish_reason"]="tool_calls".into();
+                }
+            }
             Json(value).into_response()
         }
     }
@@ -128,6 +163,7 @@ async fn setup(
         priority: 10,
         operation: operation.into(),
         supports_tools: false,
+        supports_streaming: false,
         embedding_dimension: if operation == "embedding" {
             Some(3)
         } else {
@@ -161,6 +197,9 @@ fn gateway(pool: PgPool, timeout: i32) -> Gateway {
 }
 fn chat() -> Value {
     json!({"model":"logical/model","messages":[{"role":"user","content":"hello"}],"max_tokens":10})
+}
+fn streaming_chat() -> Value {
+    json!({"model":"logical/model","messages":[{"role":"user","content":"hello"}],"max_tokens":10,"stream":true})
 }
 fn request(key: &str, idem: &str, body: Value, path: &str) -> Request<Body> {
     Request::builder()
@@ -1269,7 +1308,7 @@ async fn embeddings_capabilities_and_unapproved_networks_fail_before_post(pool: 
     stream["stream"] = true.into();
     assert!(matches!(
         g.execute(&other, "stream", stream, "chat").await,
-        Err(Error::Invalid(_))
+        Err(Error::UnsupportedCapability("SSE streaming"))
     ));
 }
 
@@ -1418,6 +1457,266 @@ async fn tool_capability_filter_skips_weaker_endpoint_and_keeps_fx_snapshot(pool
         .unwrap();
     assert_eq!(strong.count(), 1);
     assert_eq!(g.request(&who, id).await.unwrap()["cost_cny"], "0.000051");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn missing_tool_capability_is_explicit_and_never_calls_upstream(pool: PgPool) {
+    let upstream = Mock::start(Reply::Chat).await;
+    let (who, _, _) = setup(&pool, "chat", &upstream.url).await;
+    let mut body = chat();
+    body["tools"] = json!([{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}]);
+    let error = gateway(pool, 5)
+        .execute(&who, "unsupported-tool", body, "chat")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::UnsupportedCapability("function tool roundtrips")
+    ));
+    assert_eq!(upstream.count(), 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn combined_tool_stream_capability_must_exist_on_one_endpoint(pool: PgPool) {
+    let upstream = Mock::start(Reply::Stream).await;
+    let (who, _, endpoint) = setup(&pool, "chat", &upstream.url).await;
+    sqlx::query("UPDATE endpoints SET supports_tools=true WHERE id=$1")
+        .bind(endpoint.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut streaming_only = endpoint.clone();
+    streaming_only.id = Uuid::new_v4();
+    streaming_only.name = "streaming-only".into();
+    streaming_only.supports_tools = false;
+    streaming_only.supports_streaming = true;
+    store::add_endpoint(&pool, &streaming_only).await.unwrap();
+    let mut body = streaming_chat();
+    body["tools"] = json!([{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}]);
+    assert!(matches!(
+        gateway(pool, 5)
+            .execute_stream_in_turn(&who, "combined-capability", body, None)
+            .await,
+        Err(Error::UnsupportedCapability(
+            "function tool roundtrips with SSE streaming"
+        ))
+    ));
+    assert_eq!(upstream.count(), 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn provider_tool_index_is_normalized_for_exact_agent_roundtrip(pool: PgPool) {
+    let upstream = Mock::start(Reply::ToolRoundtrip).await;
+    let (who, _, endpoint) = setup(&pool, "chat", &upstream.url).await;
+    sqlx::query("UPDATE endpoints SET supports_tools=true WHERE id=$1")
+        .bind(endpoint.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let g = gateway(pool.clone(), 5);
+    let mut first = chat();
+    first["tools"] = json!([{"type":"function","function":{"name":"add","description":"Add two integers","parameters":{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}},"required":["a","b"]}}}]);
+    first["tool_choice"] = "auto".into();
+    let assistant = g
+        .execute(&who, "tool-roundtrip-1", first.clone(), "chat")
+        .await
+        .unwrap()
+        .1
+        .unwrap()["choices"][0]["message"]
+        .clone();
+    assert!(assistant["tool_calls"][0].get("index").is_none());
+    let mut second = first;
+    second["messages"] = json!([
+        {"role":"user","content":"Use add for 17 and 25."},
+        assistant,
+        {"role":"tool","tool_call_id":"call_fixture","content":"42"}
+    ]);
+    let completed = g
+        .execute(&who, "tool-roundtrip-2", second, "chat")
+        .await
+        .unwrap()
+        .1
+        .unwrap();
+    assert_eq!(completed["choices"][0]["message"]["content"], "42");
+    assert_eq!(upstream.count(), 2);
+    let totals: (i64, i64) = sqlx::query_as(
+        "SELECT count(*),count(*) FILTER (WHERE status='succeeded') FROM requests WHERE tenant_id=$1",
+    )
+    .bind(who.tenant_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(totals, (2, 2));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn sse_stream_settles_before_done_and_replays_without_provider_call(pool: PgPool) {
+    let upstream = Mock::start(Reply::Stream).await;
+    let (who, key, endpoint) = setup(&pool, "chat", &upstream.url).await;
+    sqlx::query("UPDATE endpoints SET supports_streaming=true WHERE id=$1")
+        .bind(endpoint.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let app = api::gateway_router(gateway(pool.clone(), 5));
+    for expected_calls in [1, 1] {
+        let response = app
+            .clone()
+            .oneshot(request(
+                &key,
+                "stream-idempotent",
+                streaming_chat(),
+                "/v1/chat/completions",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/event-stream; charset=utf-8"
+        );
+        assert!(response.headers().contains_key("x-brokerrouter-request-id"));
+        let body = String::from_utf8(
+            http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("private answer"));
+        assert!(body.ends_with("data: [DONE]\n\n"));
+        assert_eq!(upstream.count(), expected_calls);
+    }
+    let row: (String, i64, i64) = sqlx::query_as(
+        "SELECT status,final_micros,(SELECT count(*) FROM attempts WHERE request_id=requests.id) FROM requests WHERE tenant_id=$1 AND idempotency_key='stream-idempotent'",
+    )
+    .bind(who.tenant_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row, ("succeeded".into(), 7, 1));
+    let sent = upstream.state.received.lock().unwrap();
+    assert_eq!(sent[0]["body"]["stream"], true);
+    assert_eq!(sent[0]["body"]["stream_options"]["include_usage"], true);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn client_disconnect_does_not_cancel_stream_settlement(pool: PgPool) {
+    let upstream = Mock::start(Reply::Stream).await;
+    let (who, _, endpoint) = setup(&pool, "chat", &upstream.url).await;
+    sqlx::query("UPDATE endpoints SET supports_streaming=true WHERE id=$1")
+        .bind(endpoint.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let g = gateway(pool.clone(), 5);
+    let session = g
+        .execute_stream_in_turn(&who, "stream-disconnect", streaming_chat(), None)
+        .await
+        .unwrap();
+    let id = session.id;
+    drop(session.receiver);
+    for _ in 0..100 {
+        let state: String = sqlx::query_scalar("SELECT status FROM requests WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        if state == "succeeded" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM requests WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "succeeded"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn incomplete_sse_is_unknown_and_never_emits_done(pool: PgPool) {
+    for reply in [Reply::StreamBroken, Reply::StreamNoUsage] {
+        let upstream = Mock::start(reply).await;
+        let (who, key, endpoint) = setup(&pool, "chat", &upstream.url).await;
+        sqlx::query("UPDATE endpoints SET supports_streaming=true WHERE id=$1")
+            .bind(endpoint.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let app = api::gateway_router(gateway(pool.clone(), 5));
+        let idem = Uuid::new_v4().to_string();
+        let response = app
+            .oneshot(request(
+                &key,
+                &idem,
+                streaming_chat(),
+                "/v1/chat/completions",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("submission_unknown"));
+        assert!(!body.contains("data: [DONE]"));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM requests WHERE tenant_id=$1 AND idempotency_key=$2",
+            )
+            .bind(who.tenant_id)
+            .bind(idem)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "submission_unknown"
+        );
+        assert_eq!(upstream.count(), 1);
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn streaming_requires_endpoint_capability_and_no_post_guardrail(pool: PgPool) {
+    let upstream = Mock::start(Reply::Stream).await;
+    let (who, _, endpoint) = setup(&pool, "chat", &upstream.url).await;
+    let g = gateway(pool.clone(), 5);
+    assert!(matches!(
+        g.execute_stream_in_turn(&who, "stream-capability", streaming_chat(), None)
+            .await,
+        Err(Error::UnsupportedCapability("SSE streaming"))
+    ));
+    sqlx::query("UPDATE endpoints SET supports_streaming=true WHERE id=$1")
+        .bind(endpoint.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    common::provision(&pool, &who, "stream-user").await;
+    common::guardrail(
+        &pool,
+        who.tenant_id,
+        "post-review",
+        1,
+        "post",
+        json!({"kind":"always"}),
+    )
+    .await;
+    let turn = common::turn(&pool, &who, "stream-user", 0).await;
+    assert!(matches!(
+        g.execute_stream_in_turn(&who, "stream-post-guardrail", streaming_chat(), Some(turn),)
+            .await,
+        Err(Error::StreamingGuardrail)
+    ));
+    assert_eq!(upstream.count(), 0);
 }
 
 #[sqlx::test(migrations = "./migrations")]

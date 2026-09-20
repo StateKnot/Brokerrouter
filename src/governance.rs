@@ -179,6 +179,20 @@ pub(crate) async fn selected(
     }
     Ok(rules)
 }
+
+pub async fn has_selected_guardrails(
+    pool: &PgPool,
+    who: &Identity,
+    stage: &str,
+    model: Option<&str>,
+    tool: Option<&str>,
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    tenant_lock(&mut tx, who.tenant_id).await?;
+    let found = !selected(&mut tx, who, stage, model, tool).await?.is_empty();
+    tx.commit().await?;
+    Ok(found)
+}
 pub fn validate_rule(rule: &Value) -> Result<()> {
     let Some(object) = rule.as_object() else {
         return Err(Error::Invalid("rule must be an object"));

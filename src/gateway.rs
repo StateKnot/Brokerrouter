@@ -9,12 +9,30 @@ use crate::{
     protocol::{self, ValidatedRequest},
     store::{self, Endpoint, Identity},
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use std::{collections::HashMap, sync::Arc, time::Duration};
-use tokio::sync::Semaphore;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use uuid::Uuid;
+
+pub struct StreamSession {
+    pub id: Uuid,
+    pub receiver: mpsc::UnboundedReceiver<bytes::Bytes>,
+}
+
+struct StreamExecution {
+    who: Identity,
+    request: ValidatedRequest,
+    endpoint: Endpoint,
+    request_id: Uuid,
+    attempt: Uuid,
+}
 
 type AttemptRow = (
     Uuid,
@@ -160,6 +178,34 @@ impl Gateway {
         .await
     }
 
+    pub async fn execute_stream_in_turn(
+        &self,
+        who: &Identity,
+        idempotency: &str,
+        body: Value,
+        turn_id: Option<Uuid>,
+    ) -> Result<StreamSession> {
+        if idempotency.starts_with("_br_guardrail:") || idempotency.starts_with("_br_media:") {
+            return Err(Error::Invalid("reserved idempotency namespace"));
+        }
+        let (request, row, permit) = self
+            .admit(
+                who,
+                idempotency,
+                body,
+                "chat",
+                CallContext {
+                    turn_id,
+                    judge: None,
+                },
+            )
+            .await?;
+        if !request.stream {
+            return Err(Error::Invalid("stream:true is required for SSE execution"));
+        }
+        self.start_stream(who.clone(), request, row, permit).await
+    }
+
     pub(crate) fn judge_timeout_seconds(&self) -> i32 {
         self.timeout_seconds
     }
@@ -211,6 +257,26 @@ impl Gateway {
         operation: &'static str,
         context: CallContext,
     ) -> Result<(Uuid, Result<Value>)> {
+        let (request, row, _permit) = self
+            .admit(who, idempotency, body, operation, context)
+            .await?;
+        if request.stream {
+            return Err(Error::Invalid(
+                "stream:true requires the SSE response execution path",
+            ));
+        }
+        let result = self.run(who, &request, row.clone()).await;
+        Ok((row.id, result))
+    }
+
+    async fn admit(
+        &self,
+        who: &Identity,
+        idempotency: &str,
+        body: Value,
+        operation: &'static str,
+        context: CallContext,
+    ) -> Result<(ValidatedRequest, Reservation, OwnedSemaphorePermit)> {
         let turn_id = context.turn_id;
         if idempotency.is_empty()
             || idempotency.len() > 200
@@ -223,6 +289,18 @@ impl Gateway {
         let request = protocol::validate(body, operation)?;
         store::authorize_model(&self.pool, who, &request.model).await?;
         governance::context(&self.pool, who, turn_id, &request.model).await?;
+        if request.stream
+            && governance::has_selected_guardrails(
+                &self.pool,
+                who,
+                "post",
+                Some(&request.model),
+                None,
+            )
+            .await?
+        {
+            return Err(Error::StreamingGuardrail);
+        }
         let mut envelope = json!({"operation":operation,"request":request.body});
         if let Some(id) = turn_id {
             envelope["turn_id"] = json!(id);
@@ -261,11 +339,11 @@ impl Gateway {
             )?;
         }
         let capacity = if context.judge.is_some() {
-            &self.judge_capacity
+            self.judge_capacity.clone()
         } else {
-            &self.capacity
+            self.capacity.clone()
         };
-        let _permit = capacity.try_acquire().map_err(|_| Error::Busy)?;
+        let permit = capacity.try_acquire_owned().map_err(|_| Error::Busy)?;
         let row = if let Some(row) = existing {
             if row.request_hash != digest
                 || row.guardrail_evaluation_id != context.judge.map(|(id, _)| id)
@@ -276,6 +354,9 @@ impl Gateway {
         } else {
             let endpoints =
                 store::endpoints(&self.pool, who, &request.model, request.max_output).await?;
+            if let Some(capability) = request.unsupported_capability(&endpoints) {
+                return Err(Error::UnsupportedCapability(capability));
+            }
             let mut routes = Vec::new();
             let mut maximum = 0;
             let mut bound = None;
@@ -332,8 +413,7 @@ impl Gateway {
                 accounting::reserve(&self.pool, admission).await?.0
             }
         };
-        let result = self.run(who, &request, row.clone()).await;
-        Ok((row.id, result))
+        Ok((request, row, permit))
     }
 
     async fn run(
@@ -489,8 +569,8 @@ impl Gateway {
                 .await?;
                 return Err(Error::UpstreamUnknown);
             }
-            let received = read_response(response).await.and_then(|body| {
-                let usage = protocol::validate_response(&body, request, &route.endpoint)?;
+            let received = read_response(response).await.and_then(|mut body| {
+                let usage = protocol::validate_response(&mut body, request, &route.endpoint)?;
                 Ok((body, usage))
             });
             let (mut body, (input, output)) = match received {
@@ -546,6 +626,311 @@ impl Gateway {
         }
         accounting::release_unsubmitted(&self.pool, who, row.id).await?;
         Err(Error::NotSubmitted)
+    }
+
+    async fn start_stream(
+        &self,
+        who: Identity,
+        request: ValidatedRequest,
+        row: Reservation,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<StreamSession> {
+        match row.status.as_str() {
+            "succeeded" => {
+                let value = self
+                    .result_inner(&who, row.id, row.guardrail_evaluation_id, true)
+                    .await?;
+                let (sender, receiver) = mpsc::unbounded_channel();
+                for event in replay_stream(&value)? {
+                    let _ = sender.send(event);
+                }
+                drop(permit);
+                return Ok(StreamSession {
+                    id: row.id,
+                    receiver,
+                });
+            }
+            "failed" => return Err(Error::NotSubmitted),
+            "reconciled" => return Err(Error::ResultUnavailable),
+            "submission_unknown" => return Err(Error::UpstreamUnknown),
+            "submitting" => return Err(Error::InProgress),
+            "reserved" => {}
+            _ => return Err(Error::Configuration),
+        }
+        for _ in 0..3 {
+            let (attempt, route) = match attempts::begin(&self.pool, &who, row.id).await {
+                Ok(attempt) => attempt,
+                Err(Error::NotSubmitted) => {
+                    accounting::release_unsubmitted(&self.pool, &who, row.id).await?;
+                    return Err(Error::NotSubmitted);
+                }
+                Err(Error::Unauthorized) => {
+                    let _ = accounting::release_unsubmitted(&self.pool, &who, row.id).await;
+                    return Err(Error::Unauthorized);
+                }
+                Err(error) => return Err(error),
+            };
+            let remaining = row
+                .dispatch_deadline
+                .ok_or(Error::Configuration)?
+                .signed_duration_since(chrono::Utc::now())
+                .to_std()
+                .unwrap_or(Duration::from_millis(1));
+            let (client, url) = match egress::client(&route.endpoint, remaining).await {
+                Ok(prepared) => prepared,
+                Err(_) => {
+                    attempts::failed(
+                        &self.pool,
+                        &who,
+                        row.id,
+                        attempt,
+                        true,
+                        "preflight_failed",
+                        None,
+                    )
+                    .await?;
+                    continue;
+                }
+            };
+            let Some(secret) = self.credentials.get(&route.endpoint.credential_env) else {
+                attempts::failed(
+                    &self.pool,
+                    &who,
+                    row.id,
+                    attempt,
+                    true,
+                    "credential_unavailable",
+                    None,
+                )
+                .await?;
+                continue;
+            };
+            let mut body = request.body.clone();
+            body["model"] = route.endpoint.upstream_model.clone().into();
+            body["stream"] = true.into();
+            body["stream_options"] = json!({"include_usage":true});
+            let outgoing = match client
+                .post(url)
+                .bearer_auth(secret)
+                .header("x-request-id", attempt.to_string())
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .json(&body)
+                .build()
+            {
+                Ok(request) => request,
+                Err(_) => {
+                    attempts::failed(
+                        &self.pool,
+                        &who,
+                        row.id,
+                        attempt,
+                        true,
+                        "request_build_failed",
+                        None,
+                    )
+                    .await?;
+                    continue;
+                }
+            };
+            let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM endpoints WHERE tenant_id=$1 AND id=$2 AND active AND supports_streaming)")
+                .bind(who.tenant_id)
+                .bind(route.endpoint.id)
+                .fetch_one(&self.pool)
+                .await?;
+            let authority = async {
+                store::authorize_model(&self.pool, &who, &row.model_id).await?;
+                governance::context(&self.pool, &who, row.governance_turn_id, &row.model_id)
+                    .await?;
+                if active {
+                    Ok(())
+                } else {
+                    Err(Error::Unauthorized)
+                }
+            }
+            .await;
+            if let Err(error) = authority {
+                attempts::failed(
+                    &self.pool,
+                    &who,
+                    row.id,
+                    attempt,
+                    true,
+                    "authority_unavailable_before_send",
+                    None,
+                )
+                .await?;
+                accounting::release_unsubmitted(&self.pool, &who, row.id).await?;
+                return Err(error);
+            }
+            let response = match client.execute(outgoing).await {
+                Ok(response) => response,
+                Err(error) => {
+                    let not_sent = error.is_connect();
+                    attempts::failed(
+                        &self.pool,
+                        &who,
+                        row.id,
+                        attempt,
+                        not_sent,
+                        if not_sent {
+                            "connect_failed"
+                        } else {
+                            "transport_unknown"
+                        },
+                        None,
+                    )
+                    .await?;
+                    if not_sent {
+                        continue;
+                    }
+                    return Err(Error::UpstreamUnknown);
+                }
+            };
+            let status = response.status().as_u16();
+            if status != 200 || !is_event_stream(&response) {
+                attempts::failed(
+                    &self.pool,
+                    &who,
+                    row.id,
+                    attempt,
+                    false,
+                    if status == 200 {
+                        "invalid_stream_content_type"
+                    } else {
+                        "upstream_http_status"
+                    },
+                    Some(status),
+                )
+                .await?;
+                return Err(Error::UpstreamUnknown);
+            }
+            let (sender, receiver) = mpsc::unbounded_channel();
+            let gateway = self.clone();
+            let id = row.id;
+            let execution = StreamExecution {
+                who,
+                request,
+                endpoint: route.endpoint,
+                request_id: id,
+                attempt,
+            };
+            self.tasks.spawn(async move {
+                let result = gateway.consume_stream(&execution, response, &sender).await;
+                if let Err(code) = result {
+                    let _ = attempts::failed(
+                        &gateway.pool,
+                        &execution.who,
+                        execution.request_id,
+                        execution.attempt,
+                        false,
+                        code,
+                        Some(status),
+                    )
+                    .await;
+                    send_stream_error(&sender);
+                }
+                drop(permit);
+            });
+            return Ok(StreamSession {
+                id: row.id,
+                receiver,
+            });
+        }
+        accounting::release_unsubmitted(&self.pool, &who, row.id).await?;
+        Err(Error::NotSubmitted)
+    }
+
+    async fn consume_stream(
+        &self,
+        execution: &StreamExecution,
+        response: reqwest::Response,
+        sender: &mpsc::UnboundedSender<bytes::Bytes>,
+    ) -> std::result::Result<(), &'static str> {
+        const LIMIT: usize = 4 * 1024 * 1024;
+        if response
+            .content_length()
+            .is_some_and(|size| size > LIMIT as u64)
+        {
+            return Err("stream_response_too_large");
+        }
+        let bounded = response
+            .bytes_stream()
+            .scan((0usize, false), |(observed, failed), item| {
+                futures_util::future::ready(if *failed {
+                    None
+                } else {
+                    match item {
+                        Ok(bytes) if bytes.len() <= LIMIT.saturating_sub(*observed) => {
+                            *observed += bytes.len();
+                            Some(Ok(bytes))
+                        }
+                        Ok(_) => {
+                            *failed = true;
+                            Some(Err(std::io::Error::other("stream response too large")))
+                        }
+                        Err(error) => {
+                            *failed = true;
+                            Some(Err(std::io::Error::other(error)))
+                        }
+                    }
+                })
+            });
+        let mut stream = sse_stream::SseStream::from_bytes_stream(bounded);
+        let mut aggregate = StreamAggregate::default();
+        let mut done = false;
+        while let Some(event) = stream.next().await {
+            let event = event.map_err(|_| "invalid_or_incomplete_stream")?;
+            if event.event.is_some() || event.id.is_some() || event.retry.is_some() {
+                return Err("invalid_or_incomplete_stream");
+            }
+            let Some(data) = event.data else {
+                continue;
+            };
+            if data == "[DONE]" {
+                done = true;
+                break;
+            }
+            let mut chunk: Value =
+                serde_json::from_str(&data).map_err(|_| "invalid_or_incomplete_stream")?;
+            aggregate
+                .push(&mut chunk, &execution.request.model)
+                .map_err(|_| "invalid_or_incomplete_stream")?;
+            let encoded =
+                serde_json::to_string(&chunk).map_err(|_| "invalid_or_incomplete_stream")?;
+            let _ = sender.send(sse_data(&encoded));
+        }
+        if !done {
+            return Err("invalid_or_incomplete_stream");
+        }
+        let mut completion = aggregate
+            .finish(&execution.request.model)
+            .map_err(|_| "invalid_or_incomplete_stream")?;
+        let (input, output) =
+            protocol::validate_response(&mut completion, &execution.request, &execution.endpoint)
+                .map_err(|_| "invalid_or_incomplete_stream")?;
+        let encoded =
+            serde_json::to_vec(&completion).map_err(|_| "invalid_or_incomplete_stream")?;
+        let ciphertext = self
+            .cipher
+            .encrypt(execution.who.tenant_id, execution.request_id, &encoded)
+            .map_err(|_| "result_encryption_failed")?;
+        attempts::complete(
+            &self.pool,
+            &execution.who,
+            execution.request_id,
+            attempts::Completion {
+                attempt: execution.attempt,
+                usage: completion["usage"].clone(),
+                input,
+                output,
+                ciphertext: &ciphertext,
+                ttl_seconds: self.result_ttl_seconds,
+            },
+        )
+        .await
+        .map_err(|_| "settlement_unknown")?;
+        let _ = sender.send(sse_data("[DONE]"));
+        Ok(())
     }
 
     pub async fn result(&self, who: &Identity, id: Uuid) -> Result<Value> {
@@ -672,4 +1057,304 @@ async fn read_response(mut response: reqwest::Response) -> Result<Value> {
         bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).map_err(|_| Error::UpstreamUnknown)
+}
+
+fn is_event_stream(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+fn sse_data(data: &str) -> bytes::Bytes {
+    sse_stream::Sse::default().data(data).into()
+}
+
+fn send_stream_error(sender: &mpsc::UnboundedSender<bytes::Bytes>) {
+    let error = json!({"error":{"code":"submission_unknown","message":"the upstream stream ended without a complete durably settled result","type":"gateway_error"}});
+    let _ = sender.send(sse_data(&error.to_string()));
+}
+
+fn object_fields(value: &Value, allowed: &[&str]) -> Result<()> {
+    let object = value.as_object().ok_or(Error::UpstreamUnknown)?;
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(Error::UpstreamUnknown);
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct StreamTool {
+    id: Option<String>,
+    kind: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+#[derive(Default)]
+struct StreamAggregate {
+    id: Option<String>,
+    created: Option<i64>,
+    role: Option<String>,
+    content: String,
+    content_seen: bool,
+    refusal: String,
+    refusal_seen: bool,
+    tools: BTreeMap<u64, StreamTool>,
+    finish_reason: Option<String>,
+    usage: Option<Value>,
+    event_count: usize,
+}
+
+impl StreamAggregate {
+    fn push(&mut self, chunk: &mut Value, logical_model: &str) -> Result<()> {
+        self.event_count = self
+            .event_count
+            .checked_add(1)
+            .ok_or(Error::UpstreamUnknown)?;
+        if self.event_count > 100_000 {
+            return Err(Error::UpstreamUnknown);
+        }
+        object_fields(
+            chunk,
+            &[
+                "id",
+                "object",
+                "created",
+                "model",
+                "choices",
+                "usage",
+                "system_fingerprint",
+                "service_tier",
+            ],
+        )?;
+        if chunk["object"] != "chat.completion.chunk" {
+            return Err(Error::UpstreamUnknown);
+        }
+        let id = chunk["id"]
+            .as_str()
+            .filter(|value| !value.is_empty() && value.len() <= 512)
+            .ok_or(Error::UpstreamUnknown)?;
+        if self.id.as_deref().is_some_and(|existing| existing != id) {
+            return Err(Error::UpstreamUnknown);
+        }
+        self.id.get_or_insert_with(|| id.to_owned());
+        let created = chunk["created"].as_i64().ok_or(Error::UpstreamUnknown)?;
+        if self.created.is_some_and(|existing| existing != created) {
+            return Err(Error::UpstreamUnknown);
+        }
+        self.created.get_or_insert(created);
+        if !chunk["model"].is_string() {
+            return Err(Error::UpstreamUnknown);
+        }
+        chunk["model"] = logical_model.into();
+        let choices = chunk["choices"]
+            .as_array()
+            .filter(|choices| choices.len() <= 1)
+            .ok_or(Error::UpstreamUnknown)?;
+        if choices.is_empty() {
+            if self.usage.is_some() {
+                return Err(Error::UpstreamUnknown);
+            }
+            let usage = chunk
+                .get("usage")
+                .filter(|usage| !usage.is_null())
+                .ok_or(Error::UpstreamUnknown)?;
+            validate_stream_usage(usage)?;
+            self.usage = Some(usage.clone());
+            return Ok(());
+        }
+        if chunk.get("usage").is_some_and(|usage| !usage.is_null()) {
+            return Err(Error::UpstreamUnknown);
+        }
+        let choice = &choices[0];
+        object_fields(choice, &["index", "delta", "finish_reason", "logprobs"])?;
+        if choice["index"].as_u64() != Some(0)
+            || choice.get("logprobs").is_some_and(|value| !value.is_null())
+        {
+            return Err(Error::UpstreamUnknown);
+        }
+        if let Some(reason) = choice.get("finish_reason").filter(|value| !value.is_null()) {
+            let reason = reason.as_str().ok_or(Error::UpstreamUnknown)?;
+            if self.finish_reason.replace(reason.to_owned()).is_some() {
+                return Err(Error::UpstreamUnknown);
+            }
+        }
+        let delta = choice.get("delta").ok_or(Error::UpstreamUnknown)?;
+        object_fields(delta, &["role", "content", "tool_calls", "refusal"])?;
+        if let Some(role) = delta.get("role").filter(|value| !value.is_null()) {
+            let role = role.as_str().ok_or(Error::UpstreamUnknown)?;
+            if role != "assistant"
+                || self
+                    .role
+                    .as_deref()
+                    .is_some_and(|existing| existing != role)
+            {
+                return Err(Error::UpstreamUnknown);
+            }
+            self.role = Some(role.to_owned());
+        }
+        if let Some(content) = delta.get("content").filter(|value| !value.is_null()) {
+            self.content
+                .push_str(content.as_str().ok_or(Error::UpstreamUnknown)?);
+            self.content_seen = true;
+        }
+        if let Some(refusal) = delta.get("refusal").filter(|value| !value.is_null()) {
+            self.refusal
+                .push_str(refusal.as_str().ok_or(Error::UpstreamUnknown)?);
+            self.refusal_seen = true;
+        }
+        if let Some(calls) = delta.get("tool_calls") {
+            let calls = calls
+                .as_array()
+                .filter(|calls| !calls.is_empty() && calls.len() <= 128)
+                .ok_or(Error::UpstreamUnknown)?;
+            for call in calls {
+                object_fields(call, &["index", "id", "type", "function"])?;
+                let index = call["index"]
+                    .as_u64()
+                    .filter(|index| *index < 128)
+                    .ok_or(Error::UpstreamUnknown)?;
+                let tool = self.tools.entry(index).or_default();
+                if let Some(id) = call.get("id").filter(|value| !value.is_null()) {
+                    let id = id
+                        .as_str()
+                        .filter(|id| !id.is_empty() && id.len() <= 512)
+                        .ok_or(Error::UpstreamUnknown)?;
+                    if tool.id.as_deref().is_some_and(|existing| existing != id) {
+                        return Err(Error::UpstreamUnknown);
+                    }
+                    tool.id = Some(id.to_owned());
+                }
+                if let Some(kind) = call.get("type").filter(|value| !value.is_null()) {
+                    let kind = kind.as_str().ok_or(Error::UpstreamUnknown)?;
+                    if kind != "function"
+                        || tool
+                            .kind
+                            .as_deref()
+                            .is_some_and(|existing| existing != kind)
+                    {
+                        return Err(Error::UpstreamUnknown);
+                    }
+                    tool.kind = Some(kind.to_owned());
+                }
+                if let Some(function) = call.get("function") {
+                    object_fields(function, &["name", "arguments"])?;
+                    if let Some(name) = function.get("name").filter(|value| !value.is_null()) {
+                        tool.name
+                            .push_str(name.as_str().ok_or(Error::UpstreamUnknown)?);
+                    }
+                    if let Some(arguments) =
+                        function.get("arguments").filter(|value| !value.is_null())
+                    {
+                        tool.arguments
+                            .push_str(arguments.as_str().ok_or(Error::UpstreamUnknown)?);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self, logical_model: &str) -> Result<Value> {
+        let id = self.id.ok_or(Error::UpstreamUnknown)?;
+        let created = self.created.ok_or(Error::UpstreamUnknown)?;
+        if self.role.as_deref() != Some("assistant") || self.finish_reason.is_none() {
+            return Err(Error::UpstreamUnknown);
+        }
+        let mut message = json!({"role":"assistant"});
+        if self.content_seen {
+            message["content"] = self.content.into();
+        } else {
+            message["content"] = Value::Null;
+        }
+        if self.refusal_seen {
+            message["refusal"] = self.refusal.into();
+        }
+        if !self.tools.is_empty() {
+            let mut calls = Vec::with_capacity(self.tools.len());
+            for (expected, (index, tool)) in self.tools.into_iter().enumerate() {
+                if index != expected as u64
+                    || tool.kind.as_deref() != Some("function")
+                    || tool.id.as_deref().is_none_or(str::is_empty)
+                    || tool.name.is_empty()
+                {
+                    return Err(Error::UpstreamUnknown);
+                }
+                calls.push(json!({"id":tool.id,"type":"function","function":{"name":tool.name,"arguments":tool.arguments}}));
+            }
+            message["tool_calls"] = calls.into();
+        }
+        if !self.content_seen && !self.refusal_seen && message.get("tool_calls").is_none() {
+            return Err(Error::UpstreamUnknown);
+        }
+        Ok(json!({
+            "id":id,
+            "object":"chat.completion",
+            "created":created,
+            "model":logical_model,
+            "choices":[{"index":0,"message":message,"finish_reason":self.finish_reason}],
+            "usage":self.usage.ok_or(Error::UpstreamUnknown)?
+        }))
+    }
+}
+
+fn validate_stream_usage(usage: &Value) -> Result<()> {
+    let input = usage["prompt_tokens"]
+        .as_u64()
+        .ok_or(Error::UpstreamUnknown)?;
+    let output = usage["completion_tokens"]
+        .as_u64()
+        .ok_or(Error::UpstreamUnknown)?;
+    if usage["total_tokens"].as_u64() != input.checked_add(output) {
+        return Err(Error::UpstreamUnknown);
+    }
+    Ok(())
+}
+
+fn replay_stream(completion: &Value) -> Result<Vec<bytes::Bytes>> {
+    let choices = completion["choices"]
+        .as_array()
+        .filter(|choices| choices.len() == 1)
+        .ok_or(Error::ResultUnavailable)?;
+    let choice = &choices[0];
+    let message = &choice["message"];
+    let mut delta = json!({"role":"assistant"});
+    if let Some(content) = message.get("content") {
+        delta["content"] = content.clone();
+    }
+    if let Some(refusal) = message.get("refusal") {
+        delta["refusal"] = refusal.clone();
+    }
+    if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+        delta["tool_calls"] = Value::Array(
+            calls
+                .iter()
+                .enumerate()
+                .map(|(index, call)| {
+                    json!({"index":index,"id":call["id"],"type":call["type"],"function":call["function"]})
+                })
+                .collect(),
+        );
+    }
+    let base = json!({
+        "id":completion["id"],
+        "object":"chat.completion.chunk",
+        "created":completion["created"],
+        "model":completion["model"]
+    });
+    let mut content = base.clone();
+    content["choices"] =
+        json!([{"index":0,"delta":delta,"finish_reason":choice["finish_reason"],"logprobs":null}]);
+    content["usage"] = Value::Null;
+    let mut usage = base;
+    usage["choices"] = json!([]);
+    usage["usage"] = completion["usage"].clone();
+    Ok(vec![
+        sse_data(&content.to_string()),
+        sse_data(&usage.to_string()),
+        sse_data("[DONE]"),
+    ])
 }

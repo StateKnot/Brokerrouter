@@ -229,6 +229,14 @@ enum Command {
         #[arg(long)]
         name: String,
     },
+    /// Local/single-operator bootstrap. This is not a production certification path.
+    InitPersonal {
+        /// JSON `store::PersonalProfile`; contains a credential environment reference only.
+        #[arg(long)]
+        file: std::path::PathBuf,
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        gateway_base_url: String,
+    },
     McpServerRegister {
         /// JSON `mcp_catalog::RegisterServer`; contains only a secret reference.
         #[arg(long)]
@@ -343,6 +351,8 @@ enum Command {
         operation: String,
         #[arg(long)]
         supports_tools: bool,
+        #[arg(long)]
+        supports_streaming: bool,
         #[arg(long)]
         embedding_dimension: Option<i32>,
     },
@@ -939,6 +949,39 @@ async fn main() -> anyhow::Result<()> {
             store::put_model(&pool, tenant, &id, &name).await?;
             println!("Model saved");
         }
+        Command::InitPersonal {
+            file,
+            gateway_base_url,
+        } => {
+            migrate(&pool).await?;
+            let url = url::Url::parse(&gateway_base_url)?;
+            if url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+                || !matches!(url.scheme(), "http" | "https")
+            {
+                anyhow::bail!(
+                    "gateway base URL must be an HTTP(S) origin without credentials, query or fragment"
+                );
+            }
+            let profile: store::PersonalProfile =
+                serde_json::from_str(&std::fs::read_to_string(file)?)?;
+            let created = store::init_personal(&pool, profile).await?;
+            eprintln!(
+                "Personal/dev profile created. The virtual key is shown once and expires at {}. This is not a production certification claim.",
+                created.expires_at
+            );
+            println!("[provider]");
+            println!("provider_type = \"brokerrouter\"");
+            println!(
+                "base_url = {}",
+                serde_json::to_string(gateway_base_url.trim_end_matches('/'))?
+            );
+            println!("api_key = {}", serde_json::to_string(&created.key)?);
+            println!("model = {}", serde_json::to_string(&created.model_id)?);
+        }
         Command::KeyCreate {
             tenant,
             name,
@@ -1012,6 +1055,7 @@ async fn main() -> anyhow::Result<()> {
             allow_private,
             operation,
             supports_tools,
+            supports_streaming,
             embedding_dimension,
         } => {
             let e = store::Endpoint {
@@ -1031,6 +1075,7 @@ async fn main() -> anyhow::Result<()> {
                 priority,
                 operation,
                 supports_tools,
+                supports_streaming,
                 embedding_dimension,
             };
             store::add_endpoint(&pool, &e).await?;

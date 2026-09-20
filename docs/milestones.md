@@ -6,7 +6,7 @@
 | --- | --- | --- | --- |
 | M0 工程与生产契约 | Rust 锁定工具链、构建、迁移、CI、运行说明、v0.3 决策 | fmt/clippy/test、真实 PostgreSQL 迁移、健康检查 | 本地与远端 CI 验收通过 |
 | M1 访问、模型与金额基础 | 租户、虚拟密钥生成/撤销、逻辑模型多端点、预算、价格、人民币/美元汇率配置 | 跨租户不可见、撤销即时生效、预算并发、汇率快照与低价精度 | 基础模块本地验收通过 |
-| M2 统一文本调用闭环 | Chat/Embedding、能力过滤、端点路由、请求/attempt、精确计费、日志 | 本地协议/故障集成测试；真实供应商调用认证另行执行 | 非流式核心实现与本地测试通过；[阿里云 4 模型真实冒烟](live-aliyun-2026-09-14.md)部分通过，工具原样回传、端点限制和完整认证待完成 |
+| M2 统一文本调用闭环 | Chat/Embedding、能力过滤、端点路由、请求/attempt、精确计费、日志 | 本地协议/故障集成测试；真实供应商调用认证另行执行 | 非流式核心、能力受控 SSE、工具扩展字段规范化、个人初始化及本地故障回归已实现；[阿里云 4 模型真实冒烟](live-aliyun-2026-09-14.md)仅部分通过，当前修复的真实复验、SSE/SDK/账单与容量认证待完成 |
 | M3 护栏与用户审批 | 用户身份与 Agent 分离、turn 权威生命周期、持久审批、输出隔离、当前 turn 豁免、恢复协议 | 代批失败、重复决定原子、迟到批准失效、重启不重复副作用 | 核心及文本语义连接器已实现；多模态/专用审核适配、检测质量与真实 BFF/Runtime 认证待完成 |
 | M4 多模态作业与资产 | 同步图像/异步视频/3D、连接器配置、持久 worker、提交不确定、私有资产、回调 | 接收后断线不重提、转存恢复、取消竞态、跨租户资产访问拒绝 | 资产/计费、文生视频作业、隔离转存、扫描与技术检测、资产策略及真人审批交付、隔离 MP4 预览已实现；专用内容语义、其他模态预览、图片/3D/其他协议待开发，生产认证待完成 |
 | M5 控制台与治理 | TypeScript 控制台、OIDC、模型/端点、策略/护栏、汇率、人民币统计、任务审计、经验/评测样本 | 页面使用真实 API；各维度账本一致；权限矩阵与审批审计 | 报表、OIDC BFF、配置管理、护栏监控、本人 JSON/隔离 MP4 审阅审批、逐轮次节点/调用/事件治理与 HTTPS edge 已实现；其他模态预览、经验候选/评测样本和其余统计维度待开发，真实 IdP/整链路/部署待认证 |
@@ -65,11 +65,11 @@
 
 ## M2 实施记录（2026-09-11）
 
-已实现 [text-nonstream-v1 契约](m2-text-gateway.md)：Chat/工具调用协议、Embedding、最多 3 个候选端点的安全回退、逻辑请求与 attempt、当前 Key 的请求日志、人民币结算、加密结果重放与有效期、正常停机排空、持久不确定状态维护、独立核对身份及证据审计。沿用 M1 的预算/账本事务，没有另建资金事实库。
+已实现当时的 `text-nonstream-v1`，后续增量已将当前 [M2 契约](m2-text-gateway.md) 提升为 `text-chat-v2`：Chat/工具调用协议、Embedding、最多 3 个候选端点的安全回退、逻辑请求与 attempt、当前 Key 的请求日志、人民币结算、加密结果重放与有效期、正常停机排空、持久不确定状态维护、独立核对身份及证据审计。沿用 M1 的预算/账本事务，没有另建资金事实库。
 
 当前测试集：3 项纯单元测试 + 19 项 PostgreSQL/HTTP 集成测试，共 22 项（含 M1 回归测试）。新增覆盖数据库等待上限、真实 HTTP 客户端→网关→供应商测试服务闭环、连接拒绝后按实际端点价格结算、上游接收后超时不回退、无效用量/重定向/429 不伪装未收费、工具能力/向量维度/SSRF、并发幂等、密文过期与跨租户访问、客户端断开与排空、重启状态恢复、数据库结算失败不重发，以及运行身份不能代核对人员闭合未知费用。
 
-未完成闸门：真实供应商和 SDK 认证尚未执行；需要供应商/区域/模型 ID、凭据引用和人民币测试上限。SSE/Responses 不在当前档位中，明确返回不支持；多模态、护栏审批、控制台和完整生产容量仍按后续里程碑完成，不据此宣称整个平台可上线。
+当时未完成闸门为真实供应商和 SDK 认证；后续虽已实现能力受控 SSE，仍需固定供应商/区域/模型 ID、凭据引用和人民币测试上限完成真实复验。Responses 和多模态 Chat content 仍明确不支持；不据此宣称整个平台可上线。
 
 ## M3 实施记录（2026-09-11）
 
@@ -384,3 +384,16 @@ OAuth client credentials 配置固定 issuer/resource/audience 且 audience 必�
 0022 迁移增加 OAuth issuer/subject/tenant 到虚拟 Key 的显式映射。签名 token 的自报租户不能直接授权；映射、Key、租户、scope 和工具 grant 每次请求都重新校验。配置通过幂等 operation、事务审计与专用 catalog/server 数据库权限发布。虚拟 Key 路径继续兼容，下游 token 从不转发到上游。
 
 本地 OAuth 单元测试 **3 项通过**；隔离 PostgreSQL 17 的 MCP catalog **6 项**和 server **2 项**通过，全仓常规回归 **224 项通过、0 失败、4 项环境专项 ignored**；fmt、Clippy `-D warnings` 通过。ignored 项由正式 CI 的 S3/固定 ClamAV/FFmpeg fixture 显式执行。真实 IdP/JWKS TLS/轮换、opaque introspection、容量和官方 conformance 仍在 LIVE-22。治理后的真实上游调用、MRTR `input_required`、执行 claim/receipt、Hermes/OpenClaw 恢复仍属后续包，因此 `tools/call` 继续审计后失败关闭。
+
+## M2 JiaClaw 消费者闭环增量（2026-09-20）
+
+针对 JiaClaw 必须统一走 Brokerrouter 的个人 Agent 约束，完成四个相互依赖的生产边界：
+
+1. 新增事务化 `init-personal`，在一个数据库事务中创建有预算租户、Chat 模型、上游端点、有期限虚拟 Key、模型 grant 和审计事实；同名 profile 不重发密钥。用于 JiaClaw 的单用户 TOML 只在创建成功时输出一次。
+2. Chat 端点新增默认 false 的 `supports_streaming`。`stream:true` 只在满足能力的端点中路由，严格校验 OpenAI 兼容 SSE；客户端断开后仍完成账本与加密结果持久化，且只在这些事实成功后发 `[DONE]`。输出护栏命中时出网前失败关闭。
+3. 供应商非标准 `tool_calls[].index` 在响应边界规范化，同一 assistant message 原样回传时也会验证后移除扩展字段。无工具或 SSE 能力时返回 `unsupported_model_capability`，不静默删除请求字段。
+4. 新增 [JiaClaw 消费者指南](jiaclaw-consumer-guide.md)、[工具往返认证矩阵](tool-roundtrip-certification.md)和可重复执行的 `brokerrouter-certify-tools`，用虚拟 Key 验证两轮 tool 闭环、幂等重放、单 attempt 及人民币预留归零，不输出凭据或正文。
+
+本地回归覆盖个人初始化原子回滚、工具原样两轮往返、SSE 成功结算/幂等重放/客户端断开/上游中断/缺失 usage、能力路由与输出护栏。常规 Rust 全量 **232 项通过、0 失败、4 项环境专项 ignored**；最终组合能力加固后 Gateway **34 项通过**，fmt、Clippy `-D warnings` 和 release 构建通过。Console 合约 **28 项**、Chromium/WebKit 真实浏览器 **124 项**全部通过。另以一次性 PostgreSQL 17 和真实 `init-personal`/`serve` 进程完成非流式、SSE、请求详情及认证 CLI 端到端冒烟，幂等重放未增加上游请求。
+
+阿里云北京的当前修复复验、真实 SSE、固定 SDK、账单核对和容量仍由 LIVE-01/03/04 阻断；在真实两轮证据入库前，认证矩阵不将任何真实供应商标为 JiaClaw 生产默认。

@@ -50,7 +50,7 @@ brokerrouter console-permission-set --tenant <租户UUID> --user <治理用户UU
 
 - `model_create`：ID、名称，默认停用。
 - `model_update`：ID、预期版本、名称、启停；ID 不可原地替换。
-- `endpoint_create`：模型、登记连接/摘要、名称、上游模型、Chat/Embedding 合同、上下文/输出上限、优先级、CNY/USD 和输入/输出每百万 Token 价格。默认停用；不会替 Key 授权。
+- `endpoint_create`：模型、登记连接/摘要、名称、上游模型、Chat/Embedding 合同、上下文/输出上限、工具/SSE 能力、优先级、CNY/USD 和输入/输出每百万 Token 价格。工具/SSE 默认 false，端点默认停用；不会替 Key 授权，也不自动把声明当作供应商认证。
 - `endpoint_update`：UUID、预期版本、名称、启停、优先级、币种与价格。连接、上游模型、能力/向量维度不可原地替换；新建替代端点后停用旧端点。
 
 模型/端点每次更新（含 CLI）由数据库推进 `config_revision`。旧版本 409，不自动覆盖。配置、审计前后值/真人/理由/操作号、幂等回执同事务提交，任一步失败全部回滚。同租户/用户/操作号的相同内容返回原回执，不重复创建/审计；不同内容 409。回执保持不可变，未来归档也必须保持去重墓碑和审计完整性，不能通过清理让旧操作重新可执行。
