@@ -1,0 +1,7 @@
+# Place inside the existing stknot.com `route` block, before the static-file fallback.
+redir /ai-gateway /ai-gateway/ 308
+handle_path /ai-gateway/* {
+	reverse_proxy 127.0.0.1:18080 {
+		flush_interval -1
+	}
+}
