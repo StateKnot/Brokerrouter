@@ -5,10 +5,11 @@ use crate::{
 };
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path, Query, State},
-    http::{HeaderMap, Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::{Value, json};
@@ -59,12 +60,80 @@ pub(crate) async fn http_capacity(
 
 fn base_routes(pool: PgPool) -> Router {
     Router::new()
+        .route("/", get(landing))
+        .route("/gateway.css", get(landing_css))
         .route("/health/live", get(|| async { StatusCode::NO_CONTENT }))
         .route("/health/ready", get(ready))
         .route("/v1/models", get(models))
         .route("/v1/exchange-rates", get(exchange_rate))
         .fallback(|| async { Error::NotFound })
         .with_state(pool)
+}
+
+const LANDING_HTML: &str = r#"<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Brokerrouter AI 网关</title>
+  <link rel="stylesheet" href="gateway.css">
+</head>
+<body>
+  <main>
+    <p class="eyebrow">STATEKNOT · BROKERROUTER</p>
+    <h1>AI 网关已上线</h1>
+    <p class="lead">统一模型调用、人民币账本与智能体审批治理的生产核心数据面。</p>
+    <section aria-labelledby="service-status">
+      <div class="status"><span aria-hidden="true"></span>服务运行中</div>
+      <h2 id="service-status">API 接入地址</h2>
+      <code>https://stknot.com/ai-gateway/v1</code>
+      <p>模型与业务接口需要 Brokerrouter 虚拟密钥；此入口不会公开租户、模型或用量数据。</p>
+      <nav aria-label="服务检查">
+        <a href="health/ready">就绪状态</a>
+        <a href="health/live">存活状态</a>
+      </nav>
+    </section>
+  </main>
+</body>
+</html>
+"#;
+
+const LANDING_CSS: &str = r#":root {
+  color-scheme: light;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #f5f7fb;
+  color: #14213d;
+}
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+main { width: min(720px, 100%); }
+.eyebrow { color: #5f6fff; font-size: 13px; font-weight: 750; letter-spacing: .14em; margin: 0 0 18px; }
+h1 { color: #101828; font-size: clamp(42px, 8vw, 72px); letter-spacing: -.055em; line-height: .98; margin: 0; }
+.lead { color: #667085; font-size: clamp(18px, 3vw, 22px); line-height: 1.65; margin: 24px 0 34px; }
+section { background: #fff; border: 1px solid #e4e7ec; border-radius: 22px; box-shadow: 0 20px 60px rgba(16, 24, 40, .08); padding: clamp(24px, 5vw, 40px); }
+.status { align-items: center; color: #087443; display: flex; font-size: 14px; font-weight: 700; gap: 10px; }
+.status span { background: #12b76a; border-radius: 50%; box-shadow: 0 0 0 5px #d1fadf; height: 9px; width: 9px; }
+h2 { color: #344054; font-size: 15px; margin: 28px 0 12px; }
+code { background: #f2f4f7; border-radius: 9px; color: #101828; display: block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px; overflow-wrap: anywhere; padding: 14px 16px; }
+section p { color: #667085; font-size: 14px; line-height: 1.7; margin: 18px 0 24px; }
+nav { display: flex; flex-wrap: wrap; gap: 12px; }
+a { background: #eef0ff; border-radius: 9px; color: #3448d8; font-size: 14px; font-weight: 700; padding: 10px 14px; text-decoration: none; }
+a:focus-visible, a:hover { background: #e0e4ff; outline: 2px solid #7180ff; outline-offset: 2px; }
+"#;
+
+async fn landing() -> impl IntoResponse {
+    ([(header::CACHE_CONTROL, "no-store")], Html(LANDING_HTML))
+}
+
+async fn landing_css() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        Body::from(LANDING_CSS),
+    )
 }
 
 async fn chat(State(g): State<Gateway>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
@@ -261,4 +330,70 @@ async fn exchange_rate(State(pool): State<PgPool>, headers: HeaderMap) -> Result
     Ok(Json(
         json!({"primary_currency":"CNY","quote":"CNY per 1 USD","effective":store::current_fx(&pool,who.tenant_id).await?}),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use sqlx::postgres::PgPoolOptions;
+    use tower::ServiceExt;
+
+    fn app() -> Router {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+            .expect("valid lazy database URL");
+        base_routes(pool)
+    }
+
+    #[tokio::test]
+    async fn browser_entrypoint_is_public_but_discloses_no_catalog_data() {
+        let response = app()
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(
+            response.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("网关已上线"));
+        assert!(body.contains("https://stknot.com/ai-gateway/v1"));
+        assert!(!body.contains("Authorization"));
+    }
+
+    #[tokio::test]
+    async fn browser_styles_are_self_hosted_and_unknown_routes_still_fail_closed() {
+        let response = app()
+            .oneshot(Request::get("/gateway.css").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/css; charset=utf-8"
+        );
+        assert!(
+            std::str::from_utf8(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap()
+                .contains("color-scheme")
+        );
+
+        let response = app()
+            .oneshot(Request::get("/unknown").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["error"]["code"], "not_found");
+    }
 }
