@@ -44,6 +44,8 @@ cargo run -- fx-history --tenant <TENANT_UUID> --limit 20
 
 ## 当前 HTTP 接口
 
+- `GET /`：不包含租户或模型数据的浏览器入口与服务状态页。
+- `GET /gateway.css`：入口页的同源静态样式，不依赖外部 CDN。
 - `GET /health/live`：进程存活。
 - `GET /health/ready`：数据库可连接，且迁移版本和 checksum 与运行二进制一致。
 - `GET /v1/models`：只返回当前虚拟密钥被授权的活跃模型。
