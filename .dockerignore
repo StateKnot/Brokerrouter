@@ -1,0 +1,12 @@
+.git
+.github
+.env
+target
+console/node_modules
+console/dist
+runtime/hermes/.venv
+runtime/hermes/__pycache__
+**/*.pem
+**/*.key
+**/*.crt
+**/*.env

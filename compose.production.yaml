@@ -1,0 +1,181 @@
+name: brokerrouter-production
+
+x-app-common: &app-common
+  image: brokerrouter:${BROKERROUTER_IMAGE_TAG:?set BROKERROUTER_IMAGE_TAG}
+  restart: "no"
+  networks:
+    - backend
+  secrets:
+    - pg_ca
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  cap_add:
+    - SETGID
+    - SETUID
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  pids_limit: 256
+  mem_limit: 512m
+  cpus: 1.5
+
+services:
+  postgres:
+    image: postgres@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: brokerrouter
+      POSTGRES_USER: brokerrouter_migration
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_migration_password
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=trust
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    secrets:
+      - postgres_migration_password
+      - postgres_runtime_password
+      - postgres_operator_password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./deploy/production/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./deploy/production/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./deploy/production/postgres-init.sh:/docker-entrypoint-initdb.d/10-brokerrouter-logins.sh:ro
+      - ./deploy/production/postgres-dump.sh:/usr/local/sbin/brokerrouter-pg-dump:ro
+      - ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/pg-server.crt:/run/brokerrouter/tls/server.crt:ro
+      - ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/pg-server.key:/run/brokerrouter/tls/server.key:ro
+      - ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/pg-ca.crt:/run/brokerrouter/tls/ca.crt:ro
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready --host=127.0.0.1 --username=brokerrouter_migration --dbname=brokerrouter"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 15s
+    shm_size: 128m
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.0
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  migrate:
+    <<: *app-common
+    profiles: [ops]
+    command: ["migrate"]
+    secrets:
+      - pg_ca
+      - migration_env
+    environment:
+      BROKERROUTER_ENV_FILE: /run/secrets/migration_env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  permissions:
+    image: postgres@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675
+    profiles: [ops]
+    restart: "no"
+    entrypoint: ["/usr/local/sbin/brokerrouter-apply-permissions"]
+    secrets:
+      - postgres_migration_password
+    volumes:
+      - ./deploy/permissions.sql:/opt/brokerrouter/permissions.sql:ro
+      - ./deploy/production/apply-permissions.sh:/usr/local/sbin/brokerrouter-apply-permissions:ro
+      - ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/pg-ca.crt:/run/brokerrouter/tls/ca.crt:ro
+    networks:
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.5
+
+  operator:
+    <<: *app-common
+    profiles: [ops]
+    command: ["--help"]
+    secrets:
+      - pg_ca
+      - operator_env
+    environment:
+      BROKERROUTER_ENV_FILE: /run/secrets/operator_env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  gateway:
+    <<: *app-common
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["serve", "--bind", "0.0.0.0:8080"]
+    environment:
+      BROKERROUTER_ENV_FILE: /run/secrets/runtime_env
+      BROKERROUTER_MAX_CONCURRENCY: "16"
+      BROKERROUTER_REQUEST_TIMEOUT_SECONDS: "120"
+      BROKERROUTER_RESULT_TTL_SECONDS: "86400"
+      RUST_LOG: brokerrouter=info
+    secrets:
+      - pg_ca
+      - runtime_env
+    ports:
+      - "127.0.0.1:${BROKERROUTER_BIND_PORT:-18080}:8080"
+    networks:
+      backend: {}
+      egress:
+        gw_priority: 1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8080/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    init: true
+    stop_grace_period: 3m
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+networks:
+  backend:
+    internal: true
+  egress: {}
+
+volumes:
+  pgdata:
+
+secrets:
+  pg_ca:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/pg-ca.crt
+  postgres_migration_password:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/postgres-migration-password
+  postgres_runtime_password:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/postgres-runtime-password
+  postgres_operator_password:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/postgres-operator-password
+  migration_env:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/migration.env
+  runtime_env:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/runtime.env
+  operator_env:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/operator.env
