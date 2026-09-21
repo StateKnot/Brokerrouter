@@ -5,6 +5,7 @@ WORKDIR /src
 ENV CARGO_BUILD_JOBS=1
 
 COPY Cargo.toml Cargo.lock ./
+COPY deploy/production/cargo-config.toml /usr/local/cargo/config.toml
 COPY src ./src
 COPY migrations ./migrations
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
@@ -14,7 +15,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 FROM debian@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
 
-RUN apt-get update && \
+RUN sed -i \
+      -e 's|http://deb.debian.org/debian-security|http://mirrors.cloud.tencent.com/debian-security|g' \
+      -e 's|http://deb.debian.org/debian|http://mirrors.cloud.tencent.com/debian|g' \
+      /etc/apt/sources.list.d/debian.sources && \
+    apt-get -o Acquire::ForceIPv4=true update && \
     apt-get install --yes --no-install-recommends ca-certificates curl gosu && \
     rm -rf /var/lib/apt/lists/* && \
     groupadd --gid 10001 brokerrouter && \
