@@ -10,6 +10,17 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: NousResearch/hermes-agent
+          ref: 67764dc0863349a384c16425e73ee8571f3a94b7
+          path: hermes-upstream
+          sparse-checkout: |
+            agent/tool_executor.py
+            gateway/run_turn.py
+            gateway/run_turn_runner.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12.10"
@@ -24,15 +35,9 @@ jobs:
       - name: Fixed Hermes source and overlay contract
         run: |
           mkdir -p /tmp/hermes-contract/agent /tmp/hermes-contract/gateway
-          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            https://raw.githubusercontent.com/NousResearch/hermes-agent/67764dc0863349a384c16425e73ee8571f3a94b7/agent/tool_executor.py \
-            --output /tmp/hermes-contract/agent/tool_executor.py
-          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            https://raw.githubusercontent.com/NousResearch/hermes-agent/67764dc0863349a384c16425e73ee8571f3a94b7/gateway/run_turn.py \
-            --output /tmp/hermes-contract/gateway/run_turn.py
-          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            https://raw.githubusercontent.com/NousResearch/hermes-agent/67764dc0863349a384c16425e73ee8571f3a94b7/gateway/run_turn_runner.py \
-            --output /tmp/hermes-contract/gateway/run_turn_runner.py
+          cp hermes-upstream/agent/tool_executor.py /tmp/hermes-contract/agent/tool_executor.py
+          cp hermes-upstream/gateway/run_turn.py /tmp/hermes-contract/gateway/run_turn.py
+          cp hermes-upstream/gateway/run_turn_runner.py /tmp/hermes-contract/gateway/run_turn_runner.py
           echo '1610a0893588cbc067aaf84b3d019a683cd83ba0fdb92d69baf4f7b9e6d121b9  /tmp/hermes-contract/agent/tool_executor.py' | sha256sum --check --strict
           echo 'dd203228bdfb7f69f1442adf4e24cc7e3196fb348b096ab6e7c2cb2bd2af5214  /tmp/hermes-contract/gateway/run_turn.py' | sha256sum --check --strict
           echo '9bfa045616264e944b417ce3bfe0e302168c7b6d0218ceeb253b2dad2629e4ba  /tmp/hermes-contract/gateway/run_turn_runner.py' | sha256sum --check --strict
