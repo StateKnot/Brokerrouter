@@ -91,8 +91,113 @@ fn discovery(tenant_id: Uuid, server_id: Uuid, revision: i64) -> RecordDiscovery
         })],
         tools_ttl_ms: Some(30_000),
         tools_cache_scope: Some(CacheScope::Private),
+        skills: vec![],
+        skills_ttl_ms: Some(30_000),
+        skills_cache_scope: Some(CacheScope::Private),
         authorization_context_fingerprint: Some(AUTH_CONTEXT.into()),
     }
+}
+
+fn skill_entry(name: &str) -> serde_json::Value {
+    let uri = format!("skill://{name}/SKILL.md");
+    json!({
+        "uri":uri,
+        "frontmatter":{"name":name,"description":"Reviewed workflow"},
+        "resources":[{"uri":uri,"digest":format!("sha256:{}", "a".repeat(64)),"size":42}]
+    })
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn skills_are_immutable_observations_not_agent_grants(pool: PgPool) {
+    let tenant_id = tenant(&pool, "mcp-skills").await;
+    let registered = mcp_catalog::register_server(&pool, &cipher(), registration(tenant_id))
+        .await
+        .unwrap();
+    let server_id: Uuid = serde_json::from_value(registered["server_id"].clone()).unwrap();
+    mcp_catalog::update_server(&pool, &cipher(), update(tenant_id, server_id, 1))
+        .await
+        .unwrap();
+
+    let mut observed = discovery(tenant_id, server_id, 2);
+    observed.skills = vec![skill_entry("review")];
+    let first = mcp_catalog::record_discovery(&pool, observed.clone())
+        .await
+        .unwrap();
+    assert_eq!(first["skill_count"], 1);
+    assert_eq!(
+        mcp_catalog::record_discovery(&pool, observed.clone())
+            .await
+            .unwrap(),
+        first
+    );
+    let reviewed = mcp_catalog::review_skills(&pool, tenant_id, server_id)
+        .await
+        .unwrap();
+    assert_eq!(reviewed["skills"][0]["uri"], "skill://review/SKILL.md");
+    assert_eq!(
+        reviewed["skills"][0]["activation"],
+        "disabled_until_approval_and_read_path"
+    );
+    assert_eq!(
+        reviewed["skills"][0]["approval_fingerprint"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    let snapshot_id: Uuid = serde_json::from_value(first["snapshot_id"].clone()).unwrap();
+    let immutable = sqlx::query("UPDATE mcp_discovered_skills SET name='tampered' WHERE tenant_id=$1 AND discovery_snapshot_id=$2")
+        .bind(tenant_id).bind(snapshot_id).execute(&pool).await;
+    assert!(immutable.is_err());
+
+    let mut duplicate = discovery(tenant_id, server_id, 2);
+    duplicate.skills = vec![skill_entry("review"), skill_entry("review")];
+    assert!(matches!(
+        mcp_catalog::record_discovery(&pool, duplicate).await,
+        Err(Error::Invalid(_))
+    ));
+    let mut dynamic = discovery(tenant_id, server_id, 2);
+    dynamic.skills = vec![
+        json!({"uri":"skill://review/SKILL.md","frontmatter":{"name":"review","description":"x"},"resources":"dynamic"}),
+    ];
+    assert!(matches!(
+        mcp_catalog::record_discovery(&pool, dynamic).await,
+        Err(Error::Invalid(_))
+    ));
+    let mut invalid = discovery(tenant_id, server_id, 2);
+    invalid.capabilities["resources"] = serde_json::Value::Null;
+    invalid.skills = vec![skill_entry("review")];
+    assert!(matches!(
+        mcp_catalog::record_discovery(&pool, invalid).await,
+        Err(Error::Invalid(_))
+    ));
+    let mut refreshed = observed;
+    refreshed.operation_id = Uuid::new_v4();
+    refreshed.skills[0]["resources"][0]["digest"] = json!(format!("sha256:{}", "b".repeat(64)));
+    let second = mcp_catalog::record_discovery(&pool, refreshed)
+        .await
+        .unwrap();
+    assert_ne!(first["skill_catalog_hash"], second["skill_catalog_hash"]);
+    let newest = mcp_catalog::review_skills(&pool, tenant_id, server_id)
+        .await
+        .unwrap();
+    assert_eq!(newest["snapshot_id"], second["snapshot_id"]);
+    assert_ne!(
+        reviewed["skills"][0]["approval_fingerprint"],
+        newest["skills"][0]["approval_fingerprint"]
+    );
+    let mut expired = discovery(tenant_id, server_id, 2);
+    expired.skills = vec![skill_entry("review")];
+    expired.skills_ttl_ms = Some(0);
+    mcp_catalog::record_discovery(&pool, expired).await.unwrap();
+    assert!(matches!(
+        mcp_catalog::review_skills(&pool, tenant_id, server_id).await,
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        mcp_catalog::review_skills(&pool, Uuid::new_v4(), server_id).await,
+        Err(Error::NotFound)
+    ));
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -574,7 +679,9 @@ async fn deployment_roles_separate_configuration_discovery_and_other_authority(p
     mcp_catalog::connector_server(&client, &cipher(), tenant_id, server_id)
         .await
         .unwrap();
-    mcp_catalog::record_discovery(&client, discovery(tenant_id, server_id, 2))
+    let mut observed = discovery(tenant_id, server_id, 2);
+    observed.skills = vec![skill_entry("review")];
+    mcp_catalog::record_discovery(&client, observed)
         .await
         .unwrap();
     for sql in [
@@ -592,6 +699,10 @@ async fn deployment_roles_separate_configuration_discovery_and_other_authority(p
     let reviewed = mcp_catalog::review_tools(&catalog, tenant_id, server_id)
         .await
         .unwrap();
+    let reviewed_skills = mcp_catalog::review_skills(&catalog, tenant_id, server_id)
+        .await
+        .unwrap();
+    assert_eq!(reviewed_skills["skills"][0]["name"], "review");
     mcp_catalog::set_tool_grant(
         &catalog,
         SetToolGrant {
@@ -664,6 +775,7 @@ async fn deployment_roles_separate_configuration_discovery_and_other_authority(p
         "UPDATE approvals SET state='approved'",
         "UPDATE mcp_key_tool_grants SET active=false",
         "UPDATE mcp_oauth_principals SET active=false",
+        "SELECT * FROM mcp_discovered_skills",
         "SET ROLE brokerrouter_mcp_client",
     ] {
         assert!(

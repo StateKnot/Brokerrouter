@@ -11,6 +11,7 @@ use crate::{
     egress,
     error::Error as GatewayError,
     governance,
+    mcp::{SKILLS_EXTENSION, SkillEntry},
     mcp_catalog::{self, ConnectorServer, CredentialReference, RecordDiscovery},
 };
 use futures_util::{StreamExt, stream::BoxStream};
@@ -20,9 +21,9 @@ use rmcp::{
     ClientLifecycleMode, ClientServiceExt,
     model::{
         CacheScope as RmcpCacheScope, CallToolRequestParams, CallToolResponse, CallToolResult,
-        ClientCapabilities, ClientConfig, CreateTaskResult, DiscoverResult, Implementation,
-        InputRequiredResult, JsonObject, PaginatedRequestParams, ProtocolVersion,
-        RequestMetaObject, ServerJsonRpcMessage, Tool,
+        ClientCapabilities, ClientConfig, ClientRequest, CreateTaskResult, CustomRequest,
+        DiscoverResult, Implementation, InputRequiredResult, JsonObject, PaginatedRequestParams,
+        ProtocolVersion, RequestMetaObject, ServerJsonRpcMessage, ServerResult, Tool,
     },
     service::{Peer, RoleClient},
     transport::{
@@ -39,7 +40,7 @@ use rmcp::{
     },
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::{
@@ -71,6 +72,8 @@ const MAX_STDIO_ENVIRONMENT: usize = 128;
 const MAX_STDIO_PROGRAM_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DISCOVERED_TOOLS: usize = 1024;
 const MAX_TOOL_LIST_PAGES: usize = 128;
+const MAX_DISCOVERED_SKILLS: usize = 1024;
+const MAX_SKILL_LIST_PAGES: usize = 128;
 
 #[derive(Debug)]
 struct WireDiscovery {
@@ -78,6 +81,19 @@ struct WireDiscovery {
     tools: Vec<Tool>,
     tools_ttl_ms: Option<u64>,
     tools_cache_scope: Option<RmcpCacheScope>,
+    skills: Vec<SkillEntry>,
+    skills_ttl_ms: Option<u64>,
+    skills_cache_scope: Option<RmcpCacheScope>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillsListPage {
+    result_type: String,
+    skills: Vec<SkillEntry>,
+    ttl_ms: u64,
+    cache_scope: RmcpCacheScope,
+    next_cursor: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1060,6 +1076,95 @@ async fn discover_tools(
     Ok((tools, ttl_ms, cache_scope))
 }
 
+async fn discover_skills(
+    peer: &Peer<RoleClient>,
+    discovery: &DiscoverResult,
+    timeout: Duration,
+) -> Result<(Vec<SkillEntry>, Option<u64>, Option<RmcpCacheScope>), DiscoveryError> {
+    let advertised = discovery
+        .capabilities
+        .extensions
+        .as_ref()
+        .is_some_and(|extensions| extensions.contains_key(SKILLS_EXTENSION));
+    if !advertised {
+        return Ok((Vec::new(), None, None));
+    }
+    if discovery.capabilities.resources.is_none() {
+        return Err(DiscoveryError::Protocol);
+    }
+    let config = client_config();
+    let mut skills = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut cursors = HashSet::new();
+    let mut uris = HashSet::new();
+    let mut ttl_ms: Option<u64> = None;
+    let mut cache_scope: Option<RmcpCacheScope> = None;
+    let deadline = tokio::time::Instant::now() + timeout;
+    for _ in 0..MAX_SKILL_LIST_PAGES {
+        let mut request = CustomRequest::new(
+            "skills/list",
+            Some(
+                cursor
+                    .as_ref()
+                    .map_or_else(|| json!({}), |value| json!({"cursor":value})),
+            ),
+        );
+        request
+            .extensions
+            .insert(RequestMetaObject::with_client_context(
+                ProtocolVersion::V_2026_07_28,
+                config.client_info.clone(),
+                config.capabilities.clone(),
+            ));
+        let response = tokio::time::timeout_at(
+            deadline,
+            peer.send_request(ClientRequest::CustomRequest(request)),
+        )
+        .await
+        .map_err(|_| DiscoveryError::Protocol)?
+        .map_err(|_| DiscoveryError::Protocol)?;
+        let ServerResult::CustomResult(response) = response else {
+            return Err(DiscoveryError::Protocol);
+        };
+        let page: SkillsListPage =
+            serde_json::from_value(response.0).map_err(|_| DiscoveryError::Protocol)?;
+        if page.result_type != "complete" || page.ttl_ms > 86_400_000 {
+            return Err(DiscoveryError::Protocol);
+        }
+        ttl_ms = Some(ttl_ms.map_or(page.ttl_ms, |current| current.min(page.ttl_ms)));
+        cache_scope = Some(match (cache_scope, page.cache_scope) {
+            (Some(RmcpCacheScope::Private), _) | (_, RmcpCacheScope::Private) => {
+                RmcpCacheScope::Private
+            }
+            (Some(RmcpCacheScope::Public), RmcpCacheScope::Public)
+            | (None, RmcpCacheScope::Public) => RmcpCacheScope::Public,
+            _ => return Err(DiscoveryError::Protocol),
+        });
+        if page.skills.len() > MAX_DISCOVERED_SKILLS.saturating_sub(skills.len()) {
+            return Err(DiscoveryError::Protocol);
+        }
+        for skill in page.skills {
+            if !uris.insert(skill.uri.clone()) {
+                return Err(DiscoveryError::Protocol);
+            }
+            skills.push(skill);
+        }
+        match page.next_cursor {
+            Some(next)
+                if !next.is_empty() && next.len() <= 2048 && cursors.insert(next.clone()) =>
+            {
+                cursor = Some(next);
+            }
+            Some(_) => return Err(DiscoveryError::Protocol),
+            None => {
+                skills.sort_by(|left, right| left.uri.cmp(&right.uri));
+                return Ok((skills, ttl_ms, cache_scope));
+            }
+        }
+    }
+    Err(DiscoveryError::Protocol)
+}
+
 async fn discover_wire<C>(
     client: C,
     endpoint: &str,
@@ -1105,12 +1210,17 @@ where
         .map_err(|_| DiscoveryError::Protocol)?;
     let (tools, tools_ttl_ms, tools_cache_scope) =
         discover_tools(running.peer(), &result, DISCOVERY_TIMEOUT).await?;
+    let (skills, skills_ttl_ms, skills_cache_scope) =
+        discover_skills(running.peer(), &result, DISCOVERY_TIMEOUT).await?;
     let _ = running.close_with_timeout(SHUTDOWN_TIMEOUT).await;
     Ok(WireDiscovery {
         result,
         tools,
         tools_ttl_ms,
         tools_cache_scope,
+        skills,
+        skills_ttl_ms,
+        skills_cache_scope,
     })
 }
 
@@ -1159,6 +1269,8 @@ async fn discover_stdio_wire(
         .map_err(|_| DiscoveryError::Protocol)?;
     let (tools, tools_ttl_ms, tools_cache_scope) =
         discover_tools(running.peer(), &result, timeout).await?;
+    let (skills, skills_ttl_ms, skills_cache_scope) =
+        discover_skills(running.peer(), &result, timeout).await?;
     let _ = running.close_with_timeout(SHUTDOWN_TIMEOUT).await;
     Ok((
         WireDiscovery {
@@ -1166,6 +1278,9 @@ async fn discover_stdio_wire(
             tools,
             tools_ttl_ms,
             tools_cache_scope,
+            skills,
+            skills_ttl_ms,
+            skills_cache_scope,
         },
         environment.fingerprint,
     ))
@@ -1478,6 +1593,9 @@ fn discovery_record(
         tools,
         tools_ttl_ms,
         tools_cache_scope,
+        skills,
+        skills_ttl_ms,
+        skills_cache_scope,
     } = observed;
     let ttl_ms = i32::try_from(result.ttl_ms).map_err(|_| DiscoveryError::Protocol)?;
     let server_info = result
@@ -1520,6 +1638,22 @@ fn discovery_record(
             .transpose()
             .map_err(|_| DiscoveryError::Protocol)?,
         tools_cache_scope: tools_cache_scope
+            .map(|scope| match scope {
+                RmcpCacheScope::Private => Ok(mcp_catalog::CacheScope::Private),
+                RmcpCacheScope::Public => Ok(mcp_catalog::CacheScope::Public),
+                _ => Err(DiscoveryError::Protocol),
+            })
+            .transpose()?,
+        skills: skills
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| DiscoveryError::Protocol)?,
+        skills_ttl_ms: skills_ttl_ms
+            .map(i32::try_from)
+            .transpose()
+            .map_err(|_| DiscoveryError::Protocol)?,
+        skills_cache_scope: skills_cache_scope
             .map(|scope| match scope {
                 RmcpCacheScope::Private => Ok(mcp_catalog::CacheScope::Private),
                 RmcpCacheScope::Public => Ok(mcp_catalog::CacheScope::Public),
@@ -1708,6 +1842,7 @@ mod tests {
         calls: Arc<AtomicUsize>,
         requests: Arc<Mutex<Vec<Value>>>,
         oversized: bool,
+        skills: bool,
     }
 
     async fn discovery_fixture(
@@ -1746,11 +1881,30 @@ mod tests {
                 "ttlMs":15000,
                 "cacheScope":"private"
             })
+        } else if method == "skills/list" {
+            let second = request["params"]["cursor"] == "page-2";
+            let name = if second { "audit" } else { "review" };
+            let uri = format!("skill://{name}/SKILL.md");
+            let mut result = json!({
+                "resultType":"complete",
+                "skills":[{"uri":uri,"frontmatter":{"name":name,"description":"Test workflow"},"resources":[{"uri":uri,"digest":format!("sha256:{}", "a".repeat(64)),"size":42}]}],
+                "ttlMs":if second {10_000} else {20_000},
+                "cacheScope":if second {"private"} else {"public"}
+            });
+            if !second {
+                result["nextCursor"] = json!("page-2");
+            }
+            result
         } else {
+            let mut capabilities = json!({"tools":{"listChanged":true}});
+            if state.skills {
+                capabilities["resources"] = json!({});
+                capabilities["extensions"] = json!({"io.modelcontextprotocol/skills":{}});
+            }
             json!({
                 "resultType":"complete",
                 "supportedVersions":[mcp_catalog::PROTOCOL_VERSION],
-                "capabilities":{"tools":{"listChanged":true}},
+                "capabilities":capabilities,
                 "instructions":instructions,
                 "ttlMs":30000,
                 "cacheScope":"private",
@@ -1764,10 +1918,18 @@ mod tests {
     async fn fixture_endpoint(
         oversized: bool,
     ) -> (String, WireFixture, tokio::task::JoinHandle<()>) {
+        fixture_endpoint_with_skills(oversized, false).await
+    }
+
+    async fn fixture_endpoint_with_skills(
+        oversized: bool,
+        skills: bool,
+    ) -> (String, WireFixture, tokio::task::JoinHandle<()>) {
         let fixture = WireFixture {
             calls: Arc::new(AtomicUsize::new(0)),
             requests: Arc::new(Mutex::new(Vec::new())),
             oversized,
+            skills,
         };
         let app = Router::new()
             .route("/mcp", post(discovery_fixture))
@@ -1983,6 +2145,39 @@ done"#,
                         && request["params"]["_meta"]["io.modelcontextprotocol/clientInfo"]["name"]
                             == "brokerrouter"
                 })
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_pages_preserve_origin_metadata_and_never_prefetch_content() {
+        let (endpoint, fixture, server) = fixture_endpoint_with_skills(false, true).await;
+        let client = BoundedMcpHttpClient {
+            inner: Client::new(),
+            max_response_bytes: MAX_DISCOVERY_RESPONSE_BYTES,
+        };
+        let result = discover_wire(client, &endpoint, Some("fixture-token".into()))
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(result.skills.len(), 2);
+        assert_eq!(result.skills[0].uri, "skill://audit/SKILL.md");
+        assert_eq!(result.skills_ttl_ms, Some(10_000));
+        assert_eq!(result.skills_cache_scope, Some(RmcpCacheScope::Private));
+        let requests = fixture.requests.lock().unwrap();
+        let pages: Vec<_> = requests
+            .iter()
+            .filter(|request| request["method"] == "skills/list")
+            .collect();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[1]["params"]["cursor"], "page-2");
+        assert_eq!(
+            pages[0]["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+            mcp_catalog::PROTOCOL_VERSION
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request["method"] != "resources/read")
         );
     }
 

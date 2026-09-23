@@ -268,6 +268,12 @@ enum Command {
         #[arg(long)]
         server: Uuid,
     },
+    McpSkillsList {
+        #[arg(long)]
+        tenant: Uuid,
+        #[arg(long)]
+        server: Uuid,
+    },
     McpToolGrantSet {
         /// JSON `mcp_catalog::SetToolGrant`; the descriptor digest must come
         /// from a fresh `mcp-tools-list` review.
@@ -729,6 +735,13 @@ async fn main() -> anyhow::Result<()> {
             println!(
                 "{}",
                 brokerrouter::mcp_catalog::review_tools(&pool, tenant, server).await?
+            );
+        }
+        Command::McpSkillsList { tenant, server } => {
+            brokerrouter::check_schema(&pool).await?;
+            println!(
+                "{}",
+                brokerrouter::mcp_catalog::review_skills(&pool, tenant, server).await?
             );
         }
         Command::McpToolGrantSet { file } => {

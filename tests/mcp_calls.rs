@@ -130,6 +130,9 @@ async fn fixture(pool: &PgPool, label: &str, close_on_call: bool) -> Fixture {
             tools: vec![descriptor.clone()],
             tools_ttl_ms: Some(300_000),
             tools_cache_scope: Some(CacheScope::Private),
+            skills: vec![],
+            skills_ttl_ms: None,
+            skills_cache_scope: None,
             authorization_context_fingerprint: Some("a".repeat(64)),
         },
     )

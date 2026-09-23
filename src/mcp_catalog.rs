@@ -6,13 +6,15 @@
 use crate::{
     cipher::ResultCipher,
     error::{Error, Result},
-    governance, store,
+    governance,
+    mcp::{SKILLS_EXTENSION, SkillEntry},
+    store,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, QueryBuilder, Transaction};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use url::Url;
 use uuid::Uuid;
 
@@ -22,9 +24,13 @@ const MAX_SERVER_INFO_BYTES: usize = 16 * 1024;
 const MAX_TOOL_DESCRIPTOR_BYTES: usize = 512 * 1024;
 const MAX_TOOL_CATALOG_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOOLS: usize = 1024;
+const MAX_SKILLS: usize = 1024;
+const MAX_SKILL_CATALOG_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SKILL_ENTRY_BYTES: usize = 512 * 1024;
 const MAX_JSON_DEPTH: usize = 32;
 type ObservedTool = (String, String, Value, Vec<u8>);
 type ReviewToolRow = (String, String, Value, Vec<u8>, DateTime<Utc>);
+type ObservedSkill = (String, String, Value, String, bool);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -117,6 +123,11 @@ pub struct RecordDiscovery {
     pub tools: Vec<Value>,
     pub tools_ttl_ms: Option<i32>,
     pub tools_cache_scope: Option<CacheScope>,
+    /// Complete static Skills list. Never exposed to agents merely by discovery.
+    #[serde(default)]
+    pub skills: Vec<Value>,
+    pub skills_ttl_ms: Option<i32>,
+    pub skills_cache_scope: Option<CacheScope>,
     /// Lower-hex SHA-256 of the effective upstream auth context. The client
     /// derives it from the resolved credential/token; the credential itself is
     /// never persisted in this request or snapshot.
@@ -306,6 +317,65 @@ fn validate_tools(input: &RecordDiscovery) -> Result<Vec<ObservedTool>> {
     }
     tools.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(tools)
+}
+
+fn validate_skills(input: &RecordDiscovery) -> Result<Vec<ObservedSkill>> {
+    let advertised = input
+        .capabilities
+        .get("extensions")
+        .and_then(Value::as_object)
+        .is_some_and(|extensions| extensions.contains_key(SKILLS_EXTENSION));
+    if input.skills.len() > MAX_SKILLS
+        || advertised != input.skills_ttl_ms.is_some()
+        || advertised != input.skills_cache_scope.is_some()
+        || (!advertised && !input.skills.is_empty())
+        || (advertised
+            && !input
+                .capabilities
+                .get("resources")
+                .is_some_and(Value::is_object))
+        || input
+            .skills_ttl_ms
+            .is_some_and(|ttl| !(0..=86_400_000).contains(&ttl))
+    {
+        return Err(Error::Invalid("invalid MCP Skills catalog metadata"));
+    }
+    let mut total = 0usize;
+    let mut uris = HashSet::new();
+    let mut skills = Vec::with_capacity(input.skills.len());
+    for descriptor in &input.skills {
+        bounded_json(descriptor, MAX_SKILL_ENTRY_BYTES, true)?;
+        let bytes = serde_json::to_vec(descriptor)
+            .map_err(|_| Error::Invalid("invalid MCP Skill entry"))?;
+        total = total
+            .checked_add(bytes.len())
+            .ok_or(Error::Invalid("MCP Skills catalog is too large"))?;
+        if total > MAX_SKILL_CATALOG_BYTES {
+            return Err(Error::Invalid("MCP Skills catalog is too large"));
+        }
+        let entry: SkillEntry = serde_json::from_value(descriptor.clone())
+            .map_err(|_| Error::Invalid("invalid MCP Skill entry"))?;
+        let validated = entry
+            .validate_static(input.server_id)
+            .map_err(|_| Error::Invalid("invalid or unsupported MCP Skill manifest"))?;
+        let uri = validated.identity().uri.clone();
+        if !uris.insert(uri.clone()) {
+            return Err(Error::Invalid("duplicate MCP Skill URI"));
+        }
+        let name = descriptor["frontmatter"]["name"]
+            .as_str()
+            .expect("validated Skill name")
+            .to_owned();
+        skills.push((
+            uri,
+            name,
+            descriptor.clone(),
+            validated.approval_fingerprint().to_owned(),
+            validated.requests_tool_grant(),
+        ));
+    }
+    skills.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(skills)
 }
 
 /// Internal connector view. The credential reference is decrypted only by a
@@ -799,10 +869,21 @@ pub async fn record_discovery(pool: &PgPool, input: RecordDiscovery) -> Result<V
         .capabilities
         .get("tools")
         .is_some_and(|value| !value.is_object())
+        || input
+            .capabilities
+            .get("extensions")
+            .is_some_and(|value| !value.is_object())
+        || input
+            .capabilities
+            .get("extensions")
+            .and_then(Value::as_object)
+            .and_then(|extensions| extensions.get(SKILLS_EXTENSION))
+            .is_some_and(|value| !value.is_object())
     {
         return Err(Error::Invalid("invalid MCP tools capability"));
     }
     let tools = validate_tools(&input)?;
+    let skills = validate_skills(&input)?;
     if let Some(info) = &input.server_info {
         bounded_json(info, MAX_SERVER_INFO_BYTES, true)?;
     }
@@ -826,6 +907,9 @@ pub async fn record_discovery(pool: &PgPool, input: RecordDiscovery) -> Result<V
     )?;
     let tool_catalog_hash = governance::digest(&Value::Array(
         tools.iter().map(|tool| tool.2.clone()).collect(),
+    ))?;
+    let skill_catalog_hash = governance::digest(&Value::Array(
+        skills.iter().map(|skill| skill.2.clone()).collect(),
     ))?;
     let mut tx = begin(pool, input.tenant_id, input.operation_id).await?;
     if let Some(response) = previous(&mut tx, input.tenant_id, input.operation_id, &hash).await? {
@@ -865,8 +949,8 @@ pub async fn record_discovery(pool: &PgPool, input: RecordDiscovery) -> Result<V
         None
     };
     let id = Uuid::new_v4();
-    let snapshot_expires_at:DateTime<Utc>=sqlx::query_scalar("INSERT INTO mcp_discovery_snapshots(tenant_id,id,server_id,server_config_revision,protocol_version,result_type,supported_versions,capabilities,server_info,instructions,capability_hash,ttl_ms,cache_scope,authorization_context_hash,expires_at) VALUES($1,$2,$3,$4,$5,'complete',$6,$7,$8,$9,$10,$11,$12,$13,clock_timestamp()+($11::bigint*interval '1 millisecond')) RETURNING expires_at")
-        .bind(input.tenant_id).bind(id).bind(input.server_id).bind(revision).bind(PROTOCOL_VERSION).bind(json!(input.supported_versions)).bind(&input.capabilities).bind(&input.server_info).bind(&input.instructions).bind(&capability_hash).bind(input.ttl_ms).bind(input.cache_scope.name()).bind(auth_context).fetch_one(&mut *tx).await?;
+    let snapshot_expires_at:DateTime<Utc>=sqlx::query_scalar("INSERT INTO mcp_discovery_snapshots(tenant_id,id,server_id,server_config_revision,protocol_version,result_type,supported_versions,capabilities,server_info,instructions,capability_hash,ttl_ms,cache_scope,authorization_context_hash,skills_ttl_ms,skills_cache_scope,expires_at) VALUES($1,$2,$3,$4,$5,'complete',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,clock_timestamp()+($11::bigint*interval '1 millisecond')) RETURNING expires_at")
+        .bind(input.tenant_id).bind(id).bind(input.server_id).bind(revision).bind(PROTOCOL_VERSION).bind(json!(input.supported_versions)).bind(&input.capabilities).bind(&input.server_info).bind(&input.instructions).bind(&capability_hash).bind(input.ttl_ms).bind(input.cache_scope.name()).bind(auth_context).bind(input.skills_ttl_ms).bind(input.skills_cache_scope.map(CacheScope::name)).fetch_one(&mut *tx).await?;
     if !tools.is_empty() {
         let tools_ttl_ms = input.tools_ttl_ms.expect("validated tools TTL");
         let tools_expires_at: DateTime<Utc> = sqlx::query_scalar(
@@ -900,9 +984,43 @@ pub async fn record_discovery(pool: &PgPool, input: RecordDiscovery) -> Result<V
         });
         query.build().execute(&mut *tx).await?;
     }
-    let response = json!({"operation_id":input.operation_id,"snapshot_id":id,"server_id":input.server_id,"server_revision":revision.to_string(),"protocol_version":PROTOCOL_VERSION,"capability_hash":governance::hex(&capability_hash),"tool_catalog_hash":governance::hex(&tool_catalog_hash),"tool_count":tools.len(),"ttl_ms":input.ttl_ms,"cache_scope":input.cache_scope.name()});
+    if !skills.is_empty() {
+        let skill_ttl_ms = input.skills_ttl_ms.expect("validated Skills TTL");
+        let skills_expires_at: DateTime<Utc> = sqlx::query_scalar(
+            "SELECT LEAST($1::timestamptz,clock_timestamp()+($2::bigint*interval '1 millisecond'))",
+        )
+        .bind(snapshot_expires_at)
+        .bind(skill_ttl_ms)
+        .fetch_one(&mut *tx)
+        .await?;
+        let effective_scope = if matches!(input.cache_scope, CacheScope::Private)
+            || matches!(input.skills_cache_scope, Some(CacheScope::Private))
+        {
+            "private"
+        } else {
+            "public"
+        };
+        let mut query = QueryBuilder::<Postgres>::new(
+            "INSERT INTO mcp_discovered_skills(tenant_id,discovery_snapshot_id,server_id,ordinal,uri,name,entry,approval_fingerprint,requests_tool_grant,cache_scope,expires_at) ",
+        );
+        query.push_values(skills.iter().enumerate(), |mut row, (ordinal, skill)| {
+            row.push_bind(input.tenant_id)
+                .push_bind(id)
+                .push_bind(input.server_id)
+                .push_bind(i32::try_from(ordinal).expect("bounded Skill ordinal"))
+                .push_bind(&skill.0)
+                .push_bind(&skill.1)
+                .push_bind(&skill.2)
+                .push_bind(&skill.3)
+                .push_bind(skill.4)
+                .push_bind(effective_scope)
+                .push_bind(skills_expires_at);
+        });
+        query.build().execute(&mut *tx).await?;
+    }
+    let response = json!({"operation_id":input.operation_id,"snapshot_id":id,"server_id":input.server_id,"server_revision":revision.to_string(),"protocol_version":PROTOCOL_VERSION,"capability_hash":governance::hex(&capability_hash),"tool_catalog_hash":governance::hex(&tool_catalog_hash),"tool_count":tools.len(),"skill_catalog_hash":governance::hex(&skill_catalog_hash),"skill_count":skills.len(),"ttl_ms":input.ttl_ms,"cache_scope":input.cache_scope.name()});
     sqlx::query("INSERT INTO audit_events(tenant_id,action,object_id,details) VALUES($1,'mcp.discovery_recorded',$2,$3)")
-        .bind(input.tenant_id).bind(input.server_id.to_string()).bind(json!({"actor":input.actor,"operation_id":input.operation_id,"snapshot_id":id,"server_revision":revision.to_string(),"protocol_version":PROTOCOL_VERSION,"capability_hash":governance::hex(&capability_hash),"tool_catalog_hash":governance::hex(&tool_catalog_hash),"tool_count":tools.len(),"ttl_ms":input.ttl_ms,"cache_scope":input.cache_scope.name()})).execute(&mut *tx).await?;
+        .bind(input.tenant_id).bind(input.server_id.to_string()).bind(json!({"actor":input.actor,"operation_id":input.operation_id,"snapshot_id":id,"server_revision":revision.to_string(),"protocol_version":PROTOCOL_VERSION,"capability_hash":governance::hex(&capability_hash),"tool_catalog_hash":governance::hex(&tool_catalog_hash),"tool_count":tools.len(),"skill_catalog_hash":governance::hex(&skill_catalog_hash),"skill_count":skills.len(),"ttl_ms":input.ttl_ms,"cache_scope":input.cache_scope.name()})).execute(&mut *tx).await?;
     receipt(
         &mut tx,
         input.tenant_id,
@@ -954,6 +1072,53 @@ pub async fn review_tools(pool: &PgPool, tenant: Uuid, server: Uuid) -> Result<V
     }
     Ok(
         json!({"server_id":server,"tools":rows.into_iter().map(|(upstream_name,downstream_name,descriptor,hash,expires_at)|json!({"upstream_name":upstream_name,"downstream_name":downstream_name,"descriptor":descriptor,"descriptor_sha256":governance::hex(&hash),"expires_at":expires_at})).collect::<Vec<_>>() }),
+    )
+}
+
+/// Operator-only review of fresh Skill metadata. This never grants a Skill to
+/// a virtual key or reads any resource bytes.
+pub async fn review_skills(pool: &PgPool, tenant: Uuid, server: Uuid) -> Result<Value> {
+    type Row = (
+        Uuid,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<Value>,
+        Option<String>,
+        Option<bool>,
+        Option<DateTime<Utc>>,
+    );
+    let rows: Vec<Row> = sqlx::query_as("SELECT d.id,d.server_config_revision,k.uri,k.name,k.entry,k.approval_fingerprint,k.requests_tool_grant,k.expires_at FROM mcp_servers s JOIN tenants x ON x.id=s.tenant_id AND x.active JOIN LATERAL(SELECT d.id,d.server_config_revision,d.skills_ttl_ms,d.observed_at,d.expires_at FROM mcp_discovery_snapshots d WHERE d.tenant_id=s.tenant_id AND d.server_id=s.id AND d.server_config_revision=s.config_revision ORDER BY d.observed_at DESC,d.id DESC LIMIT 1)d ON true LEFT JOIN mcp_discovered_skills k ON k.tenant_id=s.tenant_id AND k.discovery_snapshot_id=d.id AND k.server_id=s.id AND k.expires_at>clock_timestamp() WHERE s.tenant_id=$1 AND s.id=$2 AND s.active AND d.skills_ttl_ms IS NOT NULL AND d.expires_at>clock_timestamp() AND d.observed_at+(d.skills_ttl_ms::bigint*interval '1 millisecond')>clock_timestamp() ORDER BY k.uri")
+        .bind(tenant).bind(server).fetch_all(pool).await?;
+    let Some((snapshot_id, revision, ..)) = rows.first() else {
+        return Err(Error::NotFound);
+    };
+    let (snapshot_id, revision) = (*snapshot_id, *revision);
+    let mut names = HashMap::<String, usize>::new();
+    for (_, _, _, name, _, _, _, _) in &rows {
+        if let Some(name) = name {
+            *names.entry(name.clone()).or_default() += 1;
+        }
+    }
+    let skills = rows
+        .into_iter()
+        .filter_map(
+            |(_, _, uri, name, entry, fingerprint, requests_tool_grant, expires_at)| {
+                Some(json!({
+                    "uri":uri?,
+                    "name":name.as_ref()?,
+                    "entry":entry?,
+                    "approval_fingerprint":fingerprint?,
+                    "requests_tool_grant":requests_tool_grant?,
+                    "expires_at":expires_at?,
+                    "name_collision":names.get(name.as_ref()?).copied().unwrap_or(0)>1,
+                "activation":"disabled_until_approval_and_read_path",
+                }))
+            },
+        )
+        .collect::<Vec<_>>();
+    Ok(
+        json!({"server_id":server,"snapshot_id":snapshot_id,"server_revision":revision.to_string(),"skills":skills}),
     )
 }
 
