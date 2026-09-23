@@ -1,6 +1,6 @@
 use axum::{body::Body, http::Request};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use brokerrouter::{mcp_catalog, mcp_oauth, mcp_server, store};
+use brokerrouter::{cipher::ResultCipher, mcp_catalog, mcp_oauth, mcp_server, store};
 use http_body_util::BodyExt;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use rsa::{
@@ -10,12 +10,25 @@ use rsa::{
 use serde::Serialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use std::sync::OnceLock;
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 use tower::ServiceExt;
 use uuid::Uuid;
 
 const OAUTH_ISSUER: &str = "https://auth.example";
 const OAUTH_RESOURCE: &str = "https://gateway.example/mcp";
+
+fn result_cipher() -> Arc<ResultCipher> {
+    Arc::new(
+        ResultCipher::new(
+            "fixture".into(),
+            HashMap::from([("fixture".into(), "31".repeat(32))]),
+        )
+        .unwrap(),
+    )
+}
 
 fn oauth_keys() -> &'static (EncodingKey, jsonwebtoken::jwk::JwkSet) {
     static KEYS: OnceLock<(EncodingKey, jsonwebtoken::jwk::JwkSet)> = OnceLock::new();
@@ -117,7 +130,7 @@ async fn downstream_mcp_is_stateless_authenticated_and_origin_bound(pool: PgPool
         vec!["https://console.example".into()],
     )
     .unwrap();
-    let app = mcp_server::router(pool, config, None).unwrap();
+    let app = mcp_server::router(pool, config, None, result_cipher()).unwrap();
 
     let denied = app
         .clone()
@@ -212,7 +225,7 @@ async fn oauth_metadata_jwt_scope_mapping_and_revocation_fail_closed(pool: PgPoo
         vec!["https://console.example".into()],
     )
     .unwrap();
-    let app = mcp_server::router(pool.clone(), config, Some(oauth)).unwrap();
+    let app = mcp_server::router(pool.clone(), config, Some(oauth), result_cipher()).unwrap();
 
     let metadata = app
         .clone()

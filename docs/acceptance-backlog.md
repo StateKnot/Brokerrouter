@@ -26,7 +26,7 @@
 | LIVE-20 | M5/M4/M6 | 浏览器→实际 IdP/MFA→BFF→media-review/approvals→私有产物→Runtime 下载/关轮整链路；独立可注册域名/DNS/TLS/无凭据静态发布链、受管浏览器及 codec/内存/人工感知、64 MiB 峰值/跨副本撤权/失联/签名解密轮换、GetObject-only 与最小 DB 角色、0018 升级/恢复/审计留存容量/人工键盘读屏 | 预生产双站点/IdP/MFA/受管终端、私有存储与固定 Runtime、明确 SLO/归档制度；先用合成视频和零费用任务，不先索取供应商密钥 | [隔离 MP4 审阅与审批](m5-isolated-media-review.md)已实现，本地合约不替代真实部署/质量认证；发布阻断，其他模态预览与原生 Runtime 仍需开发 |
 
 | LIVE-21 | M5/M6 | 逐节点治理真实 IdP→BFF→console 分权/读取中撤权、组织审计范围、0019 索引维护窗口/恢复、实际规模查询计划/容量/留存、迟到入账与供应商对账、人工读屏；Hermes 强制入口/持久暂停点/版本与 claim 丢响应/副作用后崩溃演练 | 生产等价数据和 SLO、实际部署角色/IdP、Hermes 固定可重建代码/镜像、独立零费用工具环境；Claw 需明确项目与版本 | [逐节点治理](m5-node-call-governance.md)已实现；[Hermes M6.1a/b](m6-hermes-native-integration.md)已完成固定三文件 overlay、启动完整性校验、受信 turn 绑定、原生审批通知、加密检查点及 claim/崩溃防重派发本地合约。实际部署、输出/产物隔离发布、规模与进程终止演练仍待完成，不能关闭此闸门 |
-| LIVE-22 | M6 | MCP 2026-07-28 client/server、Streamable HTTP 标准头/Origin、OAuth issuer/resource/audience、MRTR、Skills 来源/完整性/缓存/审批，以及 Hermes/OpenClaw 原生整链路 | 固定 `rmcp 3.4.0`、官方 conformance 版本、预生产 HTTPS/OAuth、至少两个受控 MCP server、零费用工具/Skill fixture、生产等价多副本和 SLO | 安全内核、连接目录、HTTP/stdio 上游发现、下游无状态 `/mcp`、工具摘要授权与 OAuth JWT 资源认证已实现；治理后真实 `tools/call`、持久 Skill 审批、MRTR、官方 conformance 和预生产 HTTPS/OAuth 认证仍未完成，发布阻断 |
+| LIVE-22 | M6 | MCP 2026-07-28 client/server、Streamable HTTP 标准头/Origin、OAuth issuer/resource/audience、MRTR、Skills 来源/完整性/缓存/审批，以及 Hermes/OpenClaw 原生整链路 | 固定 `rmcp 3.4.0`、官方 conformance 版本、预生产 HTTPS/OAuth、至少两个受控 MCP server、零费用工具/Skill fixture、生产等价多副本和 SLO | 安全内核、连接目录、HTTP/stdio 上游发现、下游无状态 `/mcp`、工具摘要授权与 OAuth JWT 资源认证、受治理单次 `tools/call` 已实现；持久 Skill 审批、MRTR/task 恢复、官方 conformance、真实 HTTPS/OAuth 与 Runtime 联调仍未完成，发布阻断 |
 
 记录格式：测试 ID、代码提交、供应商/Runtime/SDK 版本、配置版本、输入样本引用（不提交敏感正文）、脱敏证据、人民币实际费用、通过/失败、问题单。真实密钥不得进入本文或仓库。
 

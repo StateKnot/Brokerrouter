@@ -652,9 +652,16 @@ async fn deployment_roles_separate_configuration_discovery_and_other_authority(p
         .unwrap(),
         1
     );
+    // Governed tools/call must inspect approval state, but the MCP edge has no
+    // authority to make or change a human decision.
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM approvals WHERE tenant_id=$1")
+        .bind(tenant_id)
+        .fetch_one(&server_role)
+        .await
+        .unwrap();
     for sql in [
         "SELECT credential_ref_ciphertext FROM mcp_servers",
-        "SELECT * FROM approvals",
+        "UPDATE approvals SET state='approved'",
         "UPDATE mcp_key_tool_grants SET active=false",
         "UPDATE mcp_oauth_principals SET active=false",
         "SET ROLE brokerrouter_mcp_client",

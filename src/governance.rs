@@ -703,6 +703,24 @@ pub async fn receipt(
     id: Uuid,
     receipt: Receipt,
 ) -> Result<Value> {
+    let mut tx = pool.begin().await?;
+    tenant_lock(&mut tx, who.tenant_id).await?;
+    let value = receipt_in_tx(&mut tx, cipher, who, id, &receipt).await?;
+    tx.commit().await?;
+    Ok(value)
+}
+
+/// Persist an execution receipt inside a caller-owned transaction. This lets
+/// connectors commit the upstream response and governance receipt atomically:
+/// a process crash can never leave a known response without its durable
+/// execution evidence (or vice versa).
+pub(crate) async fn receipt_in_tx(
+    tx: &mut Tx<'_>,
+    cipher: &ResultCipher,
+    who: &Identity,
+    id: Uuid,
+    receipt: &Receipt,
+) -> Result<Value> {
     if !matches!(receipt.outcome.as_str(), "completed" | "execution_unknown")
         || !valid_text(&receipt.evidence_ref, 1000)
     {
@@ -710,19 +728,17 @@ pub async fn receipt(
     }
     let value = json!({"outcome":receipt.outcome,"evidence_ref":receipt.evidence_ref});
     let hash = digest(&value)?;
-    let mut tx = pool.begin().await?;
-    tenant_lock(&mut tx, who.tenant_id).await?;
     let op: Operation = sqlx::query_as(
         "SELECT * FROM governance_operations WHERE tenant_id=$1 AND key_id=$2 AND id=$3 FOR UPDATE",
     )
     .bind(who.tenant_id)
     .bind(who.key_id)
     .bind(id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?
     .ok_or(Error::NotFound)?;
     // A late receipt may record an already-started side effect after turn closure; it never starts a new action.
-    let turn = turn_locked(&mut tx, who, op.turn_id, false).await?;
+    let turn = turn_locked(tx, who, op.turn_id, false).await?;
     if op.claim_hash.as_ref() != Some(&store::hash(receipt.token.as_bytes())) {
         return Err(Error::NotFound);
     }
@@ -730,7 +746,6 @@ pub async fn receipt(
         if existing != hash {
             return Err(Error::Conflict);
         }
-        tx.commit().await?;
         return Ok(value);
     }
     if !matches!(op.state.as_str(), "executing" | "execution_unknown") {
@@ -741,15 +756,14 @@ pub async fn receipt(
         id,
         &serde_json::to_vec(&value).map_err(|_| Error::Invalid("invalid receipt"))?,
     )?;
-    sqlx::query("UPDATE governance_operations SET state=$3,receipt_hash=$4,receipt_ciphertext=$5,payload_ciphertext=NULL WHERE tenant_id=$1 AND id=$2").bind(who.tenant_id).bind(id).bind(receipt.outcome).bind(hash).bind(encrypted).execute(&mut *tx).await?;
+    sqlx::query("UPDATE governance_operations SET state=$3,receipt_hash=$4,receipt_ciphertext=$5,payload_ciphertext=NULL WHERE tenant_id=$1 AND id=$2").bind(who.tenant_id).bind(id).bind(&receipt.outcome).bind(hash).bind(encrypted).execute(&mut **tx).await?;
     event(
-        &mut tx,
+        tx,
         &turn,
         "operation.receipted",
         json!({"operation_id":id,"outcome":value["outcome"]}),
     )
     .await?;
-    tx.commit().await?;
     Ok(value)
 }
 pub async fn maintain(pool: &PgPool) -> Result<()> {

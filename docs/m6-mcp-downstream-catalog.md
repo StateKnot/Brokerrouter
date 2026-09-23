@@ -2,6 +2,8 @@
 
 本包开放第一个生产可部署的下游 MCP 入口，但只提供经过虚拟 Key 显式授权的工具目录。工具执行继续失败关闭；在 M6.2d 将调用绑定到持久 turn、审批事实、执行租约和 Runtime 恢复凭据以前，不能把本包描述为完整 MCP 工具代理。
 
+本页记录 M6.2b2b2a 交付时的边界；后续 [M6.2b2c](m6-mcp-governed-tool-calls.md) 已加入持久治理的单次 `tools/call`。本页“执行失败关闭”描述不再代表当前代码状态，MRTR/Runtime 原生恢复仍未完成。
+
 ## 协议与 HTTP 边界
 
 - `serve-mcp` 只暴露 `POST /mcp`，使用官方 `rmcp 3.4.0` 的无状态 Streamable HTTP server 和 `NeverSessionManager`。
