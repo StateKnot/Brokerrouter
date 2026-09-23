@@ -14,6 +14,7 @@ use crate::{
     mcp::{SKILLS_EXTENSION, SkillEntry},
     mcp_catalog::{self, ConnectorServer, CredentialReference, RecordDiscovery, RecordSkillGet},
 };
+use base64::{Engine, prelude::BASE64_STANDARD};
 use futures_util::{StreamExt, stream::BoxStream};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use reqwest::Client;
@@ -23,7 +24,8 @@ use rmcp::{
         CacheScope as RmcpCacheScope, CallToolRequestParams, CallToolResponse, CallToolResult,
         ClientCapabilities, ClientConfig, ClientRequest, CreateTaskResult, CustomRequest,
         DiscoverResult, Implementation, InputRequiredResult, JsonObject, PaginatedRequestParams,
-        ProtocolVersion, RequestMetaObject, ServerJsonRpcMessage, ServerResult, Tool,
+        ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, RequestMetaObject,
+        ResourceContents, ServerJsonRpcMessage, ServerResult, Tool,
     },
     service::{Peer, RoleClient},
     transport::{
@@ -61,6 +63,7 @@ const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(45);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_DISCOVERY_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_TOOL_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SKILL_READ_RESPONSE_BYTES: usize = 24 * 1024 * 1024;
 const MAX_OAUTH_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
 const MAX_OAUTH_REDIRECTS: usize = 5;
@@ -85,6 +88,7 @@ struct WireDiscovery {
     skills_ttl_ms: Option<u64>,
     skills_cache_scope: Option<RmcpCacheScope>,
     direct_skill: Option<WireSkillGet>,
+    direct_resource: Option<SkillReadWireResult>,
 }
 
 #[derive(Debug)]
@@ -92,6 +96,22 @@ struct WireSkillGet {
     entry: SkillEntry,
     ttl_ms: u64,
     cache_scope: RmcpCacheScope,
+}
+
+#[derive(Debug)]
+pub(crate) struct SkillReadWireResult {
+    pub bytes: Vec<u8>,
+    pub mime_type: Option<String>,
+    pub kind: &'static str,
+    pub cache_scope: RmcpCacheScope,
+    pub ttl_ms: u64,
+}
+
+pub(crate) struct SkillReadObservation {
+    pub server_revision: i64,
+    pub resource: SkillReadWireResult,
+    pub authorization_fingerprint: String,
+    pub discovery_cache_scope: RmcpCacheScope,
 }
 
 #[derive(Deserialize)]
@@ -1228,6 +1248,88 @@ async fn get_skill(
     })
 }
 
+async fn read_skill_resource(
+    peer: &Peer<RoleClient>,
+    discovery: &DiscoverResult,
+    uri: &str,
+    timeout: Duration,
+) -> Result<SkillReadWireResult, DiscoveryError> {
+    if discovery.capabilities.resources.is_none()
+        || !discovery
+            .capabilities
+            .extensions
+            .as_ref()
+            .is_some_and(|extensions| extensions.contains_key(SKILLS_EXTENSION))
+    {
+        return Err(DiscoveryError::Protocol);
+    }
+    let config = client_config();
+    let params =
+        ReadResourceRequestParams::new(uri).with_meta(RequestMetaObject::with_client_context(
+            ProtocolVersion::V_2026_07_28,
+            config.client_info,
+            config.capabilities,
+        ));
+    let response = tokio::time::timeout(timeout, peer.read_resource_once(params))
+        .await
+        .map_err(|_| DiscoveryError::Protocol)?
+        .map_err(|_| DiscoveryError::Protocol)?;
+    let ReadResourceResponse::Complete(result) = response else {
+        // InputRequired must be surfaced in a later MRTR milestone, never
+        // silently answered by the connector or treated as approved content.
+        return Err(DiscoveryError::Protocol);
+    };
+    if result
+        .result_type
+        .as_ref()
+        .is_none_or(|kind| kind.as_str() != "complete")
+        || !matches!(result.ttl_ms, Some(ttl) if ttl <= 86_400_000)
+        || result.cache_scope.is_none()
+        || result.contents.len() != 1
+    {
+        return Err(DiscoveryError::Protocol);
+    }
+    let (bytes, mime_type, kind) = match result.contents.into_iter().next().unwrap() {
+        ResourceContents::TextResourceContents {
+            uri: returned_uri,
+            mime_type,
+            text,
+            ..
+        } if returned_uri == uri => (text.into_bytes(), mime_type, "text"),
+        ResourceContents::BlobResourceContents {
+            uri: returned_uri,
+            mime_type,
+            blob,
+            ..
+        } if returned_uri == uri => {
+            // Base64 itself can be 4/3 larger than the protocol byte
+            // limit. Both the HTTP envelope and decoded bytes are capped.
+            let bytes = BASE64_STANDARD
+                .decode(blob)
+                .map_err(|_| DiscoveryError::Protocol)?;
+            (bytes, mime_type, "blob")
+        }
+        _ => return Err(DiscoveryError::Protocol),
+    };
+    if bytes.len() > crate::mcp::MAX_SKILL_BYTES as usize {
+        return Err(DiscoveryError::Protocol);
+    }
+    if mime_type.as_ref().is_some_and(|value| {
+        value.is_empty()
+            || value.len() > 255
+            || !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+    }) {
+        return Err(DiscoveryError::Protocol);
+    }
+    Ok(SkillReadWireResult {
+        bytes,
+        mime_type,
+        kind,
+        cache_scope: result.cache_scope.unwrap(),
+        ttl_ms: result.ttl_ms.unwrap(),
+    })
+}
+
 #[cfg(test)]
 async fn discover_wire<C>(
     client: C,
@@ -1237,7 +1339,7 @@ async fn discover_wire<C>(
 where
     C: StreamableHttpClient + Sync,
 {
-    observe_wire(client, endpoint, auth_header, None).await
+    observe_wire(client, endpoint, auth_header, None, None).await
 }
 
 async fn observe_wire<C>(
@@ -1245,6 +1347,7 @@ async fn observe_wire<C>(
     endpoint: &str,
     auth_header: Option<String>,
     requested_skill: Option<&str>,
+    requested_resource: Option<&str>,
 ) -> Result<WireDiscovery, DiscoveryError>
 where
     C: StreamableHttpClient + Sync,
@@ -1253,7 +1356,11 @@ where
         .max_concurrent_requests(1)
         .control_request_timeout(Duration::from_secs(3))
         .session_recovery_timeout(Duration::from_secs(3))
-        .max_sse_event_size(MAX_DISCOVERY_RESPONSE_BYTES)
+        .max_sse_event_size(if requested_resource.is_some() {
+            MAX_SKILL_READ_RESPONSE_BYTES
+        } else {
+            MAX_DISCOVERY_RESPONSE_BYTES
+        })
         .reinit_on_expired_session(false);
     transport_config.allow_stateless = true;
     transport_config.auth_header = auth_header;
@@ -1292,9 +1399,31 @@ where
         skills_ttl_ms,
         skills_cache_scope,
         direct_skill,
-    ) = if let Some(uri) = requested_skill {
+        direct_resource,
+    ) = if let Some(uri) = requested_resource {
+        let resource = read_skill_resource(running.peer(), &result, uri, DISCOVERY_TIMEOUT).await?;
+        (
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            Some(resource),
+        )
+    } else if let Some(uri) = requested_skill {
         let skill = get_skill(running.peer(), &result, uri, DISCOVERY_TIMEOUT).await?;
-        (Vec::new(), None, None, Vec::new(), None, None, Some(skill))
+        (
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            Some(skill),
+            None,
+        )
     } else {
         let (tools, tools_ttl_ms, tools_cache_scope) =
             discover_tools(running.peer(), &result, DISCOVERY_TIMEOUT).await?;
@@ -1308,6 +1437,7 @@ where
             skills_ttl_ms,
             skills_cache_scope,
             None,
+            None,
         )
     };
     let _ = running.close_with_timeout(SHUTDOWN_TIMEOUT).await;
@@ -1320,6 +1450,7 @@ where
         skills_ttl_ms,
         skills_cache_scope,
         direct_skill,
+        direct_resource,
     })
 }
 
@@ -1327,12 +1458,13 @@ where
 async fn discover_stdio_wire(
     profile: &StdioLauncherProfile,
 ) -> Result<(WireDiscovery, String), DiscoveryError> {
-    observe_stdio_wire(profile, None).await
+    observe_stdio_wire(profile, None, None).await
 }
 
 async fn observe_stdio_wire(
     profile: &StdioLauncherProfile,
     requested_skill: Option<&str>,
+    requested_resource: Option<&str>,
 ) -> Result<(WireDiscovery, String), DiscoveryError> {
     let environment = resolve_stdio_environment(profile)?;
     let mut command = tokio::process::Command::new(&profile.program);
@@ -1382,9 +1514,31 @@ async fn observe_stdio_wire(
         skills_ttl_ms,
         skills_cache_scope,
         direct_skill,
-    ) = if let Some(uri) = requested_skill {
+        direct_resource,
+    ) = if let Some(uri) = requested_resource {
+        let resource = read_skill_resource(running.peer(), &result, uri, timeout).await?;
+        (
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            Some(resource),
+        )
+    } else if let Some(uri) = requested_skill {
         let skill = get_skill(running.peer(), &result, uri, timeout).await?;
-        (Vec::new(), None, None, Vec::new(), None, None, Some(skill))
+        (
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            Some(skill),
+            None,
+        )
     } else {
         let (tools, tools_ttl_ms, tools_cache_scope) =
             discover_tools(running.peer(), &result, timeout).await?;
@@ -1397,6 +1551,7 @@ async fn observe_stdio_wire(
             skills,
             skills_ttl_ms,
             skills_cache_scope,
+            None,
             None,
         )
     };
@@ -1411,6 +1566,7 @@ async fn observe_stdio_wire(
             skills_ttl_ms,
             skills_cache_scope,
             direct_skill,
+            direct_resource,
         },
         environment.fingerprint,
     ))
@@ -1727,6 +1883,7 @@ fn discovery_record(
         skills_ttl_ms,
         skills_cache_scope,
         direct_skill: _,
+        direct_resource: _,
     } = observed;
     let ttl_ms = i32::try_from(result.ttl_ms).map_err(|_| DiscoveryError::Protocol)?;
     let server_info = result
@@ -1825,6 +1982,7 @@ pub async fn discover_and_record(
         input.tenant_id,
         input.server_id,
         None,
+        None,
     )
     .await?;
     let record = discovery_record(&input, &server, result, fingerprint)?;
@@ -1840,9 +1998,15 @@ async fn observe_server(
     tenant_id: Uuid,
     server_id: Uuid,
     requested_skill: Option<&str>,
+    requested_resource: Option<&str>,
 ) -> Result<(ConnectorServer, WireDiscovery, String), DiscoveryError> {
     let server = mcp_catalog::connector_server(pool, cipher, tenant_id, server_id).await?;
     if server.transport == "stdio" {
+        // The child-process transport does not yet enforce a per-message
+        // 24 MiB envelope. Do not allow an unbounded Skill resource frame.
+        if requested_resource.is_some() {
+            return Err(DiscoveryError::UnsupportedTransport);
+        }
         if server.auth_mode != "none"
             || server.credential_reference.is_some()
             || server.endpoint_url.is_some()
@@ -1856,7 +2020,8 @@ async fn observe_server(
                 .ok_or(DiscoveryError::UnsupportedTransport)?,
             None,
         )?;
-        let (result, fingerprint) = observe_stdio_wire(&profile, requested_skill).await?;
+        let (result, fingerprint) =
+            observe_stdio_wire(&profile, requested_skill, requested_resource).await?;
         return Ok((server, result, fingerprint));
     }
     if server.transport != "streamable_http" || server.stdio_profile.is_some() {
@@ -1878,14 +2043,18 @@ async fn observe_server(
     .map_err(|_| DiscoveryError::NetworkPolicy)?;
     let http = BoundedMcpHttpClient {
         inner: http,
-        max_response_bytes: MAX_DISCOVERY_RESPONSE_BYTES,
+        max_response_bytes: if requested_resource.is_some() {
+            MAX_SKILL_READ_RESPONSE_BYTES
+        } else {
+            MAX_DISCOVERY_RESPONSE_BYTES
+        },
     };
 
     let (result, fingerprint) = match server.auth_mode.as_str() {
         "none" if server.credential_reference.is_none() => {
             let fingerprint = authorization_fingerprint(&[b"none", &tls.trust_fingerprint]);
             (
-                observe_wire(http, endpoint, None, requested_skill).await?,
+                observe_wire(http, endpoint, None, requested_skill, requested_resource).await?,
                 fingerprint,
             )
         }
@@ -1898,7 +2067,14 @@ async fn observe_server(
             let fingerprint =
                 authorization_fingerprint(&[b"bearer", &tls.trust_fingerprint, token.as_bytes()]);
             (
-                observe_wire(http, endpoint, Some(token.to_string()), requested_skill).await?,
+                observe_wire(
+                    http,
+                    endpoint,
+                    Some(token.to_string()),
+                    requested_skill,
+                    requested_resource,
+                )
+                .await?,
                 fingerprint,
             )
         }
@@ -1947,6 +2123,8 @@ async fn observe_server(
                 return Err(DiscoveryError::OAuthBinding);
             }
             manager.set_metadata(resolution.metadata);
+            let scopes_bytes = serde_json::to_vec(&secret.scopes)
+                .map_err(|_| DiscoveryError::InvalidCredential)?;
             let credentials = ClientCredentialsConfig::ClientSecret {
                 client_id: secret.client_id.clone(),
                 client_secret: secret.client_secret.clone(),
@@ -1961,7 +2139,7 @@ async fn observe_server(
                 .exchange_client_credentials(&credentials)
                 .await
                 .map_err(|_| DiscoveryError::OAuth)?;
-            let access_token = manager
+            let _access_token = manager
                 .get_access_token()
                 .await
                 .map_err(|_| DiscoveryError::OAuth)?;
@@ -1972,12 +2150,19 @@ async fn observe_server(
                 audience.as_bytes(),
                 secret.client_id.as_bytes(),
                 secret.client_secret.as_bytes(),
-                access_token.as_bytes(),
+                &scopes_bytes,
                 &tls.trust_fingerprint,
             ]);
             let auth_client = AuthClient::new(http, manager);
             (
-                observe_wire(auth_client, endpoint, None, requested_skill).await?,
+                observe_wire(
+                    auth_client,
+                    endpoint,
+                    None,
+                    requested_skill,
+                    requested_resource,
+                )
+                .await?,
                 fingerprint,
             )
         }
@@ -2012,6 +2197,7 @@ pub async fn get_skill_and_record(
         input.tenant_id,
         input.server_id,
         Some(&input.uri),
+        None,
     )
     .await?;
     let skill = observed.direct_skill.ok_or(DiscoveryError::Protocol)?;
@@ -2060,6 +2246,45 @@ pub async fn get_skill_and_record(
     mcp_catalog::record_skill_get(pool, record)
         .await
         .map_err(DiscoveryError::Catalog)
+}
+
+/// The isolated worker invokes this only after checking human approval and
+/// membership of the exact retained manifest. No higher-level client can
+/// use the transport as a general-purpose resource reader.
+pub(crate) async fn read_skill_resource_from_server(
+    pool: &PgPool,
+    cipher: &ResultCipher,
+    resolver: &InjectedCredentialResolver,
+    tenant_id: Uuid,
+    server_id: Uuid,
+    uri: &str,
+) -> Result<SkillReadObservation, DiscoveryError> {
+    let (server, observed, fingerprint) = observe_server(
+        pool,
+        cipher,
+        resolver,
+        tenant_id,
+        server_id,
+        None,
+        Some(uri),
+    )
+    .await?;
+    let resource = observed.direct_resource.ok_or(DiscoveryError::Protocol)?;
+    if !matches!(
+        observed.result.cache_scope,
+        RmcpCacheScope::Public | RmcpCacheScope::Private
+    ) || !matches!(
+        resource.cache_scope,
+        RmcpCacheScope::Public | RmcpCacheScope::Private
+    ) {
+        return Err(DiscoveryError::Protocol);
+    }
+    Ok(SkillReadObservation {
+        server_revision: server.config_revision,
+        resource,
+        authorization_fingerprint: fingerprint,
+        discovery_cache_scope: observed.result.cache_scope,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -2148,6 +2373,13 @@ mod tests {
                 "ttlMs":12_000,
                 "cacheScope":"private"
             })
+        } else if method == "resources/read" {
+            json!({
+                "resultType":"complete",
+                "contents":[{"uri":request["params"]["uri"],"mimeType":"text/markdown","text":"---\nname: hidden\ndescription: Direct lookup only\n---\nVerified."}],
+                "ttlMs":12000,
+                "cacheScope":"private"
+            })
         } else {
             let mut capabilities = json!({"tools":{"listChanged":true}});
             if state.skills {
@@ -2193,6 +2425,52 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{address}/mcp"), fixture, server)
+    }
+
+    #[tokio::test]
+    async fn resource_wire_reads_only_requested_uri_with_protocol_metadata() {
+        let (endpoint, fixture, server) = fixture_endpoint_with_skills(false, true).await;
+        let uri = "skill://hidden/SKILL.md";
+        let client = BoundedMcpHttpClient {
+            inner: reqwest::Client::new(),
+            max_response_bytes: MAX_SKILL_READ_RESPONSE_BYTES,
+        };
+        let observed = observe_wire(
+            client,
+            &endpoint,
+            Some("fixture-token".into()),
+            None,
+            Some(uri),
+        )
+        .await
+        .unwrap();
+        let read = observed.direct_resource.unwrap();
+        assert_eq!(read.kind, "text");
+        assert_eq!(read.mime_type.as_deref(), Some("text/markdown"));
+        assert_eq!(
+            read.bytes,
+            b"---\nname: hidden\ndescription: Direct lookup only\n---\nVerified."
+        );
+        let requests = fixture.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r["method"] == "resources/read")
+                .count(),
+            1
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|r| r["method"] != "skills/list" && r["method"] != "skills/get")
+        );
+        let request = requests
+            .iter()
+            .find(|r| r["method"] == "resources/read")
+            .unwrap();
+        assert_eq!(request["params"]["uri"], uri);
+        assert!(request["params"].get("_meta").is_some());
+        server.abort();
     }
 
     #[test]
@@ -2442,9 +2720,15 @@ done"#,
             max_response_bytes: MAX_DISCOVERY_RESPONSE_BYTES,
         };
         let uri = "skill://hidden/SKILL.md";
-        let result = observe_wire(client, &endpoint, Some("fixture-token".into()), Some(uri))
-            .await
-            .unwrap();
+        let result = observe_wire(
+            client,
+            &endpoint,
+            Some("fixture-token".into()),
+            Some(uri),
+            None,
+        )
+        .await
+        .unwrap();
         server.abort();
         let skill = result.direct_skill.unwrap();
         assert_eq!(skill.entry.uri, uri);

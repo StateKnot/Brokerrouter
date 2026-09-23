@@ -171,6 +171,14 @@ impl ValidatedSkill {
         self.resources.keys().map(String::as_str)
     }
 
+    pub fn contains_resource(&self, uri: &str) -> bool {
+        self.resources.contains_key(uri)
+    }
+
+    pub fn resource_size(&self, uri: &str) -> Option<u64> {
+        self.resources.get(uri).map(|resource| resource.size)
+    }
+
     /// Verify bytes lazily at the point of use against the held entry.
     pub fn verify_resource(&self, uri: &str, bytes: &[u8]) -> Result<(), SkillError> {
         let resource = self

@@ -3,7 +3,7 @@ use crate::{
     cipher::ResultCipher,
     error::{Error, Result},
     gateway::Gateway,
-    governance, human, mcp_skill_approvals,
+    governance, human, mcp_skill_approvals, mcp_skill_resources,
 };
 use axum::{
     Json, Router,
@@ -31,7 +31,36 @@ pub fn runtime_routes(gateway: Gateway) -> Router {
         .route("/v1/governance/turns/{id}/close", post(runtime_close))
         .route("/v1/governance/skills/requests", post(skill_request))
         .route("/v1/governance/skills/requests/{id}", get(skill_status))
+        .route(
+            "/v1/governance/skills/requests/{id}/resources",
+            post(skill_resource_request),
+        )
+        .route(
+            "/v1/governance/skills/resources/{id}",
+            get(skill_resource_status),
+        )
         .with_state(gateway)
+}
+async fn skill_resource_request(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(body): Json<mcp_skill_resources::ReadRequest>,
+) -> Result<Json<Value>> {
+    let who = api::identity(&g.pool, &headers).await?;
+    Ok(Json(
+        mcp_skill_resources::request(&g.pool, &who, id, body).await?,
+    ))
+}
+async fn skill_resource_status(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>> {
+    let who = api::identity(&g.pool, &headers).await?;
+    Ok(Json(
+        mcp_skill_resources::status(&g.pool, &g.cipher, &who, id).await?,
+    ))
 }
 async fn skill_request(
     State(g): State<Gateway>,

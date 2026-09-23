@@ -346,8 +346,15 @@ GRANT SELECT ON mcp_skill_approval_reviews TO brokerrouter_approvals;
 GRANT INSERT ON mcp_skill_approval_reviews TO brokerrouter_approvals;
 GRANT UPDATE(state,decision_hash,decided_by,feedback_ciphertext,decided_at)
     ON mcp_skill_approval_requests TO brokerrouter_approvals;
-GRANT SELECT(tenant_id,id,active,config_revision) ON mcp_servers TO brokerrouter_runtime,brokerrouter_approvals;
+GRANT SELECT(tenant_id,id,active,config_revision,transport) ON mcp_servers TO brokerrouter_runtime,brokerrouter_approvals;
 GRANT SELECT ON mcp_skill_get_observations TO brokerrouter_runtime,brokerrouter_approvals;
+GRANT SELECT,INSERT ON mcp_skill_resource_reads TO brokerrouter_runtime;
+GRANT SELECT ON mcp_skill_resource_reads,mcp_skill_get_observations TO brokerrouter_mcp_worker;
+GRANT SELECT(tenant_id,id,turn_id,key_id,user_id,server_id,server_config_revision,uri,
+    approval_fingerprint,manifest_hash,authorization_context_hash,state,expires_at)
+    ON mcp_skill_approval_requests TO brokerrouter_mcp_worker;
+GRANT UPDATE(state,claim_id,lease_until,content_sha256,content_ciphertext,mime_type,content_kind,resource_valid_until,failure_code,completed_at)
+    ON mcp_skill_resource_reads TO brokerrouter_mcp_worker;
 GRANT SELECT,INSERT ON mcp_tool_calls TO brokerrouter_mcp_server;
 GRANT UPDATE(state,output_operation_id,completed_at) ON mcp_tool_calls TO brokerrouter_mcp_server;
 GRANT SELECT ON mcp_tool_calls TO brokerrouter_mcp_worker;
