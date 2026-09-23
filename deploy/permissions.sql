@@ -337,6 +337,17 @@ GRANT UPDATE(state,claim_hash,execution_deadline,receipt_hash,receipt_ciphertext
 GRANT UPDATE(state,reason_code,deadline,finished_at) ON guardrail_evaluations
     TO brokerrouter_mcp_server,brokerrouter_mcp_worker;
 GRANT UPDATE(approval_skipped_at) ON guardrail_observations TO brokerrouter_mcp_server,brokerrouter_mcp_worker;
+-- Runtime can request consent but cannot approve it; the reviewer cannot create requests.
+GRANT SELECT ON mcp_skill_approval_requests TO brokerrouter_runtime,brokerrouter_approvals;
+GRANT INSERT(tenant_id,id,turn_id,key_id,user_id,server_id,observation_id,
+    server_config_revision,uri,approval_fingerprint,manifest_hash,
+    authorization_context_hash,expires_at) ON mcp_skill_approval_requests TO brokerrouter_runtime;
+GRANT SELECT ON mcp_skill_approval_reviews TO brokerrouter_approvals;
+GRANT INSERT ON mcp_skill_approval_reviews TO brokerrouter_approvals;
+GRANT UPDATE(state,decision_hash,decided_by,feedback_ciphertext,decided_at)
+    ON mcp_skill_approval_requests TO brokerrouter_approvals;
+GRANT SELECT(tenant_id,id,active,config_revision) ON mcp_servers TO brokerrouter_runtime,brokerrouter_approvals;
+GRANT SELECT ON mcp_skill_get_observations TO brokerrouter_runtime,brokerrouter_approvals;
 GRANT SELECT,INSERT ON mcp_tool_calls TO brokerrouter_mcp_server;
 GRANT UPDATE(state,output_operation_id,completed_at) ON mcp_tool_calls TO brokerrouter_mcp_server;
 GRANT SELECT ON mcp_tool_calls TO brokerrouter_mcp_worker;

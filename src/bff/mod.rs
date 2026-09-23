@@ -422,7 +422,12 @@ impl Bff {
             )
         } else if matches!(
             path,
-            "/approvals/v1/query" | "/approvals/v1/review" | "/approvals/v1/decide"
+            "/approvals/v1/query"
+                | "/approvals/v1/review"
+                | "/approvals/v1/decide"
+                | "/approvals/v1/skills/query"
+                | "/approvals/v1/skills/review"
+                | "/approvals/v1/skills/decide"
         ) {
             let c = self.approvals.as_ref().ok_or(Error::Configuration)?;
             (

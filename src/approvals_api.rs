@@ -3,6 +3,7 @@ use crate::{
     approval_workbench as workbench,
     error::{Error, Result},
     governance_api::Control,
+    mcp_skill_approvals,
 };
 use axum::{
     Json, Router,
@@ -23,6 +24,9 @@ pub fn router(c: Control) -> Router {
         .route("/approvals/v1/query", post(handle))
         .route("/approvals/v1/review", post(handle))
         .route("/approvals/v1/decide", post(handle))
+        .route("/approvals/v1/skills/query", post(handle))
+        .route("/approvals/v1/skills/review", post(handle))
+        .route("/approvals/v1/skills/decide", post(handle))
         .fallback(|| async { Error::NotFound })
         .with_state(c)
         .layer(axum::extract::DefaultBodyLimit::max(16384))
@@ -85,6 +89,15 @@ async fn handle(
         }
         "/approvals/v1/decide" => {
             workbench::decide(&c.pool, &c.cipher, &who, decode(&body)?).await?
+        }
+        "/approvals/v1/skills/query" => {
+            mcp_skill_approvals::query(&c.pool, &who, decode(&body)?).await?
+        }
+        "/approvals/v1/skills/review" => {
+            mcp_skill_approvals::review(&c.pool, &who, decode(&body)?).await?
+        }
+        "/approvals/v1/skills/decide" => {
+            mcp_skill_approvals::decide(&c.pool, &c.cipher, &who, decode(&body)?).await?
         }
         _ => return Err(Error::NotFound),
     };
