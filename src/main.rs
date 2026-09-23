@@ -258,6 +258,10 @@ enum Command {
         #[arg(long)]
         actor: String,
     },
+    McpWorker {
+        #[arg(long, default_value_t = 2)]
+        concurrency: usize,
+    },
     McpToolsList {
         #[arg(long)]
         tenant: Uuid,
@@ -683,6 +687,43 @@ async fn main() -> anyhow::Result<()> {
                 .await?
             );
         }
+        Command::McpWorker { concurrency } => {
+            if !(1..=16).contains(&concurrency) {
+                anyhow::bail!("MCP worker concurrency must be 1..16");
+            }
+            brokerrouter::check_schema(&pool).await?;
+            let worker = brokerrouter::mcp_calls::Worker::new(
+                pool.clone(),
+                std::sync::Arc::new(brokerrouter::cipher::ResultCipher::from_env()?),
+                std::sync::Arc::new(brokerrouter::cipher::ResultCipher::from_mcp_env()?),
+                brokerrouter::mcp_client::InjectedCredentialResolver::from_env()?,
+            );
+            let stop = tokio_util::sync::CancellationToken::new();
+            let mut workers = tokio::task::JoinSet::new();
+            for _ in 0..concurrency {
+                let (worker, stop) = (worker.clone(), stop.clone());
+                workers.spawn(async move {
+                    while !stop.is_cancelled() {
+                        if let Err(error) = worker.tick().await {
+                            tracing::error!(error=%error,"MCP tool worker pass failed; durable state retained");
+                        }
+                        tokio::select! {
+                            _ = stop.cancelled() => break,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                        }
+                    }
+                });
+            }
+            let failed = tokio::select! {
+                _ = shutdown() => false,
+                _ = workers.join_next() => true,
+            };
+            stop.cancel();
+            while workers.join_next().await.is_some() {}
+            if failed {
+                anyhow::bail!("MCP worker exited unexpectedly");
+            }
+        }
         Command::McpToolsList { tenant, server } => {
             brokerrouter::check_schema(&pool).await?;
             println!(
@@ -710,11 +751,12 @@ async fn main() -> anyhow::Result<()> {
             brokerrouter::check_schema(&pool).await?;
             let config = brokerrouter::mcp_server::HttpConfig::from_env()?;
             let oauth = brokerrouter::mcp_oauth::Verifier::optional_from_env().await?;
+            let cipher = std::sync::Arc::new(brokerrouter::cipher::ResultCipher::from_env()?);
             let listener = tokio::net::TcpListener::bind(bind).await?;
-            tracing::info!(address=%bind,oauth=oauth.is_some(),"stateless authenticated MCP catalog edge listening; tool execution remains governance fail-closed");
+            tracing::info!(address=%bind,oauth=oauth.is_some(),"stateless governed MCP tool edge listening");
             axum::serve(
                 listener,
-                brokerrouter::mcp_server::router(pool.clone(), config, oauth)?,
+                brokerrouter::mcp_server::router(pool.clone(), config, oauth, cipher)?,
             )
             .with_graceful_shutdown(shutdown())
             .await?;

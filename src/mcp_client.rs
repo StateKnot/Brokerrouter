@@ -10,6 +10,7 @@ use crate::{
     cipher::ResultCipher,
     egress,
     error::Error as GatewayError,
+    governance,
     mcp_catalog::{self, ConnectorServer, CredentialReference, RecordDiscovery},
 };
 use futures_util::{StreamExt, stream::BoxStream};
@@ -18,9 +19,10 @@ use reqwest::Client;
 use rmcp::{
     ClientLifecycleMode, ClientServiceExt,
     model::{
-        CacheScope as RmcpCacheScope, ClientCapabilities, ClientConfig, DiscoverResult,
-        Implementation, PaginatedRequestParams, ProtocolVersion, RequestMetaObject,
-        ServerJsonRpcMessage, Tool,
+        CacheScope as RmcpCacheScope, CallToolRequestParams, CallToolResponse, CallToolResult,
+        ClientCapabilities, ClientConfig, CreateTaskResult, DiscoverResult, Implementation,
+        InputRequiredResult, JsonObject, PaginatedRequestParams, ProtocolVersion,
+        RequestMetaObject, ServerJsonRpcMessage, Tool,
     },
     service::{Peer, RoleClient},
     transport::{
@@ -54,8 +56,10 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(45);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_DISCOVERY_RESPONSE_BYTES: usize = 512 * 1024;
+const MAX_TOOL_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OAUTH_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
 const MAX_OAUTH_REDIRECTS: usize = 5;
@@ -98,6 +102,21 @@ pub enum DiscoveryError {
     StdioConfiguration,
     #[error("the MCP stdio child process could not be started")]
     StdioLaunch,
+}
+
+#[derive(Debug)]
+pub enum ToolCallWireResult {
+    Complete(CallToolResult),
+    InputRequired(InputRequiredResult),
+    Task(CreateTaskResult),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ToolCallError {
+    #[error("MCP tool call was not submitted")]
+    NotSubmitted,
+    #[error("MCP tool call outcome is unknown")]
+    ExecutionUnknown,
 }
 
 impl From<GatewayError> for DiscoveryError {
@@ -429,13 +448,19 @@ fn parse_stdio_registry(bytes: &[u8]) -> Result<StdioLauncherRegistry, Discovery
     Ok(registry)
 }
 
-fn load_stdio_profile(name: &str) -> Result<StdioLauncherProfile, DiscoveryError> {
+fn load_stdio_profile(
+    name: &str,
+    registry_path: Option<&Path>,
+) -> Result<StdioLauncherProfile, DiscoveryError> {
     if !valid_launcher_name(name) {
         return Err(DiscoveryError::StdioConfiguration);
     }
-    let path = std::env::var_os("BROKERROUTER_MCP_STDIO_LAUNCHERS_FILE")
-        .map(PathBuf::from)
-        .ok_or(DiscoveryError::StdioConfiguration)?;
+    let path = match registry_path {
+        Some(path) => path.to_path_buf(),
+        None => std::env::var_os("BROKERROUTER_MCP_STDIO_LAUNCHERS_FILE")
+            .map(PathBuf::from)
+            .ok_or(DiscoveryError::StdioConfiguration)?,
+    };
     let path = canonical_regular_file(&path, false)?;
     let metadata = std::fs::metadata(&path).map_err(|_| DiscoveryError::StdioConfiguration)?;
     if metadata.len() == 0 || metadata.len() > MAX_STDIO_LAUNCHERS_BYTES as u64 {
@@ -696,8 +721,9 @@ enum DiscoveryBodyError {
 }
 
 #[derive(Clone, Debug)]
-struct BoundedDiscoveryHttpClient {
+struct BoundedMcpHttpClient {
     inner: Client,
+    max_response_bytes: usize,
 }
 
 fn session_id(headers: &HeaderMap) -> Result<Option<String>, StreamableHttpError<reqwest::Error>> {
@@ -756,10 +782,11 @@ fn has_content_type(headers: &HeaderMap, expected: &str) -> bool {
 
 async fn bounded_json_body(
     response: reqwest::Response,
+    limit: usize,
 ) -> Result<Vec<u8>, StreamableHttpError<reqwest::Error>> {
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_DISCOVERY_RESPONSE_BYTES as u64)
+        .is_some_and(|length| length > limit as u64)
     {
         return Err(StreamableHttpError::UnexpectedServerResponse(
             Cow::Borrowed("MCP discovery response is too large"),
@@ -769,7 +796,7 @@ async fn bounded_json_body(
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(StreamableHttpError::Client)?;
-        if chunk.len() > MAX_DISCOVERY_RESPONSE_BYTES.saturating_sub(body.len()) {
+        if chunk.len() > limit.saturating_sub(body.len()) {
             return Err(StreamableHttpError::UnexpectedServerResponse(
                 Cow::Borrowed("MCP discovery response is too large"),
             ));
@@ -781,27 +808,23 @@ async fn bounded_json_body(
 
 fn bounded_sse_response(
     response: reqwest::Response,
+    limit: usize,
 ) -> BoxStream<'static, Result<sse_stream::Sse, SseError>> {
     let stream = response
         .bytes_stream()
-        .scan((0usize, false), |(observed, failed), item| {
+        .scan((0usize, false), move |(observed, failed), item| {
             futures_util::future::ready({
                 if *failed {
                     None
                 } else {
                     match item {
-                        Ok(chunk)
-                            if chunk.len()
-                                <= MAX_DISCOVERY_RESPONSE_BYTES.saturating_sub(*observed) =>
-                        {
+                        Ok(chunk) if chunk.len() <= limit.saturating_sub(*observed) => {
                             *observed += chunk.len();
                             Some(Ok(chunk))
                         }
                         Ok(_) => {
                             *failed = true;
-                            Some(Err(DiscoveryBodyError::TooLarge(
-                                MAX_DISCOVERY_RESPONSE_BYTES,
-                            )))
+                            Some(Err(DiscoveryBodyError::TooLarge(limit)))
                         }
                         Err(error) => {
                             *failed = true;
@@ -814,7 +837,7 @@ fn bounded_sse_response(
     sse_stream::SseStream::from_bytes_stream(stream).boxed()
 }
 
-impl StreamableHttpClient for BoundedDiscoveryHttpClient {
+impl StreamableHttpClient for BoundedMcpHttpClient {
     type Error = reqwest::Error;
 
     async fn post_message(
@@ -884,12 +907,12 @@ impl StreamableHttpClient for BoundedDiscoveryHttpClient {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
         if has_content_type(response.headers(), "application/json") {
-            let body = bounded_json_body(response).await?;
+            let body = bounded_json_body(response, self.max_response_bytes).await?;
             let message: ServerJsonRpcMessage = serde_json::from_slice(&body)?;
             Ok(StreamableHttpPostResponse::Json(message, response_session))
         } else if has_content_type(response.headers(), "text/event-stream") {
             Ok(StreamableHttpPostResponse::Sse(
-                bounded_sse_response(response),
+                bounded_sse_response(response, self.max_response_bytes),
                 response_session,
             ))
         } else {
@@ -1148,6 +1171,302 @@ async fn discover_stdio_wire(
     ))
 }
 
+fn verified_tool_descriptor(
+    tools: &[Tool],
+    name: &str,
+    expected_hash: &[u8],
+) -> Result<(), ToolCallError> {
+    let tool = tools
+        .iter()
+        .find(|tool| tool.name.as_ref() == name)
+        .ok_or(ToolCallError::NotSubmitted)?;
+    let descriptor = serde_json::to_value(tool).map_err(|_| ToolCallError::NotSubmitted)?;
+    let observed = governance::digest(&descriptor).map_err(|_| ToolCallError::NotSubmitted)?;
+    if observed != expected_hash {
+        return Err(ToolCallError::NotSubmitted);
+    }
+    Ok(())
+}
+
+fn wire_result(response: CallToolResponse) -> Result<ToolCallWireResult, ToolCallError> {
+    Ok(match response {
+        CallToolResponse::Complete(result) => ToolCallWireResult::Complete(result),
+        CallToolResponse::InputRequired(result) => ToolCallWireResult::InputRequired(result),
+        CallToolResponse::Task(result) => ToolCallWireResult::Task(result),
+        _ => return Err(ToolCallError::ExecutionUnknown),
+    })
+}
+
+async fn call_tool_wire<C>(
+    client: C,
+    endpoint: &str,
+    auth_header: Option<String>,
+    name: &str,
+    descriptor_hash: &[u8],
+    arguments: JsonObject,
+) -> Result<ToolCallWireResult, ToolCallError>
+where
+    C: StreamableHttpClient + Sync,
+{
+    let mut transport_config = StreamableHttpClientTransportConfig::with_uri(endpoint.to_owned())
+        .max_concurrent_requests(1)
+        .control_request_timeout(Duration::from_secs(3))
+        .session_recovery_timeout(Duration::from_secs(3))
+        .max_sse_event_size(MAX_TOOL_RESPONSE_BYTES)
+        .reinit_on_expired_session(false);
+    transport_config.allow_stateless = true;
+    transport_config.auth_header = auth_header;
+    let transport = StreamableHttpClientTransport::with_client(client, transport_config);
+    let config = client_config();
+    let mut running = tokio::time::timeout(
+        DISCOVERY_TIMEOUT,
+        config.clone().serve_with_lifecycle(
+            transport,
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            },
+        ),
+    )
+    .await
+    .map_err(|_| ToolCallError::NotSubmitted)?
+    .map_err(|_| ToolCallError::NotSubmitted)?;
+    let meta = RequestMetaObject::with_client_context(
+        ProtocolVersion::V_2026_07_28,
+        config.client_info.clone(),
+        config.capabilities.clone(),
+    );
+    let discovery = tokio::time::timeout(DISCOVERY_TIMEOUT, running.discover(meta))
+        .await
+        .map_err(|_| ToolCallError::NotSubmitted)?
+        .map_err(|_| ToolCallError::NotSubmitted)?;
+    let (tools, _, _) = discover_tools(running.peer(), &discovery, DISCOVERY_TIMEOUT)
+        .await
+        .map_err(|_| ToolCallError::NotSubmitted)?;
+    verified_tool_descriptor(&tools, name, descriptor_hash)?;
+
+    let mut params = CallToolRequestParams::new(name.to_owned()).with_arguments(arguments);
+    params.meta = Some(RequestMetaObject::with_client_context(
+        ProtocolVersion::V_2026_07_28,
+        config.client_info,
+        config.capabilities,
+    ));
+    let response = tokio::time::timeout(TOOL_CALL_TIMEOUT, running.call_tool_once(params))
+        .await
+        .map_err(|_| ToolCallError::ExecutionUnknown)?
+        .map_err(|_| ToolCallError::ExecutionUnknown)?;
+    let _ = running.close_with_timeout(SHUTDOWN_TIMEOUT).await;
+    wire_result(response)
+}
+
+async fn call_tool_stdio_wire(
+    profile: &StdioLauncherProfile,
+    name: &str,
+    descriptor_hash: &[u8],
+    arguments: JsonObject,
+) -> Result<ToolCallWireResult, ToolCallError> {
+    let environment =
+        resolve_stdio_environment(profile).map_err(|_| ToolCallError::NotSubmitted)?;
+    let mut command = tokio::process::Command::new(&profile.program);
+    command
+        .args(&profile.arguments)
+        .current_dir(&profile.working_directory)
+        .env_clear()
+        .kill_on_drop(true);
+    for (key, value) in &environment.values {
+        command.env(key, value.as_str());
+    }
+    let (transport, _) = TokioChildProcess::builder(command)
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| ToolCallError::NotSubmitted)?;
+    let timeout = Duration::from_millis(profile.timeout_ms).min(TOOL_CALL_TIMEOUT);
+    let config = client_config();
+    let mut running = tokio::time::timeout(
+        timeout,
+        config.clone().serve_with_lifecycle(
+            transport,
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            },
+        ),
+    )
+    .await
+    .map_err(|_| ToolCallError::NotSubmitted)?
+    .map_err(|_| ToolCallError::NotSubmitted)?;
+    let meta = RequestMetaObject::with_client_context(
+        ProtocolVersion::V_2026_07_28,
+        config.client_info.clone(),
+        config.capabilities.clone(),
+    );
+    let discovery = tokio::time::timeout(timeout, running.discover(meta))
+        .await
+        .map_err(|_| ToolCallError::NotSubmitted)?
+        .map_err(|_| ToolCallError::NotSubmitted)?;
+    let (tools, _, _) = discover_tools(running.peer(), &discovery, timeout)
+        .await
+        .map_err(|_| ToolCallError::NotSubmitted)?;
+    verified_tool_descriptor(&tools, name, descriptor_hash)?;
+    let mut params = CallToolRequestParams::new(name.to_owned()).with_arguments(arguments);
+    params.meta = Some(RequestMetaObject::with_client_context(
+        ProtocolVersion::V_2026_07_28,
+        config.client_info,
+        config.capabilities,
+    ));
+    let response = tokio::time::timeout(timeout, running.call_tool_once(params))
+        .await
+        .map_err(|_| ToolCallError::ExecutionUnknown)?
+        .map_err(|_| ToolCallError::ExecutionUnknown)?;
+    let _ = running.close_with_timeout(SHUTDOWN_TIMEOUT).await;
+    wire_result(response)
+}
+
+/// Execute one descriptor-pinned tool call. This deliberately uses the
+/// single-round API: MRTR and task results are returned to durable governance
+/// rather than answered, polled, or replayed by the connector.
+pub async fn execute_tool(
+    server: &ConnectorServer,
+    resolver: &InjectedCredentialResolver,
+    name: &str,
+    descriptor_hash: &[u8],
+    arguments: JsonObject,
+    stdio_registry_path: Option<&Path>,
+) -> Result<ToolCallWireResult, ToolCallError> {
+    if server.transport == "stdio" {
+        if server.auth_mode != "none"
+            || server.credential_reference.is_some()
+            || server.endpoint_url.is_some()
+        {
+            return Err(ToolCallError::NotSubmitted);
+        }
+        let profile = load_stdio_profile(
+            server
+                .stdio_profile
+                .as_deref()
+                .ok_or(ToolCallError::NotSubmitted)?,
+            stdio_registry_path,
+        )
+        .map_err(|_| ToolCallError::NotSubmitted)?;
+        return call_tool_stdio_wire(&profile, name, descriptor_hash, arguments).await;
+    }
+    if server.transport != "streamable_http" || server.stdio_profile.is_some() {
+        return Err(ToolCallError::NotSubmitted);
+    }
+    let endpoint = server
+        .endpoint_url
+        .as_deref()
+        .ok_or(ToolCallError::NotSubmitted)?;
+    let endpoint_url = Url::parse(endpoint).map_err(|_| ToolCallError::NotSubmitted)?;
+    let tls = McpTlsRoots::from_env().map_err(|_| ToolCallError::NotSubmitted)?;
+    let http = egress::pinned_client_with_roots(
+        &endpoint_url,
+        server.allow_private,
+        TOOL_CALL_TIMEOUT,
+        &tls.roots,
+    )
+    .await
+    .map_err(|_| ToolCallError::NotSubmitted)?;
+    let http = BoundedMcpHttpClient {
+        inner: http,
+        max_response_bytes: MAX_TOOL_RESPONSE_BYTES,
+    };
+    match server.auth_mode.as_str() {
+        "none" if server.credential_reference.is_none() => {
+            call_tool_wire(http, endpoint, None, name, descriptor_hash, arguments).await
+        }
+        "bearer" => {
+            let reference = server
+                .credential_reference
+                .as_ref()
+                .ok_or(ToolCallError::NotSubmitted)?;
+            let token = resolver
+                .resolve(reference)
+                .map_err(|_| ToolCallError::NotSubmitted)?;
+            call_tool_wire(
+                http,
+                endpoint,
+                Some(token.to_string()),
+                name,
+                descriptor_hash,
+                arguments,
+            )
+            .await
+        }
+        "oauth_client_credentials" => {
+            let reference = server
+                .credential_reference
+                .as_ref()
+                .ok_or(ToolCallError::NotSubmitted)?;
+            let raw = resolver
+                .resolve(reference)
+                .map_err(|_| ToolCallError::NotSubmitted)?;
+            let secret = parse_oauth_secret(&raw).map_err(|_| ToolCallError::NotSubmitted)?;
+            let issuer = server
+                .oauth_issuer
+                .as_deref()
+                .ok_or(ToolCallError::NotSubmitted)?;
+            let resource = server
+                .oauth_resource
+                .as_deref()
+                .ok_or(ToolCallError::NotSubmitted)?;
+            let audience = server
+                .oauth_audience
+                .as_deref()
+                .ok_or(ToolCallError::NotSubmitted)?;
+            if audience != resource || resource != endpoint {
+                return Err(ToolCallError::NotSubmitted);
+            }
+            let oauth_http = Arc::new(PinnedOAuthHttpClient {
+                allow_private: server.allow_private,
+                timeout: TOOL_CALL_TIMEOUT,
+                roots: tls.roots.clone(),
+            });
+            let mut manager =
+                AuthorizationManager::new_with_oauth_http_client(endpoint, oauth_http)
+                    .await
+                    .map_err(|_| ToolCallError::NotSubmitted)?;
+            let resolution = manager
+                .resolve_metadata()
+                .await
+                .map_err(|_| ToolCallError::NotSubmitted)?;
+            if !resolution.source.is_discovered()
+                || matches!(
+                    resolution.source,
+                    AuthorizationMetadataSource::LegacyEndpointFallback
+                )
+                || resolution.metadata.issuer.as_deref() != Some(issuer)
+            {
+                return Err(ToolCallError::NotSubmitted);
+            }
+            manager.set_metadata(resolution.metadata);
+            let credentials = ClientCredentialsConfig::ClientSecret {
+                client_id: secret.client_id,
+                client_secret: secret.client_secret,
+                scopes: secret.scopes,
+                resource: Some(resource.to_owned()),
+            };
+            manager
+                .validate_client_credentials_metadata(&credentials)
+                .and_then(|_| manager.configure_client_credentials(&credentials))
+                .map_err(|_| ToolCallError::NotSubmitted)?;
+            manager
+                .exchange_client_credentials(&credentials)
+                .await
+                .map_err(|_| ToolCallError::NotSubmitted)?;
+            let auth_client = AuthClient::new(http, manager);
+            call_tool_wire(
+                auth_client,
+                endpoint,
+                None,
+                name,
+                descriptor_hash,
+                arguments,
+            )
+            .await
+        }
+        _ => Err(ToolCallError::NotSubmitted),
+    }
+}
+
 fn discovery_record(
     input: &DiscoverServer,
     server: &ConnectorServer,
@@ -1239,6 +1558,7 @@ pub async fn discover_and_record(
                 .stdio_profile
                 .as_deref()
                 .ok_or(DiscoveryError::UnsupportedTransport)?,
+            None,
         )?;
         let (result, fingerprint) = discover_stdio_wire(&profile).await?;
         let record = discovery_record(&input, &server, result, fingerprint)?;
@@ -1263,7 +1583,10 @@ pub async fn discover_and_record(
     )
     .await
     .map_err(|_| DiscoveryError::NetworkPolicy)?;
-    let http = BoundedDiscoveryHttpClient { inner: http };
+    let http = BoundedMcpHttpClient {
+        inner: http,
+        max_response_bytes: MAX_DISCOVERY_RESPONSE_BYTES,
+    };
 
     let (result, fingerprint) = match server.auth_mode.as_str() {
         "none" if server.credential_reference.is_none() => {
@@ -1615,11 +1938,12 @@ done"#,
     #[tokio::test]
     async fn official_discover_lifecycle_sends_modern_metadata_and_standard_headers() {
         let (endpoint, fixture, server) = fixture_endpoint(false).await;
-        let client = BoundedDiscoveryHttpClient {
+        let client = BoundedMcpHttpClient {
             inner: Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap(),
+            max_response_bytes: MAX_DISCOVERY_RESPONSE_BYTES,
         };
         let result = discover_wire(client, &endpoint, Some("fixture-token".into()))
             .await
@@ -1665,8 +1989,9 @@ done"#,
     #[tokio::test]
     async fn discovery_rejects_oversized_json_before_deserialization() {
         let (endpoint, _, server) = fixture_endpoint(true).await;
-        let client = BoundedDiscoveryHttpClient {
+        let client = BoundedMcpHttpClient {
             inner: Client::new(),
+            max_response_bytes: MAX_DISCOVERY_RESPONSE_BYTES,
         };
         let result = discover_wire(client, &endpoint, Some("fixture-token".into())).await;
         server.abort();

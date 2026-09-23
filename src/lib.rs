@@ -20,6 +20,7 @@ pub mod governance_settings;
 pub mod human;
 mod judge;
 pub mod mcp;
+pub mod mcp_calls;
 pub mod mcp_catalog;
 pub mod mcp_client;
 pub mod mcp_oauth;

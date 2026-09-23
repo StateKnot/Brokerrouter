@@ -1,6 +1,6 @@
 # MCP 2026-07-28 与 Skills 接入契约
 
-状态：2026-09-20 已完成 M6.2a 安全契约、[M6.2b1 连接目录](m6-mcp-connection-catalog.md)、[M6.2b2a HTTP 上游发现](m6-mcp-http-discovery.md)、[M6.2b2b1 受管 stdio](m6-mcp-stdio-discovery.md)、[M6.2b2b2a 下游只读工具目录](m6-mcp-downstream-catalog.md)和 [M6.2b2b2b OAuth 资源认证](m6-mcp-oauth-resource.md)。`POST /mcp` 已开放受保护发现和 Key/OAuth 专属 `tools/list`，但 `tools/call` 在持久治理恢复完成前失败关闭；因此仍不宣称 Brokerrouter 已完整兼容 MCP。
+状态：2026-09-23 已完成 M6.2a 安全契约、[M6.2b1 连接目录](m6-mcp-connection-catalog.md)、[M6.2b2a HTTP 上游发现](m6-mcp-http-discovery.md)、[M6.2b2b1 受管 stdio](m6-mcp-stdio-discovery.md)、[M6.2b2b2a 下游目录](m6-mcp-downstream-catalog.md)、[M6.2b2b2b OAuth 资源认证](m6-mcp-oauth-resource.md)和 [M6.2b2c 持久治理工具调用](m6-mcp-governed-tool-calls.md)。`POST /mcp` 已开放受保护目录与单次审批后 `tools/call`；MRTR、Skill wire、Hermes/OpenClaw 恢复及官方认证仍未完成，因此不宣称完整 MCP/Skills 兼容。
 
 ## 规范基线
 
@@ -34,7 +34,7 @@
 | 动态 Skill、`allowed-tools`、嵌套和跨源读取安全门 | 未实现 | 动态 Skill 默认拒绝；工具授权被标记，执行门待 M6.2c |
 | 官方 core/client/server/extension 一致性测试 | 未执行 | 待真实端点完成后执行 |
 
-所以当前准确表述是：**M6.2a 提供 Skills 安全内核，M6.2b2a 已具备受管上游发现 wire；下游 server、工具代理、MRTR、Skill wire 与官方认证未完成，因此尚不是完整 MCP 网关。**
+当前准确表述是：**Skills 安全内核、受管上游发现、下游目录和持久治理的单次工具代理已实现；MRTR、Skill wire、Runtime 恢复与官方认证未完成，因此尚不是完整 MCP 网关。**
 
 ## 双向网关边界
 
@@ -68,7 +68,8 @@ M6.2a 的 `src/mcp.rs` 固定以下不变量：
 - b2a 已固定 `rmcp 3.4.0` 实现 2026-07-28 Streamable HTTP 上游 `server/discover`、Secret/OAuth 与出站边界；详见 [上游发现契约](m6-mcp-http-discovery.md)。
 - b2b1 已实现受管 stdio launcher 和真实 Discover lifecycle；详见 [stdio 发现契约](m6-mcp-stdio-discovery.md)。
 - b2b2a 已暴露单一 `/mcp` POST，完成 Host/Origin/标准头、虚拟 Key、描述摘要授权和租户工具目录；执行在治理恢复凭据完成前失败关闭。
-- b2b2b 已接入 OAuth JWT 资源认证；治理后的上游工具执行仍失败关闭，且不得把下游 token 转发到上游。
+- b2b2b 已接入 OAuth JWT 资源认证，不把下游 token 转发到上游。
+- b2c 已实现逐调用 turn/callId、输入/输出护栏、持久租约/回执及上游单次执行；MRTR/task 响应只持久封存，尚未提供协议恢复。
 - 客户端和服务器 core 一致性测试必须全部通过；版本升级必须重新跑一致性与安全回归。
 
 ### M6.2c：Skill 注册、真人审批和隔离缓存

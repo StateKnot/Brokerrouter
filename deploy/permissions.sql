@@ -287,10 +287,13 @@ DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_mcp_server') THEN
         CREATE ROLE brokerrouter_mcp_server NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_mcp_worker') THEN
+        CREATE ROLE brokerrouter_mcp_worker NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
 END $$;
-GRANT USAGE ON SCHEMA public TO brokerrouter_mcp_catalog,brokerrouter_mcp_client,brokerrouter_mcp_server;
-GRANT SELECT ON _sqlx_migrations TO brokerrouter_mcp_catalog,brokerrouter_mcp_client,brokerrouter_mcp_server;
-GRANT SELECT(id,active) ON tenants TO brokerrouter_mcp_catalog,brokerrouter_mcp_client,brokerrouter_mcp_server;
+GRANT USAGE ON SCHEMA public TO brokerrouter_mcp_catalog,brokerrouter_mcp_client,brokerrouter_mcp_server,brokerrouter_mcp_worker;
+GRANT SELECT ON _sqlx_migrations TO brokerrouter_mcp_catalog,brokerrouter_mcp_client,brokerrouter_mcp_server,brokerrouter_mcp_worker;
+GRANT SELECT(id,active) ON tenants TO brokerrouter_mcp_catalog,brokerrouter_mcp_client,brokerrouter_mcp_server,brokerrouter_mcp_worker;
 -- Harmless lock column enables SELECT ... FOR SHARE so tenant revocation is
 -- serialized with a catalog/discovery commit without granting state changes.
 GRANT UPDATE(governance_lock) ON tenants TO brokerrouter_mcp_catalog,brokerrouter_mcp_client;
@@ -316,6 +319,30 @@ GRANT SELECT(tenant_id,id,key_hash,revoked_at,expires_at) ON virtual_keys TO bro
 GRANT SELECT(tenant_id,id,active,config_revision) ON mcp_servers TO brokerrouter_mcp_server;
 GRANT SELECT ON mcp_discovery_snapshots,mcp_discovered_tools,mcp_key_tool_grants TO brokerrouter_mcp_server;
 GRANT SELECT ON mcp_oauth_principals TO brokerrouter_mcp_server;
-GRANT INSERT ON audit_events TO brokerrouter_mcp_catalog,brokerrouter_mcp_client,brokerrouter_mcp_server;
-GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_mcp_catalog,brokerrouter_mcp_client,brokerrouter_mcp_server;
+-- MCP edge and worker run the same policy kernel but have separate DB identities.
+-- Neither role may decide approvals or update grants. Only the worker can read
+-- upstream secret references; only the edge can enqueue a client call.
+GRANT UPDATE(governance_lock) ON tenants TO brokerrouter_mcp_server,brokerrouter_mcp_worker;
+GRANT SELECT ON governance_users,runtime_bindings,governance_turns,guardrails,
+    guardrail_versions,guardrail_policies,governance_operations,approvals,
+    guardrail_grants,guardrail_evaluations,guardrail_observations
+    TO brokerrouter_mcp_server,brokerrouter_mcp_worker;
+GRANT UPDATE(event_clock) ON governance_turns TO brokerrouter_mcp_server,brokerrouter_mcp_worker;
+GRANT INSERT ON governance_operations,approvals,governance_events,guardrail_evaluations,guardrail_observations
+    TO brokerrouter_mcp_server,brokerrouter_mcp_worker;
+GRANT UPDATE(state,claim_hash,execution_deadline,receipt_hash,receipt_ciphertext,payload_ciphertext)
+    ON governance_operations TO brokerrouter_mcp_server,brokerrouter_mcp_worker;
+GRANT UPDATE(state,reason_code,deadline,finished_at) ON guardrail_evaluations
+    TO brokerrouter_mcp_server,brokerrouter_mcp_worker;
+GRANT UPDATE(approval_skipped_at) ON guardrail_observations TO brokerrouter_mcp_server,brokerrouter_mcp_worker;
+GRANT SELECT,INSERT ON mcp_tool_calls TO brokerrouter_mcp_server;
+GRANT UPDATE(state,output_operation_id,completed_at) ON mcp_tool_calls TO brokerrouter_mcp_server;
+GRANT SELECT ON mcp_tool_calls TO brokerrouter_mcp_worker;
+GRANT UPDATE(state,claim_hash,execution_deadline,response_kind,response_hash,response_ciphertext,
+    failure_code,completed_at) ON mcp_tool_calls TO brokerrouter_mcp_worker;
+GRANT SELECT(tenant_id,id,revoked_at,expires_at) ON virtual_keys TO brokerrouter_mcp_worker;
+GRANT SELECT ON mcp_servers,mcp_discovery_snapshots,mcp_discovered_tools,mcp_key_tool_grants
+    TO brokerrouter_mcp_worker;
+GRANT INSERT ON audit_events TO brokerrouter_mcp_catalog,brokerrouter_mcp_client,brokerrouter_mcp_server,brokerrouter_mcp_worker;
+GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_mcp_catalog,brokerrouter_mcp_client,brokerrouter_mcp_server,brokerrouter_mcp_worker;
 COMMIT;

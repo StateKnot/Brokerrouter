@@ -156,7 +156,12 @@ pub struct SetOauthPrincipal {
 
 #[derive(Clone, Debug)]
 pub struct AuthorizedTool {
+    pub server_id: Uuid,
+    pub server_config_revision: i64,
+    pub discovery_snapshot_id: Uuid,
+    pub upstream_name: String,
     pub downstream_name: String,
+    pub descriptor_hash: Vec<u8>,
     pub descriptor: Value,
     pub expires_at: DateTime<Utc>,
 }
@@ -1090,16 +1095,41 @@ pub async fn authorized_tools(
     if !(1..=101).contains(&limit) || after.is_some_and(|value| !valid_tool_name(value)) {
         return Err(Error::Invalid("invalid MCP tool cursor"));
     }
-    type Row = (String, Value, DateTime<Utc>);
-    let rows:Vec<Row>=sqlx::query_as("SELECT t.downstream_name,t.descriptor,t.expires_at FROM virtual_keys k JOIN tenants x ON x.id=k.tenant_id AND x.active JOIN mcp_servers s ON s.tenant_id=k.tenant_id AND s.active JOIN LATERAL(SELECT d.id,d.server_config_revision FROM mcp_discovery_snapshots d WHERE d.tenant_id=s.tenant_id AND d.server_id=s.id AND d.server_config_revision=s.config_revision AND d.expires_at>clock_timestamp() ORDER BY d.observed_at DESC,d.id DESC LIMIT 1)d ON true JOIN mcp_discovered_tools t ON t.tenant_id=s.tenant_id AND t.discovery_snapshot_id=d.id AND t.server_id=s.id AND t.expires_at>clock_timestamp() JOIN mcp_key_tool_grants g ON g.tenant_id=t.tenant_id AND g.key_id=k.id AND g.server_id=t.server_id AND g.server_config_revision=d.server_config_revision AND g.upstream_name=t.upstream_name AND g.descriptor_hash=t.descriptor_hash AND g.active WHERE k.tenant_id=$1 AND k.id=$2 AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>clock_timestamp()) AND ($3::text IS NULL OR t.downstream_name>$3) ORDER BY t.downstream_name LIMIT $4")
+    type Row = (
+        Uuid,
+        i64,
+        Uuid,
+        String,
+        String,
+        Vec<u8>,
+        Value,
+        DateTime<Utc>,
+    );
+    let rows:Vec<Row>=sqlx::query_as("SELECT s.id,d.server_config_revision,d.id,t.upstream_name,t.downstream_name,t.descriptor_hash,t.descriptor,t.expires_at FROM virtual_keys k JOIN tenants x ON x.id=k.tenant_id AND x.active JOIN mcp_servers s ON s.tenant_id=k.tenant_id AND s.active JOIN LATERAL(SELECT d.id,d.server_config_revision FROM mcp_discovery_snapshots d WHERE d.tenant_id=s.tenant_id AND d.server_id=s.id AND d.server_config_revision=s.config_revision AND d.expires_at>clock_timestamp() ORDER BY d.observed_at DESC,d.id DESC LIMIT 1)d ON true JOIN mcp_discovered_tools t ON t.tenant_id=s.tenant_id AND t.discovery_snapshot_id=d.id AND t.server_id=s.id AND t.expires_at>clock_timestamp() JOIN mcp_key_tool_grants g ON g.tenant_id=t.tenant_id AND g.key_id=k.id AND g.server_id=t.server_id AND g.server_config_revision=d.server_config_revision AND g.upstream_name=t.upstream_name AND g.descriptor_hash=t.descriptor_hash AND g.active WHERE k.tenant_id=$1 AND k.id=$2 AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>clock_timestamp()) AND ($3::text IS NULL OR t.downstream_name>$3) ORDER BY t.downstream_name LIMIT $4")
         .bind(who.tenant_id).bind(who.key_id).bind(after).bind(limit).fetch_all(pool).await?;
     Ok(rows
         .into_iter()
-        .map(|(downstream_name, descriptor, expires_at)| AuthorizedTool {
-            downstream_name,
-            descriptor,
-            expires_at,
-        })
+        .map(
+            |(
+                server_id,
+                server_config_revision,
+                discovery_snapshot_id,
+                upstream_name,
+                downstream_name,
+                descriptor_hash,
+                descriptor,
+                expires_at,
+            )| AuthorizedTool {
+                server_id,
+                server_config_revision,
+                discovery_snapshot_id,
+                upstream_name,
+                downstream_name,
+                descriptor_hash,
+                descriptor,
+                expires_at,
+            },
+        )
         .collect())
 }
 
@@ -1111,14 +1141,37 @@ pub async fn authorized_tool(
     if !valid_tool_name(name) {
         return Ok(None);
     }
-    type Row = (String, Value, DateTime<Utc>);
-    let row:Option<Row>=sqlx::query_as("SELECT t.downstream_name,t.descriptor,t.expires_at FROM virtual_keys k JOIN tenants x ON x.id=k.tenant_id AND x.active JOIN mcp_servers s ON s.tenant_id=k.tenant_id AND s.active JOIN LATERAL(SELECT d.id,d.server_config_revision FROM mcp_discovery_snapshots d WHERE d.tenant_id=s.tenant_id AND d.server_id=s.id AND d.server_config_revision=s.config_revision AND d.expires_at>clock_timestamp() ORDER BY d.observed_at DESC,d.id DESC LIMIT 1)d ON true JOIN mcp_discovered_tools t ON t.tenant_id=s.tenant_id AND t.discovery_snapshot_id=d.id AND t.server_id=s.id AND t.expires_at>clock_timestamp() JOIN mcp_key_tool_grants g ON g.tenant_id=t.tenant_id AND g.key_id=k.id AND g.server_id=t.server_id AND g.server_config_revision=d.server_config_revision AND g.upstream_name=t.upstream_name AND g.descriptor_hash=t.descriptor_hash AND g.active WHERE k.tenant_id=$1 AND k.id=$2 AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>clock_timestamp()) AND t.downstream_name=$3")
+    type Row = (
+        Uuid,
+        i64,
+        Uuid,
+        String,
+        String,
+        Vec<u8>,
+        Value,
+        DateTime<Utc>,
+    );
+    let row:Option<Row>=sqlx::query_as("SELECT s.id,d.server_config_revision,d.id,t.upstream_name,t.downstream_name,t.descriptor_hash,t.descriptor,t.expires_at FROM virtual_keys k JOIN tenants x ON x.id=k.tenant_id AND x.active JOIN mcp_servers s ON s.tenant_id=k.tenant_id AND s.active JOIN LATERAL(SELECT d.id,d.server_config_revision FROM mcp_discovery_snapshots d WHERE d.tenant_id=s.tenant_id AND d.server_id=s.id AND d.server_config_revision=s.config_revision AND d.expires_at>clock_timestamp() ORDER BY d.observed_at DESC,d.id DESC LIMIT 1)d ON true JOIN mcp_discovered_tools t ON t.tenant_id=s.tenant_id AND t.discovery_snapshot_id=d.id AND t.server_id=s.id AND t.expires_at>clock_timestamp() JOIN mcp_key_tool_grants g ON g.tenant_id=t.tenant_id AND g.key_id=k.id AND g.server_id=t.server_id AND g.server_config_revision=d.server_config_revision AND g.upstream_name=t.upstream_name AND g.descriptor_hash=t.descriptor_hash AND g.active WHERE k.tenant_id=$1 AND k.id=$2 AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>clock_timestamp()) AND t.downstream_name=$3")
         .bind(who.tenant_id).bind(who.key_id).bind(name).fetch_optional(pool).await?;
-    Ok(
-        row.map(|(downstream_name, descriptor, expires_at)| AuthorizedTool {
+    Ok(row.map(
+        |(
+            server_id,
+            server_config_revision,
+            discovery_snapshot_id,
+            upstream_name,
             downstream_name,
+            descriptor_hash,
             descriptor,
             expires_at,
-        }),
-    )
+        )| AuthorizedTool {
+            server_id,
+            server_config_revision,
+            discovery_snapshot_id,
+            upstream_name,
+            downstream_name,
+            descriptor_hash,
+            descriptor,
+            expires_at,
+        },
+    ))
 }

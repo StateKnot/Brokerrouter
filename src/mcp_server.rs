@@ -1,14 +1,9 @@
-//! Authenticated, stateless downstream MCP catalog edge.
-//!
-//! This first downstream slice deliberately does not execute tools. It exposes
-//! only descriptors explicitly granted to the calling virtual key and records
-//! attempted calls before returning a fail-closed governance error. Execution
-//! is enabled only when M6.2d can bind the operation to a durable turn,
-//! approval and runtime resume credential.
+//! Authenticated, stateless downstream MCP tool edge.
 
 use crate::{
+    cipher::ResultCipher,
     error::Error,
-    governance, mcp_catalog, mcp_oauth,
+    mcp_calls, mcp_catalog, mcp_oauth,
     store::{self, Identity},
 };
 use axum::{
@@ -162,6 +157,7 @@ pub fn router(
     pool: PgPool,
     config: HttpConfig,
     oauth: Option<mcp_oauth::Verifier>,
+    cipher: Arc<ResultCipher>,
 ) -> Result<Router, Error> {
     if oauth.as_ref().is_some_and(|oauth| {
         !config
@@ -184,10 +180,12 @@ pub fn router(
         .with_max_request_body_bytes(MAX_REQUEST_BODY_BYTES)
         .with_stateless_protocol_metadata_required(true);
     let handler_pool = pool.clone();
+    let handler_cipher = cipher;
     let service = StreamableHttpService::new(
         move || {
             Ok(CatalogServer {
                 pool: handler_pool.clone(),
+                calls: mcp_calls::Edge::new(handler_pool.clone(), handler_cipher.clone()),
             })
         },
         Arc::new(NeverSessionManager::default()),
@@ -390,6 +388,7 @@ fn insufficient_scope(oauth: Option<&mcp_oauth::Verifier>, scope: &str) -> Respo
 #[derive(Clone)]
 struct CatalogServer {
     pool: PgPool,
+    calls: mcp_calls::Edge,
 }
 
 fn identity(context: &RequestContext<RoleServer>) -> Result<Identity, McpError> {
@@ -522,7 +521,7 @@ impl ServerHandler for CatalogServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Only virtual-key-authorized tool descriptors are listed. Tool execution remains fail-closed until durable governance resume binding is enabled.",
+                "Tool calls require io.brokerrouter/turnId and io.brokerrouter/callId UUID metadata. Reuse callId on retries. Approval is resolved through the bound runtime's governance workbench.",
             )
     }
 
@@ -590,24 +589,61 @@ impl ServerHandler for CatalogServer {
             .ok_or_else(|| McpError::internal_error("Stored tool schema is invalid", None))?;
         validate_param_headers(headers, input_schema, &arguments)
             .map_err(|reason| McpError::header_mismatch(reason, None))?;
-        let arguments = Value::Object(arguments);
-        let arguments_hash = governance::digest(&arguments)
-            .map_err(|_| McpError::invalid_params("Tool arguments are invalid", None))?;
-        sqlx::query("INSERT INTO audit_events(tenant_id,action,object_id,details) VALUES($1,'mcp.tool_call_blocked',$2,$3)")
-            .bind(who.tenant_id)
-            .bind(tool.downstream_name.clone())
-            .bind(json!({"key_id":who.key_id,"arguments_sha256":governance::hex(&arguments_hash),"reason":"durable_governance_binding_required"}))
-            .execute(&self.pool)
+        if request.input_responses.is_some() || request.request_state.is_some() {
+            return Err(McpError::invalid_params(
+                "This tool call has no Brokerrouter MRTR request to resume",
+                None,
+            ));
+        }
+        let turn_id = context
+            .meta
+            .get("io.brokerrouter/turnId")
+            .and_then(Value::as_str)
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .ok_or_else(|| {
+                McpError::invalid_params("A valid io.brokerrouter/turnId is required", None)
+            })?;
+        let call_id = context
+            .meta
+            .get("io.brokerrouter/callId")
+            .and_then(Value::as_str)
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .ok_or_else(|| {
+                McpError::invalid_params("A valid io.brokerrouter/callId is required", None)
+            })?;
+        self.calls
+            .call(&who, turn_id, call_id, tool, Value::Object(arguments))
             .await
-            .map_err(|_| McpError::internal_error("Tool call audit could not be persisted", None))?;
-        Err(McpError::invalid_request(
-            "Tool execution requires a durable governed turn and resume credential",
-            Some(json!({
-                "code":"governance_execution_unavailable",
-                "tool":tool.downstream_name,
-                "argumentsSha256":governance::hex(&arguments_hash)
-            })),
-        ))
+            .map_err(|error| {
+                let (code, message) = match &error {
+                    Error::ApprovalRequired(_) => {
+                        ("approval_required", "Human approval is required")
+                    }
+                    Error::InProgress => ("tool_call_pending", "Tool call is pending"),
+                    Error::UpstreamUnknown => (
+                        "execution_unknown",
+                        "The upstream outcome needs reconciliation",
+                    ),
+                    Error::NotSubmitted => ("tool_not_submitted", "Tool call was not submitted"),
+                    Error::Conflict => (
+                        "idempotency_conflict",
+                        "callId is already bound to a different tool call",
+                    ),
+                    Error::NotFound | Error::TurnClosed | Error::Unauthorized => (
+                        "authorization_ended",
+                        "Tool call is not authorized in this turn",
+                    ),
+                    Error::ResultUnavailable => {
+                        ("result_unavailable", "Stored tool result is unavailable")
+                    }
+                    _ => ("tool_call_unavailable", "Tool execution is unavailable"),
+                };
+                let mut data = json!({"code":code,"callId":call_id});
+                if let Error::ApprovalRequired(approval) = error {
+                    data["approval"] = approval;
+                }
+                McpError::invalid_request(message, Some(data))
+            })
     }
 }
 

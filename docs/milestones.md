@@ -1,6 +1,6 @@
 # 开发里程碑
 
-更新日期：2026-09-20。主语言 Rust。里程碑是生产方案的开发顺序，每个发布能力必须完成对应验收，不能把本地 fixture 当作供应商认证。
+更新日期：2026-09-23。主语言 Rust。里程碑是生产方案的开发顺序，每个发布能力必须完成对应验收，不能把本地 fixture 当作供应商认证。
 
 | 里程碑 | 范围 | 验收闸门 | 状态 |
 | --- | --- | --- | --- |
@@ -10,7 +10,7 @@
 | M3 护栏与用户审批 | 用户身份与 Agent 分离、turn 权威生命周期、持久审批、输出隔离、当前 turn 豁免、恢复协议 | 代批失败、重复决定原子、迟到批准失效、重启不重复副作用 | 核心及文本语义连接器已实现；多模态/专用审核适配、检测质量与真实 BFF/Runtime 认证待完成 |
 | M4 多模态作业与资产 | 同步图像/异步视频/3D、连接器配置、持久 worker、提交不确定、私有资产、回调 | 接收后断线不重提、转存恢复、取消竞态、跨租户资产访问拒绝 | 资产/计费、文生视频作业、隔离转存、扫描与技术检测、资产策略及真人审批交付、隔离 MP4 预览已实现；专用内容语义、其他模态预览、图片/3D/其他协议待开发，生产认证待完成 |
 | M5 控制台与治理 | TypeScript 控制台、OIDC、模型/端点、策略/护栏、汇率、人民币统计、任务审计、经验/评测样本 | 页面使用真实 API；各维度账本一致；权限矩阵与审批审计 | 报表、OIDC BFF、配置管理、护栏监控、本人 JSON/隔离 MP4 审阅审批、逐轮次节点/调用/事件治理与 HTTPS edge 已实现；其他模态预览、经验候选/评测样本和其余统计维度待开发，真实 IdP/整链路/部署待认证 |
-| M6 Runtime、MCP 与生产认证 | Hermes Python / OpenClaw TypeScript Adapter、MCP 2026-07-28/Skills、通道认证、压测、故障演练、部署与回滚 | 指定版本完整调用/审批/恢复；MCP 官方 client/server 一致性；容量、RPO/RTO、凭据与真实费用边界达标 | Hermes 0.21.1 M6.1a/b 已实现工具输入强制门、受信 turn 绑定与原生审批通知；M6.2a 完成 MCP/Skills 安全内核，M6.2b1 完成连接目录，M6.2b2a/b2b1 完成 HTTP/stdio 上游发现，M6.2b2b2a/b 完成下游只读 `/mcp`、Key 工具摘要授权和 OAuth JWT 资源认证；真实治理转发、MRTR/持久 Skill 审批/官方认证、输出/产物发布、OpenClaw 仍待完成 |
+| M6 Runtime、MCP 与生产认证 | Hermes Python / OpenClaw TypeScript Adapter、MCP 2026-07-28/Skills、通道认证、压测、故障演练、部署与回滚 | 指定版本完整调用/审批/恢复；MCP 官方 client/server 一致性；容量、RPO/RTO、凭据与真实费用边界达标 | Hermes 0.21.1 M6.1a/b 已实现工具输入强制门、受信 turn 绑定与原生审批通知；M6.2a–b 完成安全内核、连接目录、HTTP/stdio 发现、下游目录/OAuth 与持久治理的单次工具调用；MRTR/持久 Skill 审批/官方认证、Hermes/Claw MCP 原生恢复、输出/产物发布仍待完成 |
 
 ## v0.3 已决定的实施契约
 
@@ -397,3 +397,13 @@ OAuth client credentials 配置固定 issuer/resource/audience 且 audience 必�
 本地回归覆盖个人初始化原子回滚、工具原样两轮往返、SSE 成功结算/幂等重放/客户端断开/上游中断/缺失 usage、能力路由与输出护栏。常规 Rust 全量 **232 项通过、0 失败、4 项环境专项 ignored**；最终组合能力加固后 Gateway **34 项通过**，fmt、Clippy `-D warnings` 和 release 构建通过。Console 合约 **28 项**、Chromium/WebKit 真实浏览器 **124 项**全部通过。另以一次性 PostgreSQL 17 和真实 `init-personal`/`serve` 进程完成非流式、SSE、请求详情及认证 CLI 端到端冒烟，幂等重放未增加上游请求。
 
 阿里云北京的当前修复复验、真实 SSE、固定 SDK、账单核对和容量仍由 LIVE-01/03/04 阻断；在真实两轮证据入库前，认证矩阵不将任何真实供应商标为 JiaClaw 生产默认。
+
+## M6.2b2c：治理后的 MCP 单次工具调用（2026-09-23）
+
+完成 [持久工具调用契约](m6-mcp-governed-tool-calls.md)：`tools/call` 绑定受信 turn 与不变的 `callId`，输入/输出两侧复用现有策略和真人审批；独立 `mcp-worker` 重新核对授权、连接 revision、工具完整描述，再对 HTTP/受管 stdio 上游做一次调用。密文结果与执行回执原子提交，重复请求只读取已有事实，断线或结果不确定不自动重发。
+
+0024 迁移增加逐调用状态机、审批后结果不可变约束和有界租约维护；`brokerrouter_mcp_server` 仅能入队/释放，`brokerrouter_mcp_worker` 才能访问上游连接与凭据引用，两者都不能审批或改 grant。真实 PostgreSQL/受限角色、stdio fixture 与下游 HTTP 覆盖输入审批、输出审批、撤权、幂等冲突、丢失结果、单次副作用、租约失效审计及结果篡改拒绝。
+
+本地最终 `cargo fmt --check`、Clippy `-D warnings`、release 构建和 Rust 常规全量 **241 项通过、0 失败**；4 项既有隔离 S3/ClamAV/FFmpeg 专项按本地闸门 ignored，正式 CI 必须单独执行。没有连接付费供应商或产生模型费用。
+
+当前只在上游返回完整结果时释放；`input_required` 和 task 响应保留加密事实但**不伪装成可恢复的成功调用**。M6.2d 仍需 MRTR/task 持久恢复、Hermes/OpenClaw MCP 原生暂停恢复、真实 HTTPS/OAuth 与官方 conformance。未在既有生产站点启用 MCP 工具执行，也未产生付费供应商调用。
