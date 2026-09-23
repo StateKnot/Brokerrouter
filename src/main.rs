@@ -718,11 +718,22 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("MCP worker concurrency must be 1..16");
             }
             brokerrouter::check_schema(&pool).await?;
+            let result_cipher =
+                std::sync::Arc::new(brokerrouter::cipher::ResultCipher::from_env()?);
+            let config_cipher =
+                std::sync::Arc::new(brokerrouter::cipher::ResultCipher::from_mcp_env()?);
+            let resolver = brokerrouter::mcp_client::InjectedCredentialResolver::from_env()?;
             let worker = brokerrouter::mcp_calls::Worker::new(
                 pool.clone(),
-                std::sync::Arc::new(brokerrouter::cipher::ResultCipher::from_env()?),
-                std::sync::Arc::new(brokerrouter::cipher::ResultCipher::from_mcp_env()?),
-                brokerrouter::mcp_client::InjectedCredentialResolver::from_env()?,
+                result_cipher.clone(),
+                config_cipher.clone(),
+                resolver.clone(),
+            );
+            let skill_worker = brokerrouter::mcp_skill_resources::Worker::new(
+                pool.clone(),
+                result_cipher,
+                config_cipher,
+                resolver,
             );
             let stop = tokio_util::sync::CancellationToken::new();
             let mut workers = tokio::task::JoinSet::new();
@@ -732,6 +743,20 @@ async fn main() -> anyhow::Result<()> {
                     while !stop.is_cancelled() {
                         if let Err(error) = worker.tick().await {
                             tracing::error!(error=%error,"MCP tool worker pass failed; durable state retained");
+                        }
+                        tokio::select! {
+                            _ = stop.cancelled() => break,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                        }
+                    }
+                });
+            }
+            for _ in 0..concurrency.min(4) {
+                let (skill_worker, stop) = (skill_worker.clone(), stop.clone());
+                workers.spawn(async move {
+                    while !stop.is_cancelled() {
+                        if let Err(error) = skill_worker.tick().await {
+                            tracing::error!(error=%error,"MCP Skill resource worker pass failed; durable state retained");
                         }
                         tokio::select! {
                             _ = stop.cancelled() => break,

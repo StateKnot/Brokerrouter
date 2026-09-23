@@ -357,7 +357,7 @@ OAuth client credentials 配置固定 issuer/resource/audience 且 audience 必�
 
 2026-09-20，在 M6.2b1 不可变连接目录上完成 [Streamable HTTP 发现执行边界](m6-mcp-http-discovery.md)。固定官方 `rmcp 3.4.0`，只采用 MCP `2026-07-28` Discover lifecycle；新增 `mcp-server-discover`，由 `brokerrouter_mcp_client` 读取 active revision、解密引用、经 DNS/IP 固定和受管私有 CA 发起真实 `server/discover`，再原子记录完整 snapshot/audit/receipt。
 
-凭据支持 none、Bearer 和 OAuth client credentials。Secret Manager URI 只通过显式 URI→注入环境变量映射解析；OAuth 禁止 legacy metadata fallback，精确核对 issuer 和 endpoint/resource/audience，并对 metadata/token 每个 URL 重做出站策略。JSON/SSE 发现响应限制 512 KiB，OAuth 响应限制 1 MiB；同源 metadata 重定向最多 5 次，Token 不重定向。private cache 指纹绑定实际凭据/token，operation 重试先读持久 receipt，已完成时不重复联网。
+凭据支持 none、Bearer 和 OAuth client credentials。Secret Manager URI 只通过显式 URI→注入环境变量映射解析；OAuth 禁止 legacy metadata fallback，精确核对 issuer 和 endpoint/resource/audience，并对 metadata/token 每个 URL 重做出站策略。JSON/SSE 发现响应限制 512 KiB，OAuth 响应限制 1 MiB；同源 metadata 重定向最多 5 次，Token 不重定向。private cache 指纹绑定 Bearer 实际值或 OAuth 稳定客户端身份/权限与 TLS 信任根；短期 OAuth token 正常刷新不改变同一主体的授权上下文。operation 重试先读持久 receipt，已完成时不重复联网。
 
 本地真实 TCP wire 回归验证两次 discover 均携带标准头和 self-contained metadata、从不发送 initialize、Bearer 只到固定上游、超大响应在解析前失败；Secret/指纹和 receipt/server 绑定也有回归。未完成边界：stdio launcher、下游 `/mcp`/Origin/认证/工具路由、官方 client/server conformance、真实 HTTPS/OAuth/私有 CA 预生产认证仍属 M6.2b2b/LIVE-22；M6.2c–d 继续 Skill 持久审批、MRTR 与 Runtime 恢复。
 
@@ -421,3 +421,11 @@ OAuth client credentials 配置固定 issuer/resource/audience 且 audience 必�
 完成 [直接查询契约](m6-mcp-skill-get.md)：受管 client 经 `server/discover` 校验 Resources/Skills 能力后，直接发送带完整 `_meta` 的 `skills/get`，不依赖 `skills/list`、不预取资源；严格核对响应 URI 与完整静态 manifest。0026 迁移记录宿主来源、版本、能力摘要、完整 entry、批准指纹、TTL、有效私有授权上下文及原子审计/幂等 receipt。新增 `mcp-skill-get` 与操作员 `mcp-skill-get-review`；虚拟密钥与下游 MCP 服务不能读取观察表，`activation` 恒禁用。同期加固混合 public/private 列表缓存，旧版未绑定授权上下文的 private 工具不再供下游列出或调用。
 
 本地最终全量 Rust **245 项通过、0 失败，4 项既有 S3/固定 ClamAV/FFmpeg 环境专项 ignored**；fmt、Clippy `-D warnings`、release 构建通过。真实 TCP wire、数据库角色、过期/不可变/审计回滚与旧版 private 缓存失效均有回归。M6.2c2b 仍需真人持久审批、`resources/read` 字节验证和隔离缓存；M6.2d 仍需 MRTR 与 Hermes/Claw 原生暂停恢复。该阶段不宣称 Skill 已可用。
+
+## M6.2c2c：Skill 资源按需读取与隔离缓存（2026-09-23）
+
+在 [真人 Skill 审批](m6-mcp-skill-approval.md) 之后完成 [资源读取契约](m6-mcp-skill-resources.md)。Runtime 只能对已批准的完整静态 manifest 提交逐文件读取；独立 worker 经受管 HTTPS `resources/read` 获取单条内容，校验原始字节长度、SHA-256 和 `SKILL.md` frontmatter 后，按 tenant/key/turn/server/manifest/URI 绑定、加密并不可覆盖地持久化。返回时重新检查当前直接观察、真人审批、缓存 TTL 与字节完整性；manifest/凭据变化、未列资源和审批过期均失败关闭。
+
+0028 迁移增加读取状态、租约、不可变密文事实和过期清理；权限矩阵确保 Runtime 不得写结果、worker 不得审批或读取审批反馈。真实 TCP wire 和隔离 PostgreSQL 受限角色测试覆盖无预取、审批前拒绝、无效 URI、内容/TTL 篡改以及更新 manifest 后 worker 不继续读取。此阶段仍**不激活 Skill 或授予 `allowed-tools`**；stdio 内容帧无可靠大小上限而保持关闭。完整 HTTPS/私有 CA 与 OAuth 轮换、官方 conformance、MRTR 和 Hermes/OpenClaw 原生恢复留待下一发布闸门。
+
+本地锁定依赖全量 Rust **251 项通过、0 失败、4 项既有隔离 S3/固定 ClamAV/FFmpeg 专项 ignored**；fmt、Clippy `-D warnings`、Release 构建和最后数据库约束的定向复验通过。未连接任何付费模型供应商，也未在现有服务器启用此功能。

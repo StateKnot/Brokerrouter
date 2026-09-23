@@ -6,6 +6,7 @@ use crate::{
     error::{Error, Result},
     governance::{self, Tx},
     human::{self, Human},
+    mcp::{SkillEntry, ValidatedSkill},
     mcp_catalog,
     store::Identity,
 };
@@ -120,8 +121,80 @@ fn same_observation(request: &Consent, observed: &Observation) -> Result<()> {
     Ok(())
 }
 
+pub(crate) struct ApprovedSkill {
+    pub validated: ValidatedSkill,
+    pub server_id: Uuid,
+    pub server_config_revision: i64,
+    pub skill_uri: String,
+    pub manifest_hash: Vec<u8>,
+    pub authorization_context_hash: Option<Vec<u8>>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct GateConsent {
+    turn_id: Uuid,
+    key_id: Uuid,
+    user_id: Uuid,
+    server_id: Uuid,
+    server_config_revision: i64,
+    uri: String,
+    approval_fingerprint: String,
+    manifest_hash: Vec<u8>,
+    authorization_context_hash: Option<Vec<u8>>,
+    state: String,
+    expires_at: DateTime<Utc>,
+}
+
+/// Recheck the human fact, active turn, current direct observation and full
+/// manifest under the tenant lock at every resource-read boundary.
+pub(crate) async fn approved_in_tx(
+    tx: &mut Tx<'_>,
+    who: &Identity,
+    request_id: Uuid,
+) -> Result<ApprovedSkill> {
+    let request: GateConsent = sqlx::query_as(
+        "SELECT turn_id,key_id,user_id,server_id,server_config_revision,uri,approval_fingerprint,manifest_hash,authorization_context_hash,state,expires_at FROM mcp_skill_approval_requests WHERE tenant_id=$1 AND id=$2",
+    ).bind(who.tenant_id).bind(request_id).fetch_optional(&mut **tx).await?.ok_or(Error::NotFound)?;
+    if request.key_id != who.key_id {
+        return Err(Error::NotFound);
+    }
+    let turn = governance::turn_locked(tx, who, request.turn_id, true).await?;
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut **tx)
+        .await?;
+    if request.user_id != turn.user_id || request.state != "approved" || request.expires_at <= now {
+        return Err(Error::ActionRejected);
+    }
+    let observed = current(tx, who.tenant_id, request.server_id, &request.uri).await?;
+    if request.server_config_revision != observed.server_config_revision
+        || request.approval_fingerprint != observed.approval_fingerprint
+        || request.manifest_hash != governance::digest(&observed.entry)?
+        || request.authorization_context_hash != observed.authorization_context_hash
+    {
+        return Err(Error::PolicyChanged);
+    }
+    let entry: SkillEntry =
+        serde_json::from_value(observed.entry).map_err(|_| Error::PolicyChanged)?;
+    let validated = entry
+        .validate_static(request.server_id)
+        .map_err(|_| Error::PolicyChanged)?;
+    if validated.approval_fingerprint() != request.approval_fingerprint {
+        return Err(Error::PolicyChanged);
+    }
+    Ok(ApprovedSkill {
+        validated,
+        server_id: request.server_id,
+        server_config_revision: request.server_config_revision,
+        skill_uri: request.uri,
+        manifest_hash: request.manifest_hash,
+        authorization_context_hash: request.authorization_context_hash,
+        expires_at: request.expires_at,
+    })
+}
+
 async fn consent(tx: &mut Tx<'_>, tenant: Uuid, id: Uuid, user: Option<Uuid>) -> Result<Consent> {
-    sqlx::query_as("SELECT r.id,r.turn_id,r.user_id,r.server_id,r.observation_id,r.server_config_revision,r.uri,r.approval_fingerprint,r.manifest_hash,r.authorization_context_hash,r.state,r.decision_hash,r.feedback_ciphertext,r.expires_at FROM mcp_skill_approval_requests r WHERE r.tenant_id=$1 AND r.id=$2 AND ($3::uuid IS NULL OR r.user_id=$3) FOR UPDATE")
+    sqlx::query_as("SELECT r.id,r.turn_id,r.user_id,r.server_id,r.observation_id,r.server_config_revision,r.uri,r.approval_fingerprint,r.manifest_hash,r.authorization_context_hash,r.state,r.decision_hash,r.feedback_ciphertext,r.expires_at FROM mcp_skill_approval_requests r WHERE r.tenant_id=$1 AND r.id=$2 AND ($3::uuid IS NULL OR r.user_id=$3)")
         .bind(tenant).bind(id).bind(user).fetch_optional(&mut **tx).await?.ok_or(Error::NotFound)
 }
 

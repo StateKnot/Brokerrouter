@@ -26,6 +26,7 @@ pub mod mcp_client;
 pub mod mcp_oauth;
 pub mod mcp_server;
 pub mod mcp_skill_approvals;
+pub mod mcp_skill_resources;
 pub mod media;
 pub mod media_api;
 pub mod media_protocol;

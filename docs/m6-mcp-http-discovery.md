@@ -25,7 +25,7 @@
 ```
 
   不接受未知字段、空值、重复/非法 scope 或超过 64 KiB 的凭据。客户端先按 RFC 9728/RFC 8414 发现 metadata；禁止 SDK 的 legacy endpoint fallback，metadata `issuer` 必须精确等于目录固定值，且 Streamable HTTP 的 `resource`/`audience` 必须精确等于端点。Token 请求始终携带固定 `resource`。OAuth 每个 URL 都重新执行 DNS/IP 固定；仅 GET/HEAD metadata 可在最多 5 跳内同源重定向，Token 请求不跟随重定向。
-- private discovery cache 的输入指纹采用带长度域分隔的 SHA-256。OAuth issuer/resource/audience、client id、client secret、实际 access token 和 TLS trust bundle 均参与；凭据、Token 或私有 CA 轮换后不会复用旧 private snapshot。真实材料不落库。
+- private discovery cache 的输入指纹采用带长度域分隔的 SHA-256。OAuth issuer/resource/audience、client id、client secret、scope 集合和 TLS trust bundle 均参与；客户端凭据、scope 或私有 CA 变化后不会复用旧 private snapshot。短期 access token 的正常刷新不改变同一 client-credentials 主体的权限身份。真实材料不落库。
 
 Secret Manager URI 通过生产 Secret 注入器绑定到进程环境变量，映射本身不含 Secret：
 
