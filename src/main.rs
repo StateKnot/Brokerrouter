@@ -274,6 +274,26 @@ enum Command {
         #[arg(long)]
         server: Uuid,
     },
+    McpSkillGet {
+        #[arg(long)]
+        tenant: Uuid,
+        #[arg(long)]
+        server: Uuid,
+        #[arg(long)]
+        operation: Uuid,
+        #[arg(long)]
+        actor: String,
+        #[arg(long)]
+        uri: String,
+    },
+    McpSkillGetReview {
+        #[arg(long)]
+        tenant: Uuid,
+        #[arg(long)]
+        server: Uuid,
+        #[arg(long)]
+        uri: String,
+    },
     McpToolGrantSet {
         /// JSON `mcp_catalog::SetToolGrant`; the descriptor digest must come
         /// from a fresh `mcp-tools-list` review.
@@ -742,6 +762,43 @@ async fn main() -> anyhow::Result<()> {
             println!(
                 "{}",
                 brokerrouter::mcp_catalog::review_skills(&pool, tenant, server).await?
+            );
+        }
+        Command::McpSkillGet {
+            tenant,
+            server,
+            operation,
+            actor,
+            uri,
+        } => {
+            brokerrouter::check_schema(&pool).await?;
+            let resolver = brokerrouter::mcp_client::InjectedCredentialResolver::from_env()?;
+            println!(
+                "{}",
+                brokerrouter::mcp_client::get_skill_and_record(
+                    &pool,
+                    &brokerrouter::cipher::ResultCipher::from_mcp_env()?,
+                    &resolver,
+                    brokerrouter::mcp_client::GetSkill {
+                        tenant_id: tenant,
+                        server_id: server,
+                        operation_id: operation,
+                        actor,
+                        uri,
+                    },
+                )
+                .await?
+            );
+        }
+        Command::McpSkillGetReview {
+            tenant,
+            server,
+            uri,
+        } => {
+            brokerrouter::check_schema(&pool).await?;
+            println!(
+                "{}",
+                brokerrouter::mcp_catalog::review_skill_get(&pool, tenant, server, &uri).await?
             );
         }
         Command::McpToolGrantSet { file } => {

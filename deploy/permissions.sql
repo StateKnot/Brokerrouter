@@ -301,12 +301,13 @@ GRANT SELECT,INSERT ON mcp_catalog_mutations TO brokerrouter_mcp_catalog,brokerr
 GRANT SELECT,INSERT ON mcp_discovery_snapshots TO brokerrouter_mcp_client;
 GRANT SELECT,INSERT ON mcp_discovered_tools TO brokerrouter_mcp_client;
 GRANT SELECT,INSERT ON mcp_discovered_skills TO brokerrouter_mcp_client;
+GRANT SELECT,INSERT ON mcp_skill_get_observations TO brokerrouter_mcp_client;
 GRANT SELECT,INSERT ON mcp_servers TO brokerrouter_mcp_catalog;
 GRANT UPDATE(display_name,transport,endpoint_url,stdio_profile,allow_private,auth_mode,
     credential_ref_kind,credential_ref_ciphertext,oauth_issuer,oauth_resource,oauth_audience,active)
     ON mcp_servers TO brokerrouter_mcp_catalog;
 GRANT SELECT ON mcp_servers TO brokerrouter_mcp_client;
-GRANT SELECT ON mcp_discovery_snapshots,mcp_discovered_tools,mcp_discovered_skills TO brokerrouter_mcp_catalog;
+GRANT SELECT ON mcp_discovery_snapshots,mcp_discovered_tools,mcp_discovered_skills,mcp_skill_get_observations TO brokerrouter_mcp_catalog;
 GRANT SELECT(tenant_id,id,revoked_at,expires_at) ON virtual_keys TO brokerrouter_mcp_catalog;
 GRANT SELECT,INSERT ON mcp_key_tool_grants TO brokerrouter_mcp_catalog;
 GRANT UPDATE(server_config_revision,descriptor_hash,active) ON mcp_key_tool_grants TO brokerrouter_mcp_catalog;

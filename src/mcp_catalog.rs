@@ -136,6 +136,27 @@ pub struct RecordDiscovery {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct RecordSkillGet {
+    pub tenant_id: Uuid,
+    pub server_id: Uuid,
+    pub operation_id: Uuid,
+    pub actor: String,
+    pub expected_server_revision: i64,
+    pub protocol_version: String,
+    pub result_type: String,
+    pub supported_versions: Vec<String>,
+    pub capabilities: Value,
+    pub discovery_ttl_ms: i32,
+    pub discovery_cache_scope: CacheScope,
+    pub requested_uri: String,
+    pub entry: Value,
+    pub skill_ttl_ms: i32,
+    pub skill_cache_scope: CacheScope,
+    pub authorization_context_fingerprint: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetToolGrant {
     pub tenant_id: Uuid,
     pub key_id: Uuid,
@@ -844,6 +865,203 @@ pub async fn discovery_receipt(
     Ok(Some(response))
 }
 
+/// A URI is an upstream protocol identifier, never a URL to fetch directly.
+pub fn validate_skill_lookup_uri(uri: &str) -> Result<()> {
+    if uri.is_empty() || uri.len() > 4096 || uri.chars().any(|c| c.is_control()) {
+        return Err(Error::Invalid("invalid MCP Skill URI"));
+    }
+    let parsed = Url::parse(uri).map_err(|_| Error::Invalid("invalid MCP Skill URI"))?;
+    if parsed.scheme().is_empty()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !parsed.path().ends_with("/SKILL.md")
+    {
+        return Err(Error::Invalid("invalid MCP Skill URI"));
+    }
+    Ok(())
+}
+
+pub fn validate_skill_lookup_request(actor: &str, uri: &str) -> Result<()> {
+    validate_common(actor, None, None)?;
+    validate_skill_lookup_uri(uri)
+}
+
+pub async fn skill_get_receipt(
+    pool: &PgPool,
+    tenant: Uuid,
+    server: Uuid,
+    operation: Uuid,
+    uri: &str,
+) -> Result<Option<Value>> {
+    let row: Option<(String, Value)> = sqlx::query_as(
+        "SELECT m.kind,m.response FROM mcp_catalog_mutations m JOIN tenants t ON t.id=m.tenant_id AND t.active WHERE m.tenant_id=$1 AND m.operation_id=$2",
+    )
+    .bind(tenant)
+    .bind(operation)
+    .fetch_optional(pool)
+    .await?;
+    let Some((kind, response)) = row else {
+        return Ok(None);
+    };
+    if kind != "skill_get_record"
+        || response.get("server_id").and_then(Value::as_str) != Some(&server.to_string())
+        || response.get("uri").and_then(Value::as_str) != Some(uri)
+    {
+        return Err(Error::Conflict);
+    }
+    Ok(Some(response))
+}
+
+pub async fn record_skill_get(pool: &PgPool, input: RecordSkillGet) -> Result<Value> {
+    validate_skill_lookup_request(&input.actor, &input.requested_uri)?;
+    if input.expected_server_revision < 1
+        || input.protocol_version != PROTOCOL_VERSION
+        || input.result_type != "complete"
+        || input.supported_versions.is_empty()
+        || input.supported_versions.len() > 16
+        || !input
+            .supported_versions
+            .iter()
+            .any(|v| v == PROTOCOL_VERSION)
+        || input.supported_versions.iter().any(|v| !valid_text(v, 32))
+        || !(0..=86_400_000).contains(&input.discovery_ttl_ms)
+        || !(0..=86_400_000).contains(&input.skill_ttl_ms)
+    {
+        return Err(Error::Invalid("invalid MCP Skill lookup result"));
+    }
+    let mut versions = HashSet::new();
+    if input
+        .supported_versions
+        .iter()
+        .any(|v| !versions.insert(v.as_str()))
+    {
+        return Err(Error::Invalid("duplicate MCP protocol version"));
+    }
+    bounded_json(&input.capabilities, MAX_CAPABILITIES_BYTES, true)?;
+    bounded_json(&input.entry, MAX_SKILL_ENTRY_BYTES, true)?;
+    if !input
+        .capabilities
+        .get("resources")
+        .is_some_and(Value::is_object)
+        || !input
+            .capabilities
+            .get("extensions")
+            .and_then(Value::as_object)
+            .is_some_and(|extensions| {
+                extensions
+                    .get(SKILLS_EXTENSION)
+                    .is_some_and(Value::is_object)
+            })
+    {
+        return Err(Error::Invalid("MCP Skills capability is not advertised"));
+    }
+    let entry: SkillEntry = serde_json::from_value(input.entry.clone())
+        .map_err(|_| Error::Invalid("invalid MCP Skill entry"))?;
+    let validated = entry
+        .validate_static(input.server_id)
+        .map_err(|_| Error::Invalid("invalid or unsupported MCP Skill manifest"))?;
+    if validated.identity().uri != input.requested_uri {
+        return Err(Error::Invalid("MCP Skill URI mismatch"));
+    }
+    let private = matches!(input.discovery_cache_scope, CacheScope::Private)
+        || matches!(input.skill_cache_scope, CacheScope::Private);
+    match (private, &input.authorization_context_fingerprint) {
+        (true, Some(value)) if valid_fingerprint(value) => {}
+        (false, None) => {}
+        _ => return Err(Error::Invalid("invalid MCP cache authorization context")),
+    }
+    let value = serde_json::to_value(&input)
+        .map_err(|_| Error::Invalid("invalid MCP Skill lookup result"))?;
+    let body_hash = governance::digest(&value)?;
+    let capability_hash = governance::digest(&json!({
+        "supportedVersions":input.supported_versions,
+        "capabilities":input.capabilities,
+    }))?;
+    let mut tx = begin(pool, input.tenant_id, input.operation_id).await?;
+    if let Some(response) =
+        previous(&mut tx, input.tenant_id, input.operation_id, &body_hash).await?
+    {
+        tx.commit().await?;
+        return Ok(response);
+    }
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+        .bind(format!(
+            "mcp-server:{}:{}",
+            input.tenant_id, input.server_id
+        ))
+        .execute(&mut *tx)
+        .await?;
+    let server: Option<(i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT config_revision,coalesce(credential_ref_ciphertext,'') FROM mcp_servers WHERE tenant_id=$1 AND id=$2 AND active",
+    ).bind(input.tenant_id).bind(input.server_id).fetch_optional(&mut *tx).await?;
+    let (revision, credential_envelope) = server.ok_or(Error::NotFound)?;
+    if revision != input.expected_server_revision {
+        return Err(Error::ConfigConflict);
+    }
+    let auth_context = if private {
+        let mut material = Vec::with_capacity(64 + credential_envelope.len());
+        material.extend_from_slice(input.tenant_id.as_bytes());
+        material.extend_from_slice(input.server_id.as_bytes());
+        material.extend_from_slice(&revision.to_be_bytes());
+        material.extend_from_slice(&credential_envelope);
+        material.extend_from_slice(
+            input
+                .authorization_context_fingerprint
+                .as_deref()
+                .expect("validated private cache context")
+                .as_bytes(),
+        );
+        Some(store::hash(&material))
+    } else {
+        None
+    };
+    let id = Uuid::new_v4();
+    let ttl_ms = input.discovery_ttl_ms.min(input.skill_ttl_ms);
+    let effective_scope = if private { "private" } else { "public" };
+    let name = input.entry["frontmatter"]["name"]
+        .as_str()
+        .expect("validated Skill name");
+    let expires_at: DateTime<Utc> = sqlx::query_scalar(
+        "INSERT INTO mcp_skill_get_observations(tenant_id,id,server_id,server_config_revision,operation_id,uri,name,entry,approval_fingerprint,requests_tool_grant,capability_hash,discovery_ttl_ms,skill_ttl_ms,cache_scope,authorization_context_hash,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,clock_timestamp()+($16::bigint*interval '1 millisecond')) RETURNING expires_at",
+    )
+    .bind(input.tenant_id).bind(id).bind(input.server_id).bind(revision).bind(input.operation_id)
+    .bind(&input.requested_uri).bind(name).bind(&input.entry)
+    .bind(validated.approval_fingerprint()).bind(validated.requests_tool_grant())
+    .bind(&capability_hash).bind(input.discovery_ttl_ms).bind(input.skill_ttl_ms)
+    .bind(effective_scope).bind(auth_context).bind(ttl_ms)
+    .fetch_one(&mut *tx).await?;
+    let response = json!({
+        "operation_id":input.operation_id,"observation_id":id,"server_id":input.server_id,
+        "server_revision":revision.to_string(),"uri":input.requested_uri,"name":name,
+        "approval_fingerprint":validated.approval_fingerprint(),
+        "requests_tool_grant":validated.requests_tool_grant(),
+        "capability_hash":governance::hex(&capability_hash),
+        "ttl_ms":ttl_ms,"cache_scope":effective_scope,"expires_at":expires_at,
+        "activation":"disabled_until_approval_and_read_path"
+    });
+    sqlx::query("INSERT INTO audit_events(tenant_id,action,object_id,details) VALUES($1,'mcp.skill_get_recorded',$2,$3)")
+        .bind(input.tenant_id).bind(input.server_id.to_string())
+        .bind(json!({"actor":input.actor,"operation_id":input.operation_id,
+            "observation_id":id,"uri":input.requested_uri,
+            "approval_fingerprint":validated.approval_fingerprint(),
+            "capability_hash":governance::hex(&capability_hash),"cache_scope":effective_scope}))
+        .execute(&mut *tx).await?;
+    receipt(
+        &mut tx,
+        input.tenant_id,
+        input.operation_id,
+        &input.actor,
+        "skill_get_record",
+        body_hash,
+        &response,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(response)
+}
+
 pub async fn record_discovery(pool: &PgPool, input: RecordDiscovery) -> Result<Value> {
     validate_common(&input.actor, None, None)?;
     if input.expected_server_revision < 1
@@ -894,9 +1112,12 @@ pub async fn record_discovery(pool: &PgPool, input: RecordDiscovery) -> Result<V
     {
         return Err(Error::Invalid("invalid MCP server instructions"));
     }
-    match (input.cache_scope, &input.authorization_context_fingerprint) {
-        (CacheScope::Private, Some(value)) if valid_fingerprint(value) => {}
-        (CacheScope::Public, None) => {}
+    let effective_private = matches!(input.cache_scope, CacheScope::Private)
+        || matches!(input.tools_cache_scope, Some(CacheScope::Private))
+        || matches!(input.skills_cache_scope, Some(CacheScope::Private));
+    match (effective_private, &input.authorization_context_fingerprint) {
+        (true, Some(value)) if valid_fingerprint(value) => {}
+        (false, None) => {}
         _ => return Err(Error::Invalid("invalid MCP cache authorization context")),
     }
     let value =
@@ -931,7 +1152,7 @@ pub async fn record_discovery(pool: &PgPool, input: RecordDiscovery) -> Result<V
     if revision != input.expected_server_revision {
         return Err(Error::ConfigConflict);
     }
-    let auth_context = if matches!(input.cache_scope, CacheScope::Private) {
+    let auth_context = if effective_private {
         let mut material = Vec::with_capacity(64 + credential_envelope.len());
         material.extend_from_slice(input.tenant_id.as_bytes());
         material.extend_from_slice(input.server_id.as_bytes());
@@ -948,9 +1169,14 @@ pub async fn record_discovery(pool: &PgPool, input: RecordDiscovery) -> Result<V
     } else {
         None
     };
+    let effective_scope = if effective_private {
+        "private"
+    } else {
+        "public"
+    };
     let id = Uuid::new_v4();
     let snapshot_expires_at:DateTime<Utc>=sqlx::query_scalar("INSERT INTO mcp_discovery_snapshots(tenant_id,id,server_id,server_config_revision,protocol_version,result_type,supported_versions,capabilities,server_info,instructions,capability_hash,ttl_ms,cache_scope,authorization_context_hash,skills_ttl_ms,skills_cache_scope,expires_at) VALUES($1,$2,$3,$4,$5,'complete',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,clock_timestamp()+($11::bigint*interval '1 millisecond')) RETURNING expires_at")
-        .bind(input.tenant_id).bind(id).bind(input.server_id).bind(revision).bind(PROTOCOL_VERSION).bind(json!(input.supported_versions)).bind(&input.capabilities).bind(&input.server_info).bind(&input.instructions).bind(&capability_hash).bind(input.ttl_ms).bind(input.cache_scope.name()).bind(auth_context).bind(input.skills_ttl_ms).bind(input.skills_cache_scope.map(CacheScope::name)).fetch_one(&mut *tx).await?;
+        .bind(input.tenant_id).bind(id).bind(input.server_id).bind(revision).bind(PROTOCOL_VERSION).bind(json!(input.supported_versions)).bind(&input.capabilities).bind(&input.server_info).bind(&input.instructions).bind(&capability_hash).bind(input.ttl_ms).bind(effective_scope).bind(auth_context).bind(input.skills_ttl_ms).bind(input.skills_cache_scope.map(CacheScope::name)).fetch_one(&mut *tx).await?;
     if !tools.is_empty() {
         let tools_ttl_ms = input.tools_ttl_ms.expect("validated tools TTL");
         let tools_expires_at: DateTime<Utc> = sqlx::query_scalar(
@@ -1018,9 +1244,9 @@ pub async fn record_discovery(pool: &PgPool, input: RecordDiscovery) -> Result<V
         });
         query.build().execute(&mut *tx).await?;
     }
-    let response = json!({"operation_id":input.operation_id,"snapshot_id":id,"server_id":input.server_id,"server_revision":revision.to_string(),"protocol_version":PROTOCOL_VERSION,"capability_hash":governance::hex(&capability_hash),"tool_catalog_hash":governance::hex(&tool_catalog_hash),"tool_count":tools.len(),"skill_catalog_hash":governance::hex(&skill_catalog_hash),"skill_count":skills.len(),"ttl_ms":input.ttl_ms,"cache_scope":input.cache_scope.name()});
+    let response = json!({"operation_id":input.operation_id,"snapshot_id":id,"server_id":input.server_id,"server_revision":revision.to_string(),"protocol_version":PROTOCOL_VERSION,"capability_hash":governance::hex(&capability_hash),"tool_catalog_hash":governance::hex(&tool_catalog_hash),"tool_count":tools.len(),"skill_catalog_hash":governance::hex(&skill_catalog_hash),"skill_count":skills.len(),"ttl_ms":input.ttl_ms,"cache_scope":effective_scope});
     sqlx::query("INSERT INTO audit_events(tenant_id,action,object_id,details) VALUES($1,'mcp.discovery_recorded',$2,$3)")
-        .bind(input.tenant_id).bind(input.server_id.to_string()).bind(json!({"actor":input.actor,"operation_id":input.operation_id,"snapshot_id":id,"server_revision":revision.to_string(),"protocol_version":PROTOCOL_VERSION,"capability_hash":governance::hex(&capability_hash),"tool_catalog_hash":governance::hex(&tool_catalog_hash),"tool_count":tools.len(),"skill_catalog_hash":governance::hex(&skill_catalog_hash),"skill_count":skills.len(),"ttl_ms":input.ttl_ms,"cache_scope":input.cache_scope.name()})).execute(&mut *tx).await?;
+        .bind(input.tenant_id).bind(input.server_id.to_string()).bind(json!({"actor":input.actor,"operation_id":input.operation_id,"snapshot_id":id,"server_revision":revision.to_string(),"protocol_version":PROTOCOL_VERSION,"capability_hash":governance::hex(&capability_hash),"tool_catalog_hash":governance::hex(&tool_catalog_hash),"tool_count":tools.len(),"skill_catalog_hash":governance::hex(&skill_catalog_hash),"skill_count":skills.len(),"ttl_ms":input.ttl_ms,"cache_scope":effective_scope})).execute(&mut *tx).await?;
     receipt(
         &mut tx,
         input.tenant_id,
@@ -1120,6 +1346,48 @@ pub async fn review_skills(pool: &PgPool, tenant: Uuid, server: Uuid) -> Result<
     Ok(
         json!({"server_id":server,"snapshot_id":snapshot_id,"server_revision":revision.to_string(),"skills":skills}),
     )
+}
+
+/// Operator-only view of a fresh direct lookup; never exposed by the MCP server.
+pub async fn review_skill_get(
+    pool: &PgPool,
+    tenant: Uuid,
+    server: Uuid,
+    uri: &str,
+) -> Result<Value> {
+    validate_skill_lookup_uri(uri)?;
+    type Row = (
+        Uuid,
+        i64,
+        String,
+        Value,
+        String,
+        bool,
+        Vec<u8>,
+        String,
+        DateTime<Utc>,
+    );
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT o.id,o.server_config_revision,o.name,o.entry,o.approval_fingerprint,o.requests_tool_grant,o.capability_hash,o.cache_scope,o.expires_at FROM mcp_servers s JOIN tenants t ON t.id=s.tenant_id AND t.active JOIN LATERAL(SELECT * FROM mcp_skill_get_observations o WHERE o.tenant_id=s.tenant_id AND o.server_id=s.id AND o.server_config_revision=s.config_revision AND o.uri=$3 ORDER BY o.observed_at DESC,o.id DESC LIMIT 1)o ON true WHERE s.tenant_id=$1 AND s.id=$2 AND s.active AND o.expires_at>clock_timestamp()",
+    ).bind(tenant).bind(server).bind(uri).fetch_optional(pool).await?;
+    let (
+        id,
+        revision,
+        name,
+        entry,
+        fingerprint,
+        requests_tool_grant,
+        capability_hash,
+        scope,
+        expires_at,
+    ) = row.ok_or(Error::NotFound)?;
+    Ok(json!({
+        "server_id":server,"observation_id":id,"server_revision":revision.to_string(),
+        "uri":uri,"name":name,"entry":entry,"approval_fingerprint":fingerprint,
+        "requests_tool_grant":requests_tool_grant,"capability_hash":governance::hex(&capability_hash),
+        "cache_scope":scope,"expires_at":expires_at,
+        "activation":"disabled_until_approval_and_read_path"
+    }))
 }
 
 pub async fn set_tool_grant(pool: &PgPool, input: SetToolGrant) -> Result<Value> {
@@ -1270,7 +1538,7 @@ pub async fn authorized_tools(
         Value,
         DateTime<Utc>,
     );
-    let rows:Vec<Row>=sqlx::query_as("SELECT s.id,d.server_config_revision,d.id,t.upstream_name,t.downstream_name,t.descriptor_hash,t.descriptor,t.expires_at FROM virtual_keys k JOIN tenants x ON x.id=k.tenant_id AND x.active JOIN mcp_servers s ON s.tenant_id=k.tenant_id AND s.active JOIN LATERAL(SELECT d.id,d.server_config_revision FROM mcp_discovery_snapshots d WHERE d.tenant_id=s.tenant_id AND d.server_id=s.id AND d.server_config_revision=s.config_revision AND d.expires_at>clock_timestamp() ORDER BY d.observed_at DESC,d.id DESC LIMIT 1)d ON true JOIN mcp_discovered_tools t ON t.tenant_id=s.tenant_id AND t.discovery_snapshot_id=d.id AND t.server_id=s.id AND t.expires_at>clock_timestamp() JOIN mcp_key_tool_grants g ON g.tenant_id=t.tenant_id AND g.key_id=k.id AND g.server_id=t.server_id AND g.server_config_revision=d.server_config_revision AND g.upstream_name=t.upstream_name AND g.descriptor_hash=t.descriptor_hash AND g.active WHERE k.tenant_id=$1 AND k.id=$2 AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>clock_timestamp()) AND ($3::text IS NULL OR t.downstream_name>$3) ORDER BY t.downstream_name LIMIT $4")
+    let rows:Vec<Row>=sqlx::query_as("SELECT s.id,d.server_config_revision,d.id,t.upstream_name,t.downstream_name,t.descriptor_hash,t.descriptor,t.expires_at FROM virtual_keys k JOIN tenants x ON x.id=k.tenant_id AND x.active JOIN mcp_servers s ON s.tenant_id=k.tenant_id AND s.active JOIN LATERAL(SELECT d.id,d.server_config_revision,d.authorization_context_hash FROM mcp_discovery_snapshots d WHERE d.tenant_id=s.tenant_id AND d.server_id=s.id AND d.server_config_revision=s.config_revision AND d.expires_at>clock_timestamp() ORDER BY d.observed_at DESC,d.id DESC LIMIT 1)d ON true JOIN mcp_discovered_tools t ON t.tenant_id=s.tenant_id AND t.discovery_snapshot_id=d.id AND t.server_id=s.id AND t.expires_at>clock_timestamp() JOIN mcp_key_tool_grants g ON g.tenant_id=t.tenant_id AND g.key_id=k.id AND g.server_id=t.server_id AND g.server_config_revision=d.server_config_revision AND g.upstream_name=t.upstream_name AND g.descriptor_hash=t.descriptor_hash AND g.active WHERE k.tenant_id=$1 AND k.id=$2 AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>clock_timestamp()) AND (t.cache_scope='public' OR d.authorization_context_hash IS NOT NULL) AND ($3::text IS NULL OR t.downstream_name>$3) ORDER BY t.downstream_name LIMIT $4")
         .bind(who.tenant_id).bind(who.key_id).bind(after).bind(limit).fetch_all(pool).await?;
     Ok(rows
         .into_iter()
@@ -1316,7 +1584,7 @@ pub async fn authorized_tool(
         Value,
         DateTime<Utc>,
     );
-    let row:Option<Row>=sqlx::query_as("SELECT s.id,d.server_config_revision,d.id,t.upstream_name,t.downstream_name,t.descriptor_hash,t.descriptor,t.expires_at FROM virtual_keys k JOIN tenants x ON x.id=k.tenant_id AND x.active JOIN mcp_servers s ON s.tenant_id=k.tenant_id AND s.active JOIN LATERAL(SELECT d.id,d.server_config_revision FROM mcp_discovery_snapshots d WHERE d.tenant_id=s.tenant_id AND d.server_id=s.id AND d.server_config_revision=s.config_revision AND d.expires_at>clock_timestamp() ORDER BY d.observed_at DESC,d.id DESC LIMIT 1)d ON true JOIN mcp_discovered_tools t ON t.tenant_id=s.tenant_id AND t.discovery_snapshot_id=d.id AND t.server_id=s.id AND t.expires_at>clock_timestamp() JOIN mcp_key_tool_grants g ON g.tenant_id=t.tenant_id AND g.key_id=k.id AND g.server_id=t.server_id AND g.server_config_revision=d.server_config_revision AND g.upstream_name=t.upstream_name AND g.descriptor_hash=t.descriptor_hash AND g.active WHERE k.tenant_id=$1 AND k.id=$2 AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>clock_timestamp()) AND t.downstream_name=$3")
+    let row:Option<Row>=sqlx::query_as("SELECT s.id,d.server_config_revision,d.id,t.upstream_name,t.downstream_name,t.descriptor_hash,t.descriptor,t.expires_at FROM virtual_keys k JOIN tenants x ON x.id=k.tenant_id AND x.active JOIN mcp_servers s ON s.tenant_id=k.tenant_id AND s.active JOIN LATERAL(SELECT d.id,d.server_config_revision,d.authorization_context_hash FROM mcp_discovery_snapshots d WHERE d.tenant_id=s.tenant_id AND d.server_id=s.id AND d.server_config_revision=s.config_revision AND d.expires_at>clock_timestamp() ORDER BY d.observed_at DESC,d.id DESC LIMIT 1)d ON true JOIN mcp_discovered_tools t ON t.tenant_id=s.tenant_id AND t.discovery_snapshot_id=d.id AND t.server_id=s.id AND t.expires_at>clock_timestamp() JOIN mcp_key_tool_grants g ON g.tenant_id=t.tenant_id AND g.key_id=k.id AND g.server_id=t.server_id AND g.server_config_revision=d.server_config_revision AND g.upstream_name=t.upstream_name AND g.descriptor_hash=t.descriptor_hash AND g.active WHERE k.tenant_id=$1 AND k.id=$2 AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>clock_timestamp()) AND (t.cache_scope='public' OR d.authorization_context_hash IS NOT NULL) AND t.downstream_name=$3")
         .bind(who.tenant_id).bind(who.key_id).bind(name).fetch_optional(pool).await?;
     Ok(row.map(
         |(

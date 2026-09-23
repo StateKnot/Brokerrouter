@@ -12,7 +12,7 @@ use crate::{
     error::Error as GatewayError,
     governance,
     mcp::{SKILLS_EXTENSION, SkillEntry},
-    mcp_catalog::{self, ConnectorServer, CredentialReference, RecordDiscovery},
+    mcp_catalog::{self, ConnectorServer, CredentialReference, RecordDiscovery, RecordSkillGet},
 };
 use futures_util::{StreamExt, stream::BoxStream};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
@@ -84,6 +84,23 @@ struct WireDiscovery {
     skills: Vec<SkillEntry>,
     skills_ttl_ms: Option<u64>,
     skills_cache_scope: Option<RmcpCacheScope>,
+    direct_skill: Option<WireSkillGet>,
+}
+
+#[derive(Debug)]
+struct WireSkillGet {
+    entry: SkillEntry,
+    ttl_ms: u64,
+    cache_scope: RmcpCacheScope,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillGetResult {
+    result_type: String,
+    skill: SkillEntry,
+    ttl_ms: u64,
+    cache_scope: RmcpCacheScope,
 }
 
 #[derive(Deserialize)]
@@ -1165,10 +1182,69 @@ async fn discover_skills(
     Err(DiscoveryError::Protocol)
 }
 
+async fn get_skill(
+    peer: &Peer<RoleClient>,
+    discovery: &DiscoverResult,
+    uri: &str,
+    timeout: Duration,
+) -> Result<WireSkillGet, DiscoveryError> {
+    if discovery.capabilities.resources.is_none()
+        || !discovery
+            .capabilities
+            .extensions
+            .as_ref()
+            .is_some_and(|extensions| extensions.contains_key(SKILLS_EXTENSION))
+    {
+        return Err(DiscoveryError::Protocol);
+    }
+    let config = client_config();
+    let mut request = CustomRequest::new("skills/get", Some(json!({"uri":uri})));
+    request
+        .extensions
+        .insert(RequestMetaObject::with_client_context(
+            ProtocolVersion::V_2026_07_28,
+            config.client_info,
+            config.capabilities,
+        ));
+    let response = tokio::time::timeout(
+        timeout,
+        peer.send_request(ClientRequest::CustomRequest(request)),
+    )
+    .await
+    .map_err(|_| DiscoveryError::Protocol)?
+    .map_err(|_| DiscoveryError::Protocol)?;
+    let ServerResult::CustomResult(response) = response else {
+        return Err(DiscoveryError::Protocol);
+    };
+    let result: SkillGetResult =
+        serde_json::from_value(response.0).map_err(|_| DiscoveryError::Protocol)?;
+    if result.result_type != "complete" || result.skill.uri != uri || result.ttl_ms > 86_400_000 {
+        return Err(DiscoveryError::Protocol);
+    }
+    Ok(WireSkillGet {
+        entry: result.skill,
+        ttl_ms: result.ttl_ms,
+        cache_scope: result.cache_scope,
+    })
+}
+
+#[cfg(test)]
 async fn discover_wire<C>(
     client: C,
     endpoint: &str,
     auth_header: Option<String>,
+) -> Result<WireDiscovery, DiscoveryError>
+where
+    C: StreamableHttpClient + Sync,
+{
+    observe_wire(client, endpoint, auth_header, None).await
+}
+
+async fn observe_wire<C>(
+    client: C,
+    endpoint: &str,
+    auth_header: Option<String>,
+    requested_skill: Option<&str>,
 ) -> Result<WireDiscovery, DiscoveryError>
 where
     C: StreamableHttpClient + Sync,
@@ -1208,10 +1284,32 @@ where
         .await
         .map_err(|_| DiscoveryError::Protocol)?
         .map_err(|_| DiscoveryError::Protocol)?;
-    let (tools, tools_ttl_ms, tools_cache_scope) =
-        discover_tools(running.peer(), &result, DISCOVERY_TIMEOUT).await?;
-    let (skills, skills_ttl_ms, skills_cache_scope) =
-        discover_skills(running.peer(), &result, DISCOVERY_TIMEOUT).await?;
+    let (
+        tools,
+        tools_ttl_ms,
+        tools_cache_scope,
+        skills,
+        skills_ttl_ms,
+        skills_cache_scope,
+        direct_skill,
+    ) = if let Some(uri) = requested_skill {
+        let skill = get_skill(running.peer(), &result, uri, DISCOVERY_TIMEOUT).await?;
+        (Vec::new(), None, None, Vec::new(), None, None, Some(skill))
+    } else {
+        let (tools, tools_ttl_ms, tools_cache_scope) =
+            discover_tools(running.peer(), &result, DISCOVERY_TIMEOUT).await?;
+        let (skills, skills_ttl_ms, skills_cache_scope) =
+            discover_skills(running.peer(), &result, DISCOVERY_TIMEOUT).await?;
+        (
+            tools,
+            tools_ttl_ms,
+            tools_cache_scope,
+            skills,
+            skills_ttl_ms,
+            skills_cache_scope,
+            None,
+        )
+    };
     let _ = running.close_with_timeout(SHUTDOWN_TIMEOUT).await;
     Ok(WireDiscovery {
         result,
@@ -1221,11 +1319,20 @@ where
         skills,
         skills_ttl_ms,
         skills_cache_scope,
+        direct_skill,
     })
 }
 
+#[cfg(test)]
 async fn discover_stdio_wire(
     profile: &StdioLauncherProfile,
+) -> Result<(WireDiscovery, String), DiscoveryError> {
+    observe_stdio_wire(profile, None).await
+}
+
+async fn observe_stdio_wire(
+    profile: &StdioLauncherProfile,
+    requested_skill: Option<&str>,
 ) -> Result<(WireDiscovery, String), DiscoveryError> {
     let environment = resolve_stdio_environment(profile)?;
     let mut command = tokio::process::Command::new(&profile.program);
@@ -1267,10 +1374,32 @@ async fn discover_stdio_wire(
         .await
         .map_err(|_| DiscoveryError::Protocol)?
         .map_err(|_| DiscoveryError::Protocol)?;
-    let (tools, tools_ttl_ms, tools_cache_scope) =
-        discover_tools(running.peer(), &result, timeout).await?;
-    let (skills, skills_ttl_ms, skills_cache_scope) =
-        discover_skills(running.peer(), &result, timeout).await?;
+    let (
+        tools,
+        tools_ttl_ms,
+        tools_cache_scope,
+        skills,
+        skills_ttl_ms,
+        skills_cache_scope,
+        direct_skill,
+    ) = if let Some(uri) = requested_skill {
+        let skill = get_skill(running.peer(), &result, uri, timeout).await?;
+        (Vec::new(), None, None, Vec::new(), None, None, Some(skill))
+    } else {
+        let (tools, tools_ttl_ms, tools_cache_scope) =
+            discover_tools(running.peer(), &result, timeout).await?;
+        let (skills, skills_ttl_ms, skills_cache_scope) =
+            discover_skills(running.peer(), &result, timeout).await?;
+        (
+            tools,
+            tools_ttl_ms,
+            tools_cache_scope,
+            skills,
+            skills_ttl_ms,
+            skills_cache_scope,
+            None,
+        )
+    };
     let _ = running.close_with_timeout(SHUTDOWN_TIMEOUT).await;
     Ok((
         WireDiscovery {
@@ -1281,6 +1410,7 @@ async fn discover_stdio_wire(
             skills,
             skills_ttl_ms,
             skills_cache_scope,
+            direct_skill,
         },
         environment.fingerprint,
     ))
@@ -1596,6 +1726,7 @@ fn discovery_record(
         skills,
         skills_ttl_ms,
         skills_cache_scope,
+        direct_skill: _,
     } = observed;
     let ttl_ms = i32::try_from(result.ttl_ms).map_err(|_| DiscoveryError::Protocol)?;
     let server_info = result
@@ -1660,8 +1791,17 @@ fn discovery_record(
                 _ => Err(DiscoveryError::Protocol),
             })
             .transpose()?,
-        authorization_context_fingerprint: matches!(cache_scope, mcp_catalog::CacheScope::Private)
-            .then_some(fingerprint),
+        authorization_context_fingerprint: (matches!(
+            cache_scope,
+            mcp_catalog::CacheScope::Private
+        ) || matches!(
+            tools_cache_scope,
+            Some(RmcpCacheScope::Private)
+        ) || matches!(
+            skills_cache_scope,
+            Some(RmcpCacheScope::Private)
+        ))
+        .then_some(fingerprint),
     })
 }
 
@@ -1678,8 +1818,30 @@ pub async fn discover_and_record(
     {
         return Ok(receipt);
     }
-    let server =
-        mcp_catalog::connector_server(pool, cipher, input.tenant_id, input.server_id).await?;
+    let (server, result, fingerprint) = observe_server(
+        pool,
+        cipher,
+        resolver,
+        input.tenant_id,
+        input.server_id,
+        None,
+    )
+    .await?;
+    let record = discovery_record(&input, &server, result, fingerprint)?;
+    mcp_catalog::record_discovery(pool, record)
+        .await
+        .map_err(DiscoveryError::Catalog)
+}
+
+async fn observe_server(
+    pool: &PgPool,
+    cipher: &ResultCipher,
+    resolver: &InjectedCredentialResolver,
+    tenant_id: Uuid,
+    server_id: Uuid,
+    requested_skill: Option<&str>,
+) -> Result<(ConnectorServer, WireDiscovery, String), DiscoveryError> {
+    let server = mcp_catalog::connector_server(pool, cipher, tenant_id, server_id).await?;
     if server.transport == "stdio" {
         if server.auth_mode != "none"
             || server.credential_reference.is_some()
@@ -1694,11 +1856,8 @@ pub async fn discover_and_record(
                 .ok_or(DiscoveryError::UnsupportedTransport)?,
             None,
         )?;
-        let (result, fingerprint) = discover_stdio_wire(&profile).await?;
-        let record = discovery_record(&input, &server, result, fingerprint)?;
-        return mcp_catalog::record_discovery(pool, record)
-            .await
-            .map_err(DiscoveryError::Catalog);
+        let (result, fingerprint) = observe_stdio_wire(&profile, requested_skill).await?;
+        return Ok((server, result, fingerprint));
     }
     if server.transport != "streamable_http" || server.stdio_profile.is_some() {
         return Err(DiscoveryError::UnsupportedTransport);
@@ -1725,7 +1884,10 @@ pub async fn discover_and_record(
     let (result, fingerprint) = match server.auth_mode.as_str() {
         "none" if server.credential_reference.is_none() => {
             let fingerprint = authorization_fingerprint(&[b"none", &tls.trust_fingerprint]);
-            (discover_wire(http, endpoint, None).await?, fingerprint)
+            (
+                observe_wire(http, endpoint, None, requested_skill).await?,
+                fingerprint,
+            )
         }
         "bearer" => {
             let reference = server
@@ -1736,7 +1898,7 @@ pub async fn discover_and_record(
             let fingerprint =
                 authorization_fingerprint(&[b"bearer", &tls.trust_fingerprint, token.as_bytes()]);
             (
-                discover_wire(http, endpoint, Some(token.to_string())).await?,
+                observe_wire(http, endpoint, Some(token.to_string()), requested_skill).await?,
                 fingerprint,
             )
         }
@@ -1815,16 +1977,98 @@ pub async fn discover_and_record(
             ]);
             let auth_client = AuthClient::new(http, manager);
             (
-                discover_wire(auth_client, endpoint, None).await?,
+                observe_wire(auth_client, endpoint, None, requested_skill).await?,
                 fingerprint,
             )
         }
         _ => return Err(DiscoveryError::InvalidCredential),
     };
-    let record = discovery_record(&input, &server, result, fingerprint)?;
-    mcp_catalog::record_discovery(pool, record)
+    Ok((server, result, fingerprint))
+}
+
+/// Fetch only Skill metadata. This never reads resources or enables activation.
+pub async fn get_skill_and_record(
+    pool: &PgPool,
+    cipher: &ResultCipher,
+    resolver: &InjectedCredentialResolver,
+    input: GetSkill,
+) -> Result<Value, DiscoveryError> {
+    mcp_catalog::validate_skill_lookup_request(&input.actor, &input.uri)?;
+    if let Some(receipt) = mcp_catalog::skill_get_receipt(
+        pool,
+        input.tenant_id,
+        input.server_id,
+        input.operation_id,
+        &input.uri,
+    )
+    .await?
+    {
+        return Ok(receipt);
+    }
+    let (server, observed, fingerprint) = observe_server(
+        pool,
+        cipher,
+        resolver,
+        input.tenant_id,
+        input.server_id,
+        Some(&input.uri),
+    )
+    .await?;
+    let skill = observed.direct_skill.ok_or(DiscoveryError::Protocol)?;
+    let discovery_scope = match observed.result.cache_scope {
+        RmcpCacheScope::Private => mcp_catalog::CacheScope::Private,
+        RmcpCacheScope::Public => mcp_catalog::CacheScope::Public,
+        _ => return Err(DiscoveryError::Protocol),
+    };
+    let skill_scope = match skill.cache_scope {
+        RmcpCacheScope::Private => mcp_catalog::CacheScope::Private,
+        RmcpCacheScope::Public => mcp_catalog::CacheScope::Public,
+        _ => return Err(DiscoveryError::Protocol),
+    };
+    let record = RecordSkillGet {
+        tenant_id: input.tenant_id,
+        server_id: input.server_id,
+        operation_id: input.operation_id,
+        actor: input.actor,
+        expected_server_revision: server.config_revision,
+        protocol_version: mcp_catalog::PROTOCOL_VERSION.into(),
+        result_type: observed.result.result_type.as_str().into(),
+        supported_versions: observed
+            .result
+            .supported_versions
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        capabilities: serde_json::to_value(&observed.result.capabilities)
+            .map_err(|_| DiscoveryError::Protocol)?,
+        discovery_ttl_ms: i32::try_from(observed.result.ttl_ms)
+            .map_err(|_| DiscoveryError::Protocol)?,
+        discovery_cache_scope: discovery_scope,
+        requested_uri: input.uri,
+        entry: serde_json::to_value(skill.entry).map_err(|_| DiscoveryError::Protocol)?,
+        skill_ttl_ms: i32::try_from(skill.ttl_ms).map_err(|_| DiscoveryError::Protocol)?,
+        skill_cache_scope: skill_scope,
+        authorization_context_fingerprint: (matches!(
+            discovery_scope,
+            mcp_catalog::CacheScope::Private
+        ) || matches!(
+            skill_scope,
+            mcp_catalog::CacheScope::Private
+        ))
+        .then_some(fingerprint),
+    };
+    mcp_catalog::record_skill_get(pool, record)
         .await
         .map_err(DiscoveryError::Catalog)
+}
+
+#[derive(Clone, Debug)]
+pub struct GetSkill {
+    pub tenant_id: Uuid,
+    pub server_id: Uuid,
+    pub operation_id: Uuid,
+    pub actor: String,
+    pub uri: String,
 }
 
 #[cfg(test)]
@@ -1895,6 +2139,15 @@ mod tests {
                 result["nextCursor"] = json!("page-2");
             }
             result
+        } else if method == "skills/get" {
+            let uri = request["params"]["uri"].as_str().unwrap();
+            json!({
+                "resultType":"complete",
+                "skill":{"uri":uri,"frontmatter":{"name":"hidden","description":"Direct lookup only"},
+                    "resources":[{"uri":uri,"digest":format!("sha256:{}", "b".repeat(64)),"size":35}]},
+                "ttlMs":12_000,
+                "cacheScope":"private"
+            })
         } else {
             let mut capabilities = json!({"tools":{"listChanged":true}});
             if state.skills {
@@ -2178,6 +2431,44 @@ done"#,
             requests
                 .iter()
                 .all(|request| request["method"] != "resources/read")
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_skill_lookup_does_not_depend_on_listing_or_prefetch_content() {
+        let (endpoint, fixture, server) = fixture_endpoint_with_skills(false, true).await;
+        let client = BoundedMcpHttpClient {
+            inner: Client::new(),
+            max_response_bytes: MAX_DISCOVERY_RESPONSE_BYTES,
+        };
+        let uri = "skill://hidden/SKILL.md";
+        let result = observe_wire(client, &endpoint, Some("fixture-token".into()), Some(uri))
+            .await
+            .unwrap();
+        server.abort();
+        let skill = result.direct_skill.unwrap();
+        assert_eq!(skill.entry.uri, uri);
+        assert_eq!(skill.ttl_ms, 12_000);
+        assert_eq!(skill.cache_scope, RmcpCacheScope::Private);
+        let requests = fixture.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r["method"] == "skills/get")
+                .count(),
+            1
+        );
+        assert!(requests.iter().all(|r| r["method"] != "skills/list"
+            && r["method"] != "tools/list"
+            && r["method"] != "resources/read"));
+        let get = requests
+            .iter()
+            .find(|r| r["method"] == "skills/get")
+            .unwrap();
+        assert_eq!(get["params"]["uri"], uri);
+        assert_eq!(
+            get["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+            mcp_catalog::PROTOCOL_VERSION
         );
     }
 
