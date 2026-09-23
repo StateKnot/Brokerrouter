@@ -32,4 +32,4 @@ brokerrouter --database-url "$MCP_CATALOG_DATABASE_URL" mcp-skill-get-review \
 
 ## 后续发布闸门
 
-M6.2c2b 仍需真人持久审批（人、租户、服务器版本、来源授权上下文、完整 manifest 及撤销）、按需 `resources/read` 字节级校验与不可变隔离缓存；M6.2d 才处理 MRTR 和 Hermes/Claw 原生暂停恢复。上述能力和正式一致性/预生产认证未完成前，不宣称 Skills 可供智能体执行。
+M6.2c2b 的真人持久审批已见 [Skill 审批契约](m6-mcp-skill-approval.md)。按需 `resources/read` 字节级校验与不可变隔离缓存仍待 M6.2c2c；M6.2d 才处理 MRTR 和 Hermes/Claw 原生暂停恢复。上述能力和正式一致性/预生产认证未完成前，不宣称 Skills 可供智能体执行。

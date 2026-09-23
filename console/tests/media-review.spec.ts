@@ -238,6 +238,11 @@ test("isolated MP4 requires real decode and explicit review before separate doub
     remote.every((r) => r.cookie === undefined && r.referer === undefined),
   ).toBe(true);
   await confirm.click();
+  // The completion response replaces the reviewed receipt and remounts the
+  // decision form. Do not select while that network transition is in flight.
+  await expect(
+    page.getByText("媒体审阅已记录；尚未提交审批决定，请在下方选择意见。"),
+  ).toBeVisible();
   await expect(page.getByRole("combobox", { name: "审批意见" })).toBeEnabled();
   expect(f.counts()).toEqual({ chunks: 1, completions: 1, decisions: 0 });
   await page

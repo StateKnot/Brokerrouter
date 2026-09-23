@@ -12,6 +12,7 @@ import {
 import type { Decision, Review } from "./approval-contracts";
 import { time } from "./format";
 import MediaReview from "./MediaReview";
+import SkillApprovals from "./SkillApprovals";
 
 export default function Approvals({
   denied,
@@ -20,6 +21,52 @@ export default function Approvals({
   denied: Denied;
   previewOrigin: string | null;
 }) {
+  const [kind, setKind] = useState<"guardrail" | "skill">("guardrail");
+  const [locked, setLocked] = useState(false);
+  return (
+    <>
+      <div className="tabs" role="tablist" aria-label="审批类型">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={kind === "guardrail"}
+          disabled={locked}
+          onClick={() => setKind("guardrail")}
+        >
+          护栏审批
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={kind === "skill"}
+          disabled={locked}
+          onClick={() => setKind("skill")}
+        >
+          Skill 审批
+        </button>
+      </div>
+      {kind === "guardrail" ? (
+        <GuardrailApprovals
+          denied={denied}
+          previewOrigin={previewOrigin}
+          onFrozenChange={setLocked}
+        />
+      ) : (
+        <SkillApprovals denied={denied} onFrozenChange={setLocked} />
+      )}
+    </>
+  );
+}
+
+function GuardrailApprovals({
+  denied,
+  previewOrigin,
+  onFrozenChange,
+}: {
+  denied: Denied;
+  previewOrigin: string | null;
+  onFrozenChange: (value: boolean) => void;
+}) {
   const [query, setQuery] = useState<Record<string, unknown>>({
     limit: 20,
     pending_only: true,
@@ -27,6 +74,7 @@ export default function Approvals({
   const [epoch, setEpoch] = useState(0);
   const [review, setReview] = useState<Review | null>(null);
   const [frozen, setFrozen] = useState<Decision | null>(null);
+  useEffect(() => onFrozenChange(frozen !== null), [frozen, onFrozenChange]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
   const [notice, setNotice] = useState("");

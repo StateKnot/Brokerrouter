@@ -3,7 +3,7 @@ use crate::{
     cipher::ResultCipher,
     error::{Error, Result},
     gateway::Gateway,
-    governance, human,
+    governance, human, mcp_skill_approvals,
 };
 use axum::{
     Json, Router,
@@ -29,7 +29,29 @@ pub fn runtime_routes(gateway: Gateway) -> Router {
         .route("/v1/governance/turns/{id}/events", get(events))
         .route("/v1/governance/turns/{id}/ack", post(ack))
         .route("/v1/governance/turns/{id}/close", post(runtime_close))
+        .route("/v1/governance/skills/requests", post(skill_request))
+        .route("/v1/governance/skills/requests/{id}", get(skill_status))
         .with_state(gateway)
+}
+async fn skill_request(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Json(body): Json<mcp_skill_approvals::Request>,
+) -> Result<Json<Value>> {
+    let who = api::identity(&g.pool, &headers).await?;
+    Ok(Json(
+        mcp_skill_approvals::request(&g.pool, &who, body).await?,
+    ))
+}
+async fn skill_status(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>> {
+    let who = api::identity(&g.pool, &headers).await?;
+    Ok(Json(
+        mcp_skill_approvals::status(&g.pool, &g.cipher, &who, id).await?,
+    ))
 }
 async fn check(
     State(g): State<Gateway>,

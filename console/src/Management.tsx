@@ -26,6 +26,7 @@ export const PendingConfig = createContext<{
 }>({ owner: null, setOwner: () => {} });
 type QueryPath =
   | "approvals/query"
+  | "approvals/skills/query"
   | "audit/query"
   | "governance/monitor/query"
   | "traces/turns/query"
