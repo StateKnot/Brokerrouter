@@ -407,3 +407,11 @@ OAuth client credentials 配置固定 issuer/resource/audience 且 audience 必�
 本地最终 `cargo fmt --check`、Clippy `-D warnings`、release 构建和 Rust 常规全量 **241 项通过、0 失败**；4 项既有隔离 S3/ClamAV/FFmpeg 专项按本地闸门 ignored，正式 CI 必须单独执行。没有连接付费供应商或产生模型费用。
 
 当前只在上游返回完整结果时释放；`input_required` 和 task 响应保留加密事实但**不伪装成可恢复的成功调用**。M6.2d 仍需 MRTR/task 持久恢复、Hermes/OpenClaw MCP 原生暂停恢复、真实 HTTPS/OAuth 与官方 conformance。未在既有生产站点启用 MCP 工具执行，也未产生付费供应商调用。
+
+## M6.2c1：Skills 元数据发现与不可变目录（2026-09-23）
+
+完成 [Skills 元数据目录契约](m6-mcp-skill-catalog.md)：只有上游同时声明 Resources 与 Skills 扩展时，受管 client 才以完整逐请求 `_meta` 进行分页 `skills/list`；限制页数、游标、条目数量和元数据字节，要求 `resultType=complete`，并严格拒绝动态或不完整静态 manifest。没有提前读取任何 Skill 文件。
+
+0025 迁移将每个条目、宿主来源身份、完整资源集合批准指纹、列表 TTL/cacheScope 与当前发现快照同事务保存；新旧快照互不改写。操作员可用 `mcp-skills-list` 复核元数据和名称碰撞；MCP server/虚拟密钥无表读取权限，也没有 Skill 激活入口。测试覆盖真实 TCP 分页 wire、无预取、manifest 变化、重复 URI、动态 Skill 拒绝、不可变性、租户隔离和实际数据库角色。
+
+本地常规 Rust 全量 **243 项通过、0 失败，4 项既有 S3/固定 ClamAV/FFmpeg 环境专项 ignored**。M6.2c2 仍需 `skills/get`、真人持久审批、按需 `resources/read`/字节校验和隔离缓存；M6.2d 仍需 MRTR、Runtime 恢复及正式一致性认证。此包只提供可部署的发现目录，不宣称 Skills 已可调用。

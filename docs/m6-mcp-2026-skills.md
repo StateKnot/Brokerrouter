@@ -1,6 +1,6 @@
 # MCP 2026-07-28 与 Skills 接入契约
 
-状态：2026-09-23 已完成 M6.2a 安全契约、[M6.2b1 连接目录](m6-mcp-connection-catalog.md)、[M6.2b2a HTTP 上游发现](m6-mcp-http-discovery.md)、[M6.2b2b1 受管 stdio](m6-mcp-stdio-discovery.md)、[M6.2b2b2a 下游目录](m6-mcp-downstream-catalog.md)、[M6.2b2b2b OAuth 资源认证](m6-mcp-oauth-resource.md)和 [M6.2b2c 持久治理工具调用](m6-mcp-governed-tool-calls.md)。`POST /mcp` 已开放受保护目录与单次审批后 `tools/call`；MRTR、Skill wire、Hermes/OpenClaw 恢复及官方认证仍未完成，因此不宣称完整 MCP/Skills 兼容。
+状态：2026-09-23 已完成 M6.2a 安全契约、[M6.2b1 连接目录](m6-mcp-connection-catalog.md)、[M6.2b2a HTTP 上游发现](m6-mcp-http-discovery.md)、[M6.2b2b1 受管 stdio](m6-mcp-stdio-discovery.md)、[M6.2b2b2a 下游目录](m6-mcp-downstream-catalog.md)、[M6.2b2b2b OAuth 资源认证](m6-mcp-oauth-resource.md)、[M6.2b2c 持久治理工具调用](m6-mcp-governed-tool-calls.md)和 [M6.2c1 Skill 元数据目录](m6-mcp-skill-catalog.md)。`POST /mcp` 已开放受保护目录与单次审批后 `tools/call`；MRTR、Skill 激活/内容读取、Hermes/OpenClaw 恢复及官方认证仍未完成，因此不宣称完整 MCP/Skills 兼容。
 
 ## 规范基线
 
@@ -26,7 +26,7 @@
 | OAuth 2.1 资源服务器/客户端、issuer/resource/audience 绑定 | 未实现 | 下游 JWT Protected Resource 与上游 client credentials 已实现；真实 IdP 认证待 LIVE-22 |
 | MRTR `input_required` 暂停与恢复 | 只有 Brokerrouter 自有审批协议 | 未实现协议映射 |
 | 上游 MCP server 注册、宿主分配身份和能力快照 | 未实现 | M6.2b1 已持久化；实际发现连接待 b2 |
-| `skills/list`、`skills/get`、`resources/read` | 未实现 | wire 方法未实现 |
+| `skills/list`、`skills/get`、`resources/read` | 未实现 | `skills/list` 分页发现和持久快照已实现；`skills/get`/内容读取未实现 |
 | 完整 manifest、512 文件/16 MiB、逐文件 size/SHA-256 | 未实现 | 内部校验已实现 |
 | `(host server id, URI)` 身份与名称冲突隔离 | 未实现 | 内部身份/冲突检测已实现 |
 | 内容按需读取、未列文件拒绝、frontmatter 逐字段核对 | 未实现 | 内部读取校验已实现 |
@@ -34,7 +34,7 @@
 | 动态 Skill、`allowed-tools`、嵌套和跨源读取安全门 | 未实现 | 动态 Skill 默认拒绝；工具授权被标记，执行门待 M6.2c |
 | 官方 core/client/server/extension 一致性测试 | 未执行 | 待真实端点完成后执行 |
 
-当前准确表述是：**Skills 安全内核、受管上游发现、下游目录和持久治理的单次工具代理已实现；MRTR、Skill wire、Runtime 恢复与官方认证未完成，因此尚不是完整 MCP 网关。**
+当前准确表述是：**Skills 安全内核、元数据发现、受管上游发现、下游目录和持久治理的单次工具代理已实现；Skill 激活、MRTR、Runtime 恢复与官方认证未完成，因此尚不是完整 MCP 网关。**
 
 ## 双向网关边界
 
@@ -74,7 +74,7 @@ M6.2a 的 `src/mcp.rs` 固定以下不变量：
 
 ### M6.2c：Skill 注册、真人审批和隔离缓存
 
-- 实现 `skills/list`/`skills/get`/`resources/read` 客户端代理与分页、TTL/cacheScope。
+- M6.2c1 已完成 `skills/list` 客户端分页、TTL/cacheScope、静态 manifest 校验和不可变持久快照；`skills/get`/`resources/read` 待 M6.2c2。
 - entry、资源验证事实和审批决定写入 PostgreSQL；manifest 变化在同一事务内撤销旧批准。
 - 内容按需读入只写主机专用不可变缓存，路径编码 server identity，排除所有本地 Skill 扫描目录。
 - 接入现有审批工作台：展示来源、URI、完整资源变化、`allowed-tools`、代码执行/跨源请求；Agent 不能代批。
