@@ -2,8 +2,8 @@ use brokerrouter::{
     cipher::ResultCipher,
     error::Error,
     mcp_catalog::{
-        self, Authentication, CacheScope, CredentialReference, RecordDiscovery, RegisterServer,
-        SetOauthPrincipal, SetToolGrant, Transport, UpdateServer,
+        self, Authentication, CacheScope, CredentialReference, RecordDiscovery, RecordSkillGet,
+        RegisterServer, SetOauthPrincipal, SetToolGrant, Transport, UpdateServer,
     },
     store,
 };
@@ -105,6 +105,192 @@ fn skill_entry(name: &str) -> serde_json::Value {
         "frontmatter":{"name":name,"description":"Reviewed workflow"},
         "resources":[{"uri":uri,"digest":format!("sha256:{}", "a".repeat(64)),"size":42}]
     })
+}
+
+fn skill_get(tenant_id: Uuid, server_id: Uuid, revision: i64) -> RecordSkillGet {
+    RecordSkillGet {
+        tenant_id,
+        server_id,
+        operation_id: Uuid::new_v4(),
+        actor: "mcp-connector:fixture".into(),
+        expected_server_revision: revision,
+        protocol_version: mcp_catalog::PROTOCOL_VERSION.into(),
+        result_type: "complete".into(),
+        supported_versions: vec![mcp_catalog::PROTOCOL_VERSION.into()],
+        capabilities: json!({"resources":{},"extensions":{"io.modelcontextprotocol/skills":{}}}),
+        discovery_ttl_ms: 30_000,
+        discovery_cache_scope: CacheScope::Public,
+        requested_uri: "skill://hidden/SKILL.md".into(),
+        entry: skill_entry("hidden"),
+        skill_ttl_ms: 12_000,
+        skill_cache_scope: CacheScope::Private,
+        authorization_context_fingerprint: Some(AUTH_CONTEXT.into()),
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn direct_skill_get_is_private_immutable_and_not_an_approval(pool: PgPool) {
+    let tenant_id = tenant(&pool, "mcp-skill-get").await;
+    let registered = mcp_catalog::register_server(&pool, &cipher(), registration(tenant_id))
+        .await
+        .unwrap();
+    let server_id: Uuid = serde_json::from_value(registered["server_id"].clone()).unwrap();
+    mcp_catalog::update_server(&pool, &cipher(), update(tenant_id, server_id, 1))
+        .await
+        .unwrap();
+    let input = skill_get(tenant_id, server_id, 2);
+    let response = mcp_catalog::record_skill_get(&pool, input.clone())
+        .await
+        .unwrap();
+    assert_eq!(response["uri"], "skill://hidden/SKILL.md");
+    assert_eq!(response["ttl_ms"], 12_000);
+    assert_eq!(response["cache_scope"], "private");
+    let reviewed = mcp_catalog::review_skill_get(&pool, tenant_id, server_id, &input.requested_uri)
+        .await
+        .unwrap();
+    assert_eq!(reviewed["entry"], input.entry);
+    assert_eq!(
+        reviewed["approval_fingerprint"],
+        response["approval_fingerprint"]
+    );
+    assert!(matches!(
+        mcp_catalog::review_skill_get(&pool, Uuid::new_v4(), server_id, &input.requested_uri).await,
+        Err(Error::NotFound)
+    ));
+    assert_eq!(
+        response["activation"],
+        "disabled_until_approval_and_read_path"
+    );
+    assert_eq!(
+        mcp_catalog::record_skill_get(&pool, input.clone())
+            .await
+            .unwrap(),
+        response
+    );
+    assert_eq!(
+        mcp_catalog::skill_get_receipt(
+            &pool,
+            tenant_id,
+            server_id,
+            input.operation_id,
+            &input.requested_uri
+        )
+        .await
+        .unwrap(),
+        Some(response.clone())
+    );
+    assert!(matches!(
+        mcp_catalog::skill_get_receipt(
+            &pool,
+            tenant_id,
+            server_id,
+            input.operation_id,
+            "skill://other/SKILL.md"
+        )
+        .await,
+        Err(Error::Conflict)
+    ));
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM mcp_skill_get_observations WHERE tenant_id=$1")
+            .bind(tenant_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 1);
+    let context: Option<Vec<u8>> = sqlx::query_scalar("SELECT authorization_context_hash FROM mcp_skill_get_observations WHERE tenant_id=$1 AND operation_id=$2")
+        .bind(tenant_id).bind(input.operation_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(context.unwrap().len(), 32);
+    let immutable =
+        sqlx::query("UPDATE mcp_skill_get_observations SET name='tampered' WHERE tenant_id=$1")
+            .bind(tenant_id)
+            .execute(&pool)
+            .await;
+    assert!(immutable.is_err());
+    let mut mismatch = skill_get(tenant_id, server_id, 2);
+    mismatch.requested_uri = "skill://other/SKILL.md".into();
+    assert!(matches!(
+        mcp_catalog::record_skill_get(&pool, mismatch).await,
+        Err(Error::Invalid(_))
+    ));
+    let mut dynamic = skill_get(tenant_id, server_id, 2);
+    dynamic.entry["resources"] = json!("dynamic");
+    assert!(matches!(
+        mcp_catalog::record_skill_get(&pool, dynamic).await,
+        Err(Error::Invalid(_))
+    ));
+    let mut no_context = skill_get(tenant_id, server_id, 2);
+    no_context.authorization_context_fingerprint = None;
+    assert!(matches!(
+        mcp_catalog::record_skill_get(&pool, no_context).await,
+        Err(Error::Invalid(_))
+    ));
+    let mut stale = skill_get(tenant_id, server_id, 1);
+    assert!(matches!(
+        mcp_catalog::record_skill_get(&pool, stale.clone()).await,
+        Err(Error::ConfigConflict)
+    ));
+    stale.expected_server_revision = 2;
+    stale.discovery_cache_scope = CacheScope::Public;
+    stale.skill_cache_scope = CacheScope::Public;
+    stale.authorization_context_fingerprint = None;
+    let public = mcp_catalog::record_skill_get(&pool, stale).await.unwrap();
+    assert_eq!(public["cache_scope"], "public");
+    assert!(
+        mcp_catalog::skill_get_receipt(
+            &pool,
+            Uuid::new_v4(),
+            server_id,
+            input.operation_id,
+            &input.requested_uri
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    let audit: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE tenant_id=$1 AND action='mcp.skill_get_recorded'",
+    )
+    .bind(tenant_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(audit, 2);
+
+    let mut expired = skill_get(tenant_id, server_id, 2);
+    expired.skill_ttl_ms = 0;
+    mcp_catalog::record_skill_get(&pool, expired).await.unwrap();
+    assert!(matches!(
+        mcp_catalog::review_skill_get(&pool, tenant_id, server_id, "skill://hidden/SKILL.md").await,
+        Err(Error::NotFound)
+    ));
+
+    sqlx::raw_sql("CREATE FUNCTION fail_skill_get_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action='mcp.skill_get_recorded' THEN RAISE EXCEPTION 'fixture'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_skill_get_audit BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION fail_skill_get_audit();")
+        .execute(&pool).await.unwrap();
+    let failed = skill_get(tenant_id, server_id, 2);
+    assert!(
+        mcp_catalog::record_skill_get(&pool, failed.clone())
+            .await
+            .is_err()
+    );
+    assert!(
+        mcp_catalog::skill_get_receipt(
+            &pool,
+            tenant_id,
+            server_id,
+            failed.operation_id,
+            &failed.requested_uri
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM mcp_skill_get_observations WHERE tenant_id=$1")
+            .bind(tenant_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 3);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -357,7 +543,7 @@ async fn oauth_revision_discovery_cache_and_self_report_are_not_identity(pool: P
             actor: "operator:alice".into(),
             reason: "reviewed exact tool descriptor".into(),
             downstream_name: downstream_name.clone(),
-            descriptor_sha256,
+            descriptor_sha256: descriptor_sha256.clone(),
             active: true,
         },
     )
@@ -370,6 +556,33 @@ async fn oauth_revision_discovery_cache_and_self_report_are_not_identity(pool: P
             .unwrap()
             .len(),
         1
+    );
+
+    // Simulate an older persisted snapshot where a private tools/list was
+    // incorrectly nested under a public server/discover cache. Never expose
+    // that legacy row even if its descriptor still matches a live grant.
+    let legacy_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO mcp_discovery_snapshots(tenant_id,id,server_id,server_config_revision,protocol_version,result_type,supported_versions,capabilities,capability_hash,ttl_ms,cache_scope,observed_at,expires_at) VALUES($1,$2,$3,2,'2026-07-28','complete',$4,$5,$6,60000,'public',clock_timestamp(),clock_timestamp()+interval '1 minute')")
+        .bind(tenant_id).bind(legacy_id).bind(server_id)
+        .bind(json!([mcp_catalog::PROTOCOL_VERSION]))
+        .bind(json!({"tools":{}})).bind(vec![0_u8;32])
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO mcp_discovered_tools(tenant_id,discovery_snapshot_id,server_id,ordinal,upstream_name,downstream_name,descriptor,descriptor_hash,cache_scope,expires_at) VALUES($1,$2,$3,0,$4,$5,$6,decode($7,'hex'),'private',clock_timestamp()+interval '1 minute')")
+        .bind(tenant_id).bind(legacy_id).bind(server_id)
+        .bind(review["tools"][0]["upstream_name"].as_str().unwrap())
+        .bind(&downstream_name).bind(&review["tools"][0]["descriptor"])
+        .bind(&descriptor_sha256).execute(&pool).await.unwrap();
+    assert!(
+        mcp_catalog::authorized_tools(&pool, &who, None, 101)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        mcp_catalog::authorized_tool(&pool, &who, &downstream_name)
+            .await
+            .unwrap()
+            .is_none()
     );
 
     let mut changed_descriptor = discovery(tenant_id, server_id, 2);
@@ -494,6 +707,8 @@ async fn invalid_transport_oauth_version_metadata_and_stale_revision_fail_closed
     ));
     stale.expected_server_revision = 2;
     stale.cache_scope = CacheScope::Public;
+    stale.tools_cache_scope = Some(CacheScope::Public);
+    stale.skills_cache_scope = Some(CacheScope::Public);
     assert!(matches!(
         mcp_catalog::record_discovery(&pool, stale.clone()).await,
         Err(Error::Invalid(_))
@@ -510,6 +725,24 @@ async fn invalid_transport_oauth_version_metadata_and_stale_revision_fail_closed
     .await
     .unwrap();
     assert!(context.is_none());
+    let mut mixed = discovery(tenant_id, server_id, 2);
+    mixed.cache_scope = CacheScope::Public;
+    mixed.skills_cache_scope = Some(CacheScope::Public);
+    let mixed = mcp_catalog::record_discovery(&pool, mixed).await.unwrap();
+    assert_eq!(mixed["cache_scope"], "private");
+    assert!(matches!(
+        mcp_catalog::current_discovery(&pool, tenant_id, server_id, None).await,
+        Err(Error::NotFound)
+    ));
+    let observed = mcp_catalog::current_discovery(&pool, tenant_id, server_id, Some(AUTH_CONTEXT))
+        .await
+        .unwrap();
+    assert_eq!(observed["cache_scope"], "private");
+    let mixed_snapshot: Uuid = serde_json::from_value(mixed["snapshot_id"].clone()).unwrap();
+    let context: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT authorization_context_hash FROM mcp_discovery_snapshots WHERE tenant_id=$1 AND id=$2",
+    ).bind(tenant_id).bind(mixed_snapshot).fetch_one(&pool).await.unwrap();
+    assert_eq!(context.unwrap().len(), 32);
     sqlx::query("UPDATE tenants SET active=false WHERE id=$1")
         .bind(tenant_id)
         .execute(&pool)
@@ -684,12 +917,16 @@ async fn deployment_roles_separate_configuration_discovery_and_other_authority(p
     mcp_catalog::record_discovery(&client, observed)
         .await
         .unwrap();
+    mcp_catalog::record_skill_get(&client, skill_get(tenant_id, server_id, 2))
+        .await
+        .unwrap();
     for sql in [
         "UPDATE mcp_servers SET active=false",
         "DELETE FROM mcp_discovery_snapshots",
         "SELECT * FROM mcp_oauth_principals",
         "SELECT result_ciphertext FROM requests",
         "SELECT * FROM approvals",
+        "DELETE FROM mcp_skill_get_observations",
         "SET ROLE brokerrouter_mcp_catalog",
     ] {
         assert!(sqlx::query(sql).execute(&client).await.is_err(), "{sql}");
@@ -703,6 +940,16 @@ async fn deployment_roles_separate_configuration_discovery_and_other_authority(p
         .await
         .unwrap();
     assert_eq!(reviewed_skills["skills"][0]["name"], "review");
+    let direct_count: i64 = sqlx::query_scalar("SELECT count(*) FROM mcp_skill_get_observations")
+        .fetch_one(&catalog)
+        .await
+        .unwrap();
+    assert_eq!(direct_count, 1);
+    let reviewed_direct =
+        mcp_catalog::review_skill_get(&catalog, tenant_id, server_id, "skill://hidden/SKILL.md")
+            .await
+            .unwrap();
+    assert_eq!(reviewed_direct["name"], "hidden");
     mcp_catalog::set_tool_grant(
         &catalog,
         SetToolGrant {
@@ -776,6 +1023,7 @@ async fn deployment_roles_separate_configuration_discovery_and_other_authority(p
         "UPDATE mcp_key_tool_grants SET active=false",
         "UPDATE mcp_oauth_principals SET active=false",
         "SELECT * FROM mcp_discovered_skills",
+        "SELECT * FROM mcp_skill_get_observations",
         "SET ROLE brokerrouter_mcp_client",
     ] {
         assert!(

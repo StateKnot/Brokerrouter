@@ -415,3 +415,9 @@ OAuth client credentials 配置固定 issuer/resource/audience 且 audience 必�
 0025 迁移将每个条目、宿主来源身份、完整资源集合批准指纹、列表 TTL/cacheScope 与当前发现快照同事务保存；新旧快照互不改写。操作员可用 `mcp-skills-list` 复核元数据和名称碰撞；MCP server/虚拟密钥无表读取权限，也没有 Skill 激活入口。测试覆盖真实 TCP 分页 wire、无预取、manifest 变化、重复 URI、动态 Skill 拒绝、不可变性、租户隔离和实际数据库角色。
 
 本地常规 Rust 全量 **243 项通过、0 失败，4 项既有 S3/固定 ClamAV/FFmpeg 环境专项 ignored**。M6.2c2 仍需 `skills/get`、真人持久审批、按需 `resources/read`/字节校验和隔离缓存；M6.2d 仍需 MRTR、Runtime 恢复及正式一致性认证。此包只提供可部署的发现目录，不宣称 Skills 已可调用。
+
+## M6.2c2a：Skills 直接 URI 查询与不可变观察（2026-09-23）
+
+完成 [直接查询契约](m6-mcp-skill-get.md)：受管 client 经 `server/discover` 校验 Resources/Skills 能力后，直接发送带完整 `_meta` 的 `skills/get`，不依赖 `skills/list`、不预取资源；严格核对响应 URI 与完整静态 manifest。0026 迁移记录宿主来源、版本、能力摘要、完整 entry、批准指纹、TTL、有效私有授权上下文及原子审计/幂等 receipt。新增 `mcp-skill-get` 与操作员 `mcp-skill-get-review`；虚拟密钥与下游 MCP 服务不能读取观察表，`activation` 恒禁用。同期加固混合 public/private 列表缓存，旧版未绑定授权上下文的 private 工具不再供下游列出或调用。
+
+本地最终全量 Rust **245 项通过、0 失败，4 项既有 S3/固定 ClamAV/FFmpeg 环境专项 ignored**；fmt、Clippy `-D warnings`、release 构建通过。真实 TCP wire、数据库角色、过期/不可变/审计回滚与旧版 private 缓存失效均有回归。M6.2c2b 仍需真人持久审批、`resources/read` 字节验证和隔离缓存；M6.2d 仍需 MRTR 与 Hermes/Claw 原生暂停恢复。该阶段不宣称 Skill 已可用。
