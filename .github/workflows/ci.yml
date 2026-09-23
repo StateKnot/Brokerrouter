@@ -7,7 +7,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:17-alpine
@@ -62,6 +62,9 @@ jobs:
         run: |
           cargo test --locked --test assets s3_conditional_write -- --ignored
           cargo test --locked --test outputs s3_output_import -- --ignored
+      # Debug/test artifacts are no longer needed after every contract passes.
+      # A fresh release build avoids filling the hosted runner's shared disk.
+      - run: cargo clean
       - run: cargo build --release --locked
       - if: always()
         run: docker compose -f compose.test.yaml --profile assets rm -sf minio
