@@ -1,8 +1,10 @@
 # Production deployment
 
-This package deploys the certified core data plane without replacing the host's existing web service. It uses a dedicated PostgreSQL 17 database, private Docker network, persistent volume, least-privilege runtime/operator logins, verified internal TLS, encrypted stored results, resource limits and a loopback-only HTTP listener. The public edge must terminate TLS and strip the deployment prefix before proxying.
+This package covers the core data plane without replacing the host's existing web service. It uses a dedicated PostgreSQL 17 database, private Docker network, persistent volume, least-privilege runtime/operator logins, verified internal TLS, encrypted stored results, resource limits and a loopback-only HTTP listener. The public edge must terminate TLS and strip the deployment prefix before proxying.
 
 It does **not** certify unfinished providers, media pipelines, the console/BFF or external identity system. Provider credentials remain absent until their models, prices and failure semantics pass the live certification checklist. Never reuse credentials pasted into chat or issue trackers.
+
+The [2026-09-24 milestone order](milestones.md) requires each real integration to ship its service deployment during R1–R4, followed by complete production acceptance in R5. This core package is not the full product deployment: console/BFF, identity integration, approvals, media/assets/scanning and MCP/Skill workers still need combined orchestration and operational evidence under [LIVE-25](acceptance-backlog.md). The milestone review did not inspect the current server.
 
 ## Server layout
 

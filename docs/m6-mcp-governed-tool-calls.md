@@ -22,6 +22,10 @@
 
 先应用 0024 迁移及最新 `deploy/permissions.sql`。`serve-mcp` 使用 `brokerrouter_mcp_server` 登录，只持有结果密钥环和目录/治理/入队权限；`mcp-worker --concurrency <N>` 使用 `brokerrouter_mcp_worker` 登录，持有**不同** MCP 配置密钥环、结果密钥环、Secret 注入映射和固定的 stdio launcher registry。两个进程不能使用表拥有者或超级用户登录。结果密钥环轮换必须保留旧 key，直至所有未过期密文退出保留期。
 
+MCP 输入和输出的 `model_judge` 检测由独立 `mcp-judge-worker --concurrency <N>` 进程推进；它使用 `brokerrouter_runtime` 权限组及仅供检测模型的供应商凭据和结果密钥环，不使用 `brokerrouter_mcp_server` 或 `brokerrouter_mcp_worker` 登录与 MCP 上游凭据。`serve-mcp` 登记检测后返回可恢复的等待状态，worker 根据持久 evaluation 只 claim 一次付费检测，并在结果落库后推进治理状态，使风险审批无需等待客户端再次调用即可出现在审批箱。worker 重启后继续处理 pending，补做已结算但仍在 checking 的治理操作；已进入 running 且结果未知的检测到期转人工审批，不盲目再次调用。未部署该 worker 时语义规则会一直等待，不能将此配置作为可用能力开放。
+
+工具完成后重放结果仍须按当前输出规则、审批版本和 turn 授权重新检查；新增规则可再次隔离已保存的结果，但不会重新执行工具。同内容目录刷新保留原始快照作为审计证据，以连接 revision、完整工具描述、参数和现行授权上下文判断原调用身份；描述、授权上下文或权限变化不会沿用旧批准。
+
 Worker 只允许出站访问已登记的 HTTPS MCP 服务及明确授权的 Secret/OAuth 地址；受管 stdio profile 必须由部署方固定程序 SHA-256、工作目录和环境。边界代理必须使用精确 Host/Origin、TLS、无客户端转发头透传。不要把用户模型供应商密钥、上游 MCP 凭据或审批私钥传入 MCP edge。
 
 验证覆盖真实 PostgreSQL 与实际受限角色、stdio 工具一次执行、输入和输出审批、grant 撤销、幂等冲突及结果丢失不重发。真实 HTTPS/OAuth、并发压测、进程逐点终止、上游 task/MRTR、官方 conformance、Hermes/OpenClaw 恢复和生产回滚仍列为 LIVE-22；这些闸门未关闭前，不在既有 `stknot.com` 生产入口启用 MCP 工具执行。

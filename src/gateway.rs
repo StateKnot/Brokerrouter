@@ -18,12 +18,96 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub struct StreamSession {
     pub id: Uuid,
-    pub receiver: mpsc::UnboundedReceiver<bytes::Bytes>,
+    receiver: Arc<Mutex<mpsc::Receiver<bytes::Bytes>>>,
+    closed: CancellationToken,
+}
+
+impl StreamSession {
+    fn new(
+        id: Uuid,
+        receiver: mpsc::Receiver<bytes::Bytes>,
+        permit: OwnedSemaphorePermit,
+        lifetime: Duration,
+    ) -> Self {
+        let receiver = Arc::new(Mutex::new(receiver));
+        let closed = CancellationToken::new();
+        let deadline_receiver = receiver.clone();
+        let deadline_closed = closed.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(lifetime) => deadline_closed.cancel(),
+                _ = deadline_closed.cancelled() => {},
+            }
+            let mut receiver = deadline_receiver.lock().await;
+            receiver.close();
+            while receiver.try_recv().is_ok() {}
+            drop(permit);
+        });
+        Self {
+            id,
+            receiver,
+            closed,
+        }
+    }
+
+    pub async fn next(&mut self) -> Option<bytes::Bytes> {
+        tokio::select! {
+            biased;
+            _ = self.closed.cancelled() => None,
+            result = async { self.receiver.lock().await.recv().await } => result,
+        }
+    }
+}
+
+impl Drop for StreamSession {
+    fn drop(&mut self) {
+        self.closed.cancel();
+    }
+}
+
+const STREAM_QUEUE_FRAMES: usize = 4;
+const STREAM_FRAME_BYTES: usize = 64 * 1024;
+
+struct StreamDelivery {
+    sender: mpsc::Sender<bytes::Bytes>,
+    closed: CancellationToken,
+}
+
+impl StreamDelivery {
+    async fn send_live(&self, event: bytes::Bytes) {
+        if self.closed.is_cancelled() {
+            return;
+        }
+        for chunk in event.chunks(STREAM_FRAME_BYTES) {
+            let send = self.sender.send(bytes::Bytes::copy_from_slice(chunk));
+            if !tokio::select! {
+                _ = self.closed.cancelled() => false,
+                result = tokio::time::timeout(Duration::from_millis(100), send) => result.is_ok_and(|sent| sent.is_ok()),
+            } {
+                self.closed.cancel();
+                break;
+            }
+        }
+    }
+
+    async fn send_replay(&self, event: bytes::Bytes) {
+        for chunk in event.chunks(STREAM_FRAME_BYTES) {
+            let send = self.sender.send(bytes::Bytes::copy_from_slice(chunk));
+            if !tokio::select! {
+                _ = self.closed.cancelled() => false,
+                result = tokio::time::timeout(Duration::from_secs(5), send) => result.is_ok_and(|sent| sent.is_ok()),
+            } {
+                self.closed.cancel();
+                break;
+            }
+        }
+    }
 }
 
 struct StreamExecution {
@@ -83,6 +167,7 @@ pub struct Gateway {
     pub(crate) cipher: Arc<ResultCipher>,
     credentials: Arc<HashMap<String, String>>,
     capacity: Arc<Semaphore>,
+    stream_capacity: Arc<Semaphore>,
     judge_capacity: Arc<Semaphore>,
     timeout_seconds: i32,
     result_ttl_seconds: i32,
@@ -108,6 +193,7 @@ impl Gateway {
             cipher: Arc::new(cipher),
             credentials: Arc::new(credentials),
             capacity: Arc::new(Semaphore::new(concurrency)),
+            stream_capacity: Arc::new(Semaphore::new((concurrency / 4).max(1))),
             judge_capacity: Arc::new(Semaphore::new((concurrency / 4).max(1))),
             timeout_seconds,
             result_ttl_seconds,
@@ -135,14 +221,22 @@ impl Gateway {
                 .unwrap_or(Ok(default))
         };
         let concurrency = number("BROKERROUTER_MAX_CONCURRENCY", 64)?;
-        Self::new(
+        let mut gateway = Self::new(
             pool,
             ResultCipher::from_env()?,
             credentials,
             usize::try_from(concurrency).map_err(|_| Error::Configuration)?,
             number("BROKERROUTER_REQUEST_TIMEOUT_SECONDS", 120)?,
             number("BROKERROUTER_RESULT_TTL_SECONDS", 86400)?,
-        )
+        )?;
+        if let Ok(value) = std::env::var("BROKERROUTER_MAX_STREAM_CONNECTIONS") {
+            let connections: usize = value.parse().map_err(|_| Error::Configuration)?;
+            if !(1..=1024).contains(&connections) {
+                return Err(Error::Configuration);
+            }
+            gateway.stream_capacity = Arc::new(Semaphore::new(connections));
+        }
+        Ok(gateway)
     }
     pub async fn execute(
         &self,
@@ -188,6 +282,15 @@ impl Gateway {
         if idempotency.starts_with("_br_guardrail:") || idempotency.starts_with("_br_media:") {
             return Err(Error::Invalid("reserved idempotency namespace"));
         }
+        if body["stream"] != true {
+            return Err(Error::Invalid("stream:true is required for SSE execution"));
+        }
+        // Refuse excess clients before reserving funds or contacting an upstream.
+        let delivery_permit = self
+            .stream_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Busy)?;
         let (request, row, permit) = self
             .admit(
                 who,
@@ -200,10 +303,9 @@ impl Gateway {
                 },
             )
             .await?;
-        if !request.stream {
-            return Err(Error::Invalid("stream:true is required for SSE execution"));
-        }
-        self.start_stream(who.clone(), request, row, permit).await
+        debug_assert!(request.stream);
+        self.start_stream(who.clone(), request, row, permit, delivery_permit)
+            .await
     }
 
     pub(crate) fn judge_timeout_seconds(&self) -> i32 {
@@ -634,21 +736,31 @@ impl Gateway {
         request: ValidatedRequest,
         row: Reservation,
         permit: OwnedSemaphorePermit,
+        delivery_permit: OwnedSemaphorePermit,
     ) -> Result<StreamSession> {
+        let lifetime = Duration::from_secs(self.timeout_seconds as u64 + 60);
         match row.status.as_str() {
             "succeeded" => {
                 let value = self
                     .result_inner(&who, row.id, row.guardrail_evaluation_id, true)
                     .await?;
-                let (sender, receiver) = mpsc::unbounded_channel();
-                for event in replay_stream(&value)? {
-                    let _ = sender.send(event);
-                }
-                drop(permit);
-                return Ok(StreamSession {
-                    id: row.id,
-                    receiver,
+                let events = replay_stream(&value)?;
+                let (sender, receiver) = mpsc::channel(STREAM_QUEUE_FRAMES);
+                let session = StreamSession::new(row.id, receiver, delivery_permit, lifetime);
+                let delivery = StreamDelivery {
+                    sender,
+                    closed: session.closed.clone(),
+                };
+                self.tasks.spawn(async move {
+                    for event in events {
+                        delivery.send_replay(event).await;
+                        if delivery.closed.is_cancelled() {
+                            break;
+                        }
+                    }
                 });
+                drop(permit);
+                return Ok(session);
             }
             "failed" => return Err(Error::NotSubmitted),
             "reconciled" => return Err(Error::ResultUnavailable),
@@ -804,7 +916,12 @@ impl Gateway {
                 .await?;
                 return Err(Error::UpstreamUnknown);
             }
-            let (sender, receiver) = mpsc::unbounded_channel();
+            let (sender, receiver) = mpsc::channel(STREAM_QUEUE_FRAMES);
+            let session = StreamSession::new(row.id, receiver, delivery_permit, lifetime);
+            let delivery = StreamDelivery {
+                sender,
+                closed: session.closed.clone(),
+            };
             let gateway = self.clone();
             let id = row.id;
             let execution = StreamExecution {
@@ -815,7 +932,9 @@ impl Gateway {
                 attempt,
             };
             self.tasks.spawn(async move {
-                let result = gateway.consume_stream(&execution, response, &sender).await;
+                let result = gateway
+                    .consume_stream(&execution, response, &delivery)
+                    .await;
                 if let Err(code) = result {
                     let _ = attempts::failed(
                         &gateway.pool,
@@ -827,14 +946,11 @@ impl Gateway {
                         Some(status),
                     )
                     .await;
-                    send_stream_error(&sender);
+                    send_stream_error(&delivery).await;
                 }
                 drop(permit);
             });
-            return Ok(StreamSession {
-                id: row.id,
-                receiver,
-            });
+            return Ok(session);
         }
         accounting::release_unsubmitted(&self.pool, &who, row.id).await?;
         Err(Error::NotSubmitted)
@@ -844,7 +960,7 @@ impl Gateway {
         &self,
         execution: &StreamExecution,
         response: reqwest::Response,
-        sender: &mpsc::UnboundedSender<bytes::Bytes>,
+        delivery: &StreamDelivery,
     ) -> std::result::Result<(), &'static str> {
         const LIMIT: usize = 4 * 1024 * 1024;
         if response
@@ -897,7 +1013,7 @@ impl Gateway {
                 .map_err(|_| "invalid_or_incomplete_stream")?;
             let encoded =
                 serde_json::to_string(&chunk).map_err(|_| "invalid_or_incomplete_stream")?;
-            let _ = sender.send(sse_data(&encoded));
+            delivery.send_live(sse_data(&encoded)).await;
         }
         if !done {
             return Err("invalid_or_incomplete_stream");
@@ -929,7 +1045,7 @@ impl Gateway {
         )
         .await
         .map_err(|_| "settlement_unknown")?;
-        let _ = sender.send(sse_data("[DONE]"));
+        delivery.send_live(sse_data("[DONE]")).await;
         Ok(())
     }
 
@@ -1072,9 +1188,9 @@ fn sse_data(data: &str) -> bytes::Bytes {
     sse_stream::Sse::default().data(data).into()
 }
 
-fn send_stream_error(sender: &mpsc::UnboundedSender<bytes::Bytes>) {
+async fn send_stream_error(delivery: &StreamDelivery) {
     let error = json!({"error":{"code":"submission_unknown","message":"the upstream stream ended without a complete durably settled result","type":"gateway_error"}});
-    let _ = sender.send(sse_data(&error.to_string()));
+    delivery.send_live(sse_data(&error.to_string())).await;
 }
 
 fn object_fields(value: &Value, allowed: &[&str]) -> Result<()> {
@@ -1357,4 +1473,36 @@ fn replay_stream(completion: &Value) -> Result<Vec<bytes::Bytes>> {
         sse_data(&usage.to_string()),
         sse_data("[DONE]"),
     ])
+}
+
+#[cfg(test)]
+mod stream_session_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn idle_session_deadline_closes_queue_and_releases_connection() {
+        let capacity = Arc::new(Semaphore::new(1));
+        let permit = capacity.clone().acquire_owned().await.unwrap();
+        let (sender, receiver) = mpsc::channel(STREAM_QUEUE_FRAMES);
+        let mut session =
+            StreamSession::new(Uuid::new_v4(), receiver, permit, Duration::from_millis(20));
+        sender
+            .send(bytes::Bytes::from_static(b"held bytes"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while capacity.available_permits() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(session.next().await.is_none());
+        assert!(
+            sender
+                .send(bytes::Bytes::from_static(b"too late"))
+                .await
+                .is_err()
+        );
+    }
 }

@@ -31,6 +31,7 @@ enum Reply {
     Tool,
     ToolRoundtrip,
     Stream,
+    StreamLarge,
     StreamBroken,
     StreamNoUsage,
     Judge(&'static str),
@@ -82,10 +83,11 @@ async fn mock(
     match state.reply {
         Reply::Http(status)=>(StatusCode::from_u16(status).unwrap(),[("location","http://127.0.0.1:9/secret")],"not a billable-success response").into_response(),
         Reply::Embedding=>Json(json!({"object":"list","model":"upstream","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2,0.3]}],"usage":{"prompt_tokens":3,"total_tokens":3}})).into_response(),
-        reply @ (Reply::Stream | Reply::StreamBroken | Reply::StreamNoUsage) => {
+        reply @ (Reply::Stream | Reply::StreamLarge | Reply::StreamBroken | Reply::StreamNoUsage) => {
+            let answer = if matches!(reply, Reply::StreamLarge) { "x".repeat(300_000) } else { "private answer".into() };
             let mut events = vec![
                 json!({"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"upstream","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null,"logprobs":null}],"usage":null}),
-                json!({"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"upstream","choices":[{"index":0,"delta":{"content":"private answer"},"finish_reason":null,"logprobs":null}],"usage":null}),
+                json!({"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"upstream","choices":[{"index":0,"delta":{"content":answer},"finish_reason":null,"logprobs":null}],"usage":null}),
                 json!({"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"upstream","choices":[{"index":0,"delta":{},"finish_reason":"stop","logprobs":null}],"usage":null}),
             ];
             if !matches!(reply, Reply::StreamNoUsage) {
@@ -1602,6 +1604,44 @@ async fn sse_stream_settles_before_done_and_replays_without_provider_call(pool: 
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn sse_large_event_and_replay_cross_bounded_frames(pool: PgPool) {
+    let upstream = Mock::start(Reply::StreamLarge).await;
+    let (who, key, endpoint) = setup(&pool, "chat", &upstream.url).await;
+    sqlx::query("UPDATE endpoints SET supports_streaming=true WHERE id=$1")
+        .bind(endpoint.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let app = api::gateway_router(gateway(pool.clone(), 5));
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(request(
+                &key,
+                "large-stream-replay",
+                streaming_chat(),
+                "/v1/chat/completions",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert!(
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains(&"x".repeat(300_000))
+        );
+        assert!(body.ends_with(b"data: [DONE]\n\n"));
+    }
+    assert_eq!(upstream.count(), 1);
+    assert_eq!(sqlx::query_scalar::<_, String>("SELECT status FROM requests WHERE tenant_id=$1 AND idempotency_key='large-stream-replay'")
+        .bind(who.tenant_id).fetch_one(&pool).await.unwrap(), "succeeded");
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn client_disconnect_does_not_cancel_stream_settlement(pool: PgPool) {
     let upstream = Mock::start(Reply::Stream).await;
     let (who, _, endpoint) = setup(&pool, "chat", &upstream.url).await;
@@ -1616,7 +1656,7 @@ async fn client_disconnect_does_not_cancel_stream_settlement(pool: PgPool) {
         .await
         .unwrap();
     let id = session.id;
-    drop(session.receiver);
+    drop(session);
     for _ in 0..100 {
         let state: String = sqlx::query_scalar("SELECT status FROM requests WHERE id=$1")
             .bind(id)
@@ -1636,6 +1676,88 @@ async fn client_disconnect_does_not_cancel_stream_settlement(pool: PgPool) {
             .unwrap(),
         "succeeded"
     );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn stalled_stream_keeps_delivery_slot_after_upstream_settles(pool: PgPool) {
+    let upstream = Mock::start(Reply::Stream).await;
+    let (who, _, endpoint) = setup(&pool, "chat", &upstream.url).await;
+    sqlx::query("UPDATE endpoints SET supports_streaming=true WHERE id=$1")
+        .bind(endpoint.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let g = Gateway::new(
+        pool.clone(),
+        ResultCipher::new(
+            "fixture-v1".into(),
+            HashMap::from([("fixture-v1".into(), "11".repeat(32))]),
+        )
+        .unwrap(),
+        HashMap::from([("FIXTURE_PROVIDER_KEY".into(), "fake-provider-secret".into())]),
+        4,
+        5,
+        60,
+    )
+    .unwrap();
+    let session = g
+        .execute_stream_in_turn(&who, "stalled-first", streaming_chat(), None)
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        let state: String = sqlx::query_scalar("SELECT status FROM requests WHERE id=$1")
+            .bind(session.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        if state == "succeeded" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM requests WHERE id=$1")
+            .bind(session.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "succeeded"
+    );
+    assert!(matches!(
+        g.execute_stream_in_turn(&who, "stalled-second", streaming_chat(), None)
+            .await,
+        Err(Error::Busy)
+    ));
+    let requests: i64 = sqlx::query_scalar("SELECT count(*) FROM requests WHERE tenant_id=$1")
+        .bind(who.tenant_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(requests, 1);
+    drop(session);
+    for _ in 0..100 {
+        match g
+            .execute_stream_in_turn(&who, "stalled-first", streaming_chat(), None)
+            .await
+        {
+            Ok(mut replay) => {
+                let mut data = Vec::new();
+                while let Some(bytes) = replay.next().await {
+                    data.extend_from_slice(&bytes);
+                }
+                assert!(
+                    String::from_utf8(data)
+                        .unwrap()
+                        .ends_with("data: [DONE]\n\n")
+                );
+                assert_eq!(upstream.count(), 1);
+                return;
+            }
+            Err(Error::Busy) => tokio::time::sleep(Duration::from_millis(10)).await,
+            other => panic!("unexpected replay result: {}", other.err().unwrap()),
+        }
+    }
+    panic!("delivery slot was not released after disconnect");
 }
 
 #[sqlx::test(migrations = "./migrations")]

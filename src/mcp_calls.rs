@@ -48,11 +48,11 @@ impl Edge {
         let arguments_hash = governance::digest(&arguments)?;
         let existing = call_row(&self.pool, who, call_id).await?;
         if let Some(row) = existing {
-            verify_call_identity(&row, who, turn_id, &tool, &arguments_hash)?;
+            verify_call_identity(&self.pool, &row, who, turn_id, &tool, &arguments_hash).await?;
             return self.release(who, row).await;
         }
         let operation_key = format!("{INPUT_OPERATION_PREFIX}{call_id}");
-        let payload = json!({
+        let mut payload = json!({
             "call_id":call_id,
             "server_id":tool.server_id,
             "server_revision":tool.server_config_revision,
@@ -62,6 +62,40 @@ impl Edge {
             "descriptor_sha256":governance::hex(&tool.descriptor_hash),
             "arguments":arguments,
         });
+        // A discovery refresh is not a new action. Preserve the exact payload
+        // a human reviewed, including its historical snapshot audit reference.
+        let previous: Option<(Uuid, Uuid, Vec<u8>)> = sqlx::query_as(
+            "SELECT id,turn_id,payload_ciphertext FROM governance_operations WHERE tenant_id=$1 AND key_id=$2 AND operation_key=$3 AND stage='tool_input'",
+        )
+        .bind(who.tenant_id)
+        .bind(who.key_id)
+        .bind(&operation_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some((id, original_turn, ciphertext)) = previous {
+            if original_turn != turn_id {
+                return Err(Error::Conflict);
+            }
+            let original: Value =
+                serde_json::from_slice(&self.cipher.decrypt(who.tenant_id, id, &ciphertext)?)
+                    .map_err(|_| Error::ResultUnavailable)?;
+            let original_snapshot = parse_id(&original["snapshot_id"])?;
+            if !same_authorization_context(
+                &self.pool,
+                who.tenant_id,
+                original_snapshot,
+                tool.discovery_snapshot_id,
+            )
+            .await?
+            {
+                return Err(Error::Conflict);
+            }
+            payload["snapshot_id"] = json!(original_snapshot);
+            if original != payload {
+                return Err(Error::Conflict);
+            }
+        }
+        let original_snapshot = parse_id(&payload["snapshot_id"])?;
         let decision = governance::check(
             &self.pool,
             &self.cipher,
@@ -93,7 +127,7 @@ impl Edge {
         .bind(input_operation_id)
         .bind(tool.server_id)
         .bind(tool.server_config_revision)
-        .bind(tool.discovery_snapshot_id)
+        .bind(original_snapshot)
         .bind(&tool.upstream_name)
         .bind(&tool.downstream_name)
         .bind(&tool.descriptor_hash)
@@ -111,7 +145,7 @@ impl Edge {
         let row = call_row(&self.pool, who, call_id)
             .await?
             .ok_or(Error::ResultUnavailable)?;
-        verify_call_identity(&row, who, turn_id, &tool, &arguments_hash)?;
+        verify_call_identity(&self.pool, &row, who, turn_id, &tool, &arguments_hash).await?;
         self.release(who, row).await
     }
 
@@ -127,17 +161,19 @@ impl Edge {
             "input_required" | "task" => Err(Error::InProgress),
             "expired" => Err(Error::ResultUnavailable),
             "output_pending" | "completed" => {
-                let encrypted = row.response_ciphertext.ok_or(Error::ResultUnavailable)?;
-                let plaintext = self.cipher.decrypt(who.tenant_id, row.id, &encrypted)?;
+                let encrypted = row
+                    .response_ciphertext
+                    .as_deref()
+                    .ok_or(Error::ResultUnavailable)?;
+                let plaintext = self.cipher.decrypt(who.tenant_id, row.id, encrypted)?;
                 let hash = store::hash(&plaintext);
                 if row.response_hash.as_deref() != Some(hash.as_slice()) {
                     return Err(Error::ResultUnavailable);
                 }
-                let result: CallToolResult =
+                let payload: Value =
                     serde_json::from_slice(&plaintext).map_err(|_| Error::ResultUnavailable)?;
-                if row.state == "completed" {
-                    return Ok(result.into());
-                }
+                let result: CallToolResult = serde_json::from_value(payload.clone())
+                    .map_err(|_| Error::ResultUnavailable)?;
                 let decision = governance::check(
                     &self.pool,
                     &self.cipher,
@@ -148,8 +184,7 @@ impl Edge {
                         stage: "tool_output".into(),
                         model_id: None,
                         tool_name: Some(row.downstream_name.clone()),
-                        payload: serde_json::from_slice(&plaintext)
-                            .map_err(|_| Error::ResultUnavailable)?,
+                        payload: payload.clone(),
                     },
                 )
                 .await?;
@@ -157,7 +192,31 @@ impl Edge {
                 let output_operation_id = parse_id(&decision["id"])?;
                 let mut tx = self.pool.begin().await?;
                 governance::tenant_lock(&mut tx, who.tenant_id).await?;
-                governance::turn_locked(&mut tx, who, row.turn_id, true).await?;
+                let turn = governance::turn_locked(&mut tx, who, row.turn_id, true).await?;
+                if !current_call_authorized(&mut tx, who, &row).await? {
+                    return Err(Error::Unauthorized);
+                }
+                let operation: governance::Operation = sqlx::query_as(
+                    "SELECT * FROM governance_operations WHERE tenant_id=$1 AND id=$2 AND key_id=$3 AND turn_id=$4 AND stage='tool_output' FOR UPDATE",
+                )
+                .bind(who.tenant_id).bind(output_operation_id).bind(who.key_id).bind(row.turn_id)
+                .fetch_optional(&mut *tx).await?.ok_or(Error::ResultUnavailable)?;
+                let gate = governance::gate(&mut tx, who, &turn, &operation, &payload).await?;
+                match gate {
+                    governance::Gate::Ready => {}
+                    governance::Gate::Approval(approval) => {
+                        tx.commit().await?;
+                        return Err(Error::ApprovalRequired(approval));
+                    }
+                    governance::Gate::Checking(_) => {
+                        tx.commit().await?;
+                        return Err(Error::InProgress);
+                    }
+                }
+                if row.state == "completed" {
+                    tx.commit().await?;
+                    return Ok(result.into());
+                }
                 let updated = sqlx::query("UPDATE mcp_tool_calls SET state='completed',output_operation_id=$3,completed_at=clock_timestamp() WHERE tenant_id=$1 AND id=$2 AND state='output_pending'")
                     .bind(who.tenant_id).bind(row.id).bind(output_operation_id)
                     .execute(&mut *tx).await?;
@@ -170,6 +229,37 @@ impl Edge {
             _ => Err(Error::Configuration),
         }
     }
+}
+
+async fn current_call_authorized(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    who: &Identity,
+    row: &CallRow,
+) -> Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+           SELECT 1 FROM mcp_discovery_snapshots original
+           JOIN mcp_servers s ON s.tenant_id=original.tenant_id AND s.id=original.server_id AND s.active
+           JOIN LATERAL (
+             SELECT d.id,d.server_config_revision,d.authorization_context_hash
+             FROM mcp_discovery_snapshots d WHERE d.tenant_id=s.tenant_id AND d.server_id=s.id
+               AND d.server_config_revision=s.config_revision AND d.expires_at>clock_timestamp()
+             ORDER BY d.observed_at DESC,d.id DESC LIMIT 1
+           ) current ON true
+           JOIN mcp_discovered_tools t ON t.tenant_id=s.tenant_id AND t.discovery_snapshot_id=current.id
+             AND t.server_id=s.id AND t.expires_at>clock_timestamp()
+           JOIN mcp_key_tool_grants g ON g.tenant_id=t.tenant_id AND g.key_id=$2 AND g.server_id=t.server_id
+             AND g.server_config_revision=current.server_config_revision AND g.upstream_name=t.upstream_name
+             AND g.descriptor_hash=t.descriptor_hash AND g.active
+           WHERE original.tenant_id=$1 AND original.id=$3 AND s.id=$4 AND s.config_revision=$5
+             AND original.authorization_context_hash IS NOT DISTINCT FROM current.authorization_context_hash
+             AND t.upstream_name=$6 AND t.downstream_name=$7 AND t.descriptor_hash=$8
+             AND (t.cache_scope='public' OR current.authorization_context_hash IS NOT NULL)
+         )",
+    )
+    .bind(who.tenant_id).bind(who.key_id).bind(row.discovery_snapshot_id).bind(row.server_id)
+    .bind(row.server_config_revision).bind(&row.upstream_name).bind(&row.downstream_name)
+    .bind(&row.descriptor_hash).fetch_one(&mut **tx).await.map_err(Into::into)
 }
 
 fn parse_id(value: &Value) -> Result<Uuid> {
@@ -211,7 +301,8 @@ async fn call_row(pool: &PgPool, who: &Identity, call_id: Uuid) -> Result<Option
     .map_err(Into::into)
 }
 
-fn verify_call_identity(
+async fn verify_call_identity(
+    pool: &PgPool,
     row: &CallRow,
     who: &Identity,
     turn_id: Uuid,
@@ -223,7 +314,6 @@ fn verify_call_identity(
         || row.turn_id != turn_id
         || row.server_id != tool.server_id
         || row.server_config_revision != tool.server_config_revision
-        || row.discovery_snapshot_id != tool.discovery_snapshot_id
         || row.upstream_name != tool.upstream_name
         || row.downstream_name != tool.downstream_name
         || row.descriptor_hash != tool.descriptor_hash
@@ -231,7 +321,37 @@ fn verify_call_identity(
     {
         return Err(Error::Conflict);
     }
+    if !same_authorization_context(
+        pool,
+        who.tenant_id,
+        row.discovery_snapshot_id,
+        tool.discovery_snapshot_id,
+    )
+    .await?
+    {
+        return Err(Error::Conflict);
+    }
     Ok(())
+}
+
+async fn same_authorization_context(
+    pool: &PgPool,
+    tenant: Uuid,
+    original: Uuid,
+    current: Uuid,
+) -> Result<bool> {
+    let same: Option<bool> = sqlx::query_scalar(
+        "SELECT old.authorization_context_hash IS NOT DISTINCT FROM current.authorization_context_hash
+         FROM mcp_discovery_snapshots old JOIN mcp_discovery_snapshots current
+           ON current.tenant_id=old.tenant_id AND current.server_id=old.server_id
+         WHERE old.tenant_id=$1 AND old.id=$2 AND current.id=$3",
+    )
+    .bind(tenant)
+    .bind(original)
+    .bind(current)
+    .fetch_optional(pool)
+    .await?;
+    Ok(same.unwrap_or(false))
 }
 
 #[derive(Clone)]
@@ -316,14 +436,24 @@ impl Worker {
             key_id: row.key_id,
         };
         let current = mcp_catalog::authorized_tool(&self.pool, &who, &row.downstream_name).await?;
-        let valid = current.is_some_and(|tool| {
+        let valid = current.as_ref().is_some_and(|tool| {
             tool.server_id == row.server_id
                 && tool.server_config_revision == row.server_config_revision
-                && tool.discovery_snapshot_id == row.discovery_snapshot_id
                 && tool.upstream_name == row.upstream_name
                 && tool.descriptor_hash == row.descriptor_hash
         });
         if !valid {
+            return self.fail_before_submit(&row, "authorization_changed").await;
+        }
+        let current = current.ok_or(Error::Configuration)?;
+        if !same_authorization_context(
+            &self.pool,
+            row.tenant_id,
+            row.discovery_snapshot_id,
+            current.discovery_snapshot_id,
+        )
+        .await?
+        {
             return self.fail_before_submit(&row, "authorization_changed").await;
         }
         let server = match mcp_catalog::connector_server(

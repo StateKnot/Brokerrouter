@@ -2,7 +2,9 @@
 
 Rust 主导的国内多供应商 AI 网关：统一模型调用、多模态任务、人民币账本和智能体审批治理。
 
-项目正在按 [开发里程碑](docs/milestones.md) 实施。当前能力及验证结果以里程碑状态为准。
+项目正在按 [开发里程碑](docs/milestones.md) 实施。2026-09-24 重排为：R0 缺陷/CI/SSE → R1 Hermes 真实审批恢复 → R2 首批供应商与多模态认证 → R3 MCP/Skills/OpenClaw → R4 剩余产品能力 → R5 完整生产验收。当前从 R0 开始，尚不能按生产级完整 AI 网关验收；原 M0–M6 编号保留为功能归属与历史记录。
+
+逐包实施顺序、代码范围和验收安排见 [开发执行计划](docs/development-plan.md)。
 
 技术路径：Rust 1.98.1、Tokio、Axum、SQLx、PostgreSQL；控制台 TypeScript，Runtime Adapter 按宿主语言实现。
 

@@ -19,6 +19,7 @@ pub mod governance_api;
 pub mod governance_settings;
 pub mod human;
 mod judge;
+pub use judge::McpJudgeWorker;
 pub mod mcp;
 pub mod mcp_calls;
 pub mod mcp_catalog;
