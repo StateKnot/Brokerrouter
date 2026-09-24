@@ -60,6 +60,8 @@ cat >"$secret_dir/operator.env" <<EOF
 DATABASE_URL='postgres://brokerrouter_operator_login:${operator_password}@postgres:5432/brokerrouter?sslmode=verify-full&sslrootcert=/run/secrets/pg_ca'
 EOF
 
+sh "$(dirname "$0")/create-mcp-judge-env.sh" "$secret_dir"
+
 chmod 0400 "$secret_dir"/*
 chmod 0444 "$secret_dir/pg-ca.crt" "$secret_dir/pg-server.crt"
 chown 999:999 \

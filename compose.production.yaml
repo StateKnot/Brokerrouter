@@ -157,6 +157,34 @@ services:
         max-size: 10m
         max-file: "5"
 
+  mcp-judge:
+    <<: *app-common
+    profiles: [mcp]
+    restart: unless-stopped
+    command: ["mcp-judge-worker", "--concurrency", "4"]
+    environment:
+      BROKERROUTER_ENV_FILE: /run/secrets/mcp_judge_env
+      BROKERROUTER_MAX_CONCURRENCY: "4"
+      BROKERROUTER_REQUEST_TIMEOUT_SECONDS: "120"
+      RUST_LOG: brokerrouter=info
+    secrets:
+      - pg_ca
+      - mcp_judge_env
+    networks:
+      backend: {}
+      egress:
+        gw_priority: 1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    init: true
+    stop_grace_period: 3m
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
 networks:
   backend:
     internal: true
@@ -180,3 +208,5 @@ secrets:
     file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/runtime.env
   operator_env:
     file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/operator.env
+  mcp_judge_env:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/mcp-judge.env

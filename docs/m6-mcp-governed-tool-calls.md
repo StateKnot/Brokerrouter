@@ -24,6 +24,8 @@
 
 MCP 输入和输出的 `model_judge` 检测由独立 `mcp-judge-worker --concurrency <N>` 进程推进；它使用 `brokerrouter_runtime` 权限组及仅供检测模型的供应商凭据和结果密钥环，不使用 `brokerrouter_mcp_server` 或 `brokerrouter_mcp_worker` 登录与 MCP 上游凭据。`serve-mcp` 登记检测后返回可恢复的等待状态，worker 根据持久 evaluation 只 claim 一次付费检测，并在结果落库后推进治理状态，使风险审批无需等待客户端再次调用即可出现在审批箱。worker 重启后继续处理 pending，补做已结算但仍在 checking 的治理操作；已进入 running 且结果未知的检测到期转人工审批，不盲目再次调用。未部署该 worker 时语义规则会一直等待，不能将此配置作为可用能力开放。
 
+生产 Compose 的 `mcp-judge` profile 只启动此检测 worker，不开放 MCP 入口。新装会生成独立的 root-only `mcp-judge.env`；旧部署须按[生产部署说明](production-deployment.md)单独生成。该 Secret 目前复用受限的 runtime 数据库登录和结果密钥环，检测供应商凭据只添加到 worker Secret，不复制到 MCP edge。启用语义规则前必须验证 worker 存活、受限数据库权限、检测预算和失败转审批；目标环境验收仍由 R0.6 和后续 MCP 发布闸门控制。
+
 工具完成后重放结果仍须按当前输出规则、审批版本和 turn 授权重新检查；新增规则可再次隔离已保存的结果，但不会重新执行工具。同内容目录刷新保留原始快照作为审计证据，以连接 revision、完整工具描述、参数和现行授权上下文判断原调用身份；描述、授权上下文或权限变化不会沿用旧批准。
 
 Worker 只允许出站访问已登记的 HTTPS MCP 服务及明确授权的 Secret/OAuth 地址；受管 stdio profile 必须由部署方固定程序 SHA-256、工作目录和环境。边界代理必须使用精确 Host/Origin、TLS、无客户端转发头透传。不要把用户模型供应商密钥、上游 MCP 凭据或审批私钥传入 MCP edge。

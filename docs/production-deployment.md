@@ -4,7 +4,7 @@ This package covers the core data plane without replacing the host's existing we
 
 It does **not** certify unfinished providers, media pipelines, the console/BFF or external identity system. Provider credentials remain absent until their models, prices and failure semantics pass the live certification checklist. Never reuse credentials pasted into chat or issue trackers.
 
-The [2026-09-24 milestone order](milestones.md) requires each real integration to ship its service deployment during R1–R4, followed by complete production acceptance in R5. This core package is not the full product deployment: console/BFF, identity integration, approvals, media/assets/scanning and MCP/Skill workers still need combined orchestration and operational evidence under [LIVE-25](acceptance-backlog.md). The milestone review did not inspect the current server.
+The [2026-09-24 milestone order](milestones.md) requires each real integration to ship its service deployment during R1–R4, followed by complete production acceptance in R5. This core package is not the full product deployment: console/BFF, identity integration, approvals, media/assets/scanning and the remaining MCP/Skill services still need combined orchestration and operational evidence under [LIVE-25](acceptance-backlog.md). The milestone review did not inspect the current server.
 
 ## Server layout
 
@@ -21,6 +21,8 @@ Create the secrets exactly once:
 sudo deploy/production/generate-secrets.sh /opt/brokerrouter/secrets
 ```
 
+The generator also creates a root-only `mcp-judge.env` for the optional semantic worker. On an existing installation, generate just this new secret with `sudo sh deploy/production/create-mcp-judge-env.sh /opt/brokerrouter/secrets`; the command refuses to replace an existing file. It copies the current runtime database URL and result keyring, but no provider credentials. After a result-key rotation, update both environment files together, retaining old keys until stored results expire. The worker uses the existing restricted `brokerrouter_runtime` database role; it has a separate process and Secret file, but not a separate database login.
+
 Set the non-secret deployment values in a root-owned Compose environment file:
 
 ```sh
@@ -36,3 +38,5 @@ The public prefix root serves a minimal, unauthenticated status page so browser 
 `backup.sh` creates a PostgreSQL custom-format dump with mode `0600` and retains 14 days. This same-host backup protects against logical mistakes, not server or disk loss; production acceptance still requires a separately encrypted off-host target and a rehearsed restore. Restores must use a new isolated database first, run `brokerrouter check_schema` through `/health/ready`, and only then switch the loopback upstream.
 
 Provider onboarding is performed through the `operator` profile and a separately injected provider Secret. Apply model/endpoint/FX changes disabled-first, run the live provider certification, and only then activate the endpoint. Restart the gateway after adding or rotating a credential reference because credentials are loaded at process start.
+
+For MCP semantic rules, add only the selected judge endpoint's `credential_env` variable to root-owned `mcp-judge.env` and provision its budget and FX version before enabling the rule. The worker is an optional, unexposed Compose profile: after building the same immutable application image and applying migrations and permissions, start it with `docker compose --file compose.production.yaml --profile mcp up --detach mcp-judge`. Confirm the worker is running, its pending evaluation count drains, and a risk result appears in the approval queue before opening MCP ingress. The core `deploy.sh` does not enable MCP. Stop the worker and disable new MCP semantic admission during rollback; retain its database evaluations, reservations, and historical keyring for reconciliation. This Compose path has passed configuration and local Secret tests only; target-host deployment and full MCP service certification remain open.

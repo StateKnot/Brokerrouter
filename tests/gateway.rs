@@ -31,6 +31,7 @@ enum Reply {
     Tool,
     ToolRoundtrip,
     Stream,
+    StreamTiny,
     StreamLarge,
     StreamBroken,
     StreamNoUsage,
@@ -83,13 +84,17 @@ async fn mock(
     match state.reply {
         Reply::Http(status)=>(StatusCode::from_u16(status).unwrap(),[("location","http://127.0.0.1:9/secret")],"not a billable-success response").into_response(),
         Reply::Embedding=>Json(json!({"object":"list","model":"upstream","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2,0.3]}],"usage":{"prompt_tokens":3,"total_tokens":3}})).into_response(),
-        reply @ (Reply::Stream | Reply::StreamLarge | Reply::StreamBroken | Reply::StreamNoUsage) => {
+        reply @ (Reply::Stream | Reply::StreamTiny | Reply::StreamLarge | Reply::StreamBroken | Reply::StreamNoUsage) => {
             let answer = if matches!(reply, Reply::StreamLarge) { "x".repeat(300_000) } else { "private answer".into() };
             let mut events = vec![
                 json!({"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"upstream","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null,"logprobs":null}],"usage":null}),
                 json!({"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"upstream","choices":[{"index":0,"delta":{"content":answer},"finish_reason":null,"logprobs":null}],"usage":null}),
                 json!({"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"upstream","choices":[{"index":0,"delta":{},"finish_reason":"stop","logprobs":null}],"usage":null}),
             ];
+            if matches!(reply, Reply::StreamTiny) {
+                events[0]["choices"][0]["delta"]["content"] = events[1]["choices"][0]["delta"]["content"].clone();
+                events.remove(1);
+            }
             if !matches!(reply, Reply::StreamNoUsage) {
                 events.push(json!({"id":"chatcmpl-stream","object":"chat.completion.chunk","created":1,"model":"upstream","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}));
             }
@@ -1680,7 +1685,7 @@ async fn client_disconnect_does_not_cancel_stream_settlement(pool: PgPool) {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn stalled_stream_keeps_delivery_slot_after_upstream_settles(pool: PgPool) {
-    let upstream = Mock::start(Reply::Stream).await;
+    let upstream = Mock::start(Reply::StreamTiny).await;
     let (who, _, endpoint) = setup(&pool, "chat", &upstream.url).await;
     sqlx::query("UPDATE endpoints SET supports_streaming=true WHERE id=$1")
         .bind(endpoint.id)
@@ -1723,11 +1728,16 @@ async fn stalled_stream_keeps_delivery_slot_after_upstream_settles(pool: PgPool)
             .unwrap(),
         "succeeded"
     );
-    assert!(matches!(
-        g.execute_stream_in_turn(&who, "stalled-second", streaming_chat(), None)
-            .await,
-        Err(Error::Busy)
-    ));
+    // The upstream has finished. A fully buffered but unread response must
+    // still consume its connection slot after the short send timeout elapsed.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for ordinal in 0..20 {
+        assert!(matches!(
+            g.execute_stream_in_turn(&who, &format!("stalled-{ordinal}"), streaming_chat(), None)
+                .await,
+            Err(Error::Busy)
+        ));
+    }
     let requests: i64 = sqlx::query_scalar("SELECT count(*) FROM requests WHERE tenant_id=$1")
         .bind(who.tenant_id)
         .fetch_one(&pool)
