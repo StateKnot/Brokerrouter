@@ -1026,6 +1026,114 @@ async fn identical_discovery_refresh_preserves_queued_and_completed_call(pool: P
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn expired_latest_discovery_never_falls_back_to_older_tool_grant(pool: PgPool) {
+    let fixture = fixture(&pool, "mcp-latest-expired", false).await;
+    let call_id = Uuid::new_v4();
+    let args = json!({"id":"already-executed"});
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args.clone()
+            )
+            .await,
+        Err(Error::InProgress)
+    ));
+    assert!(fixture.worker.tick().await.unwrap());
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args.clone()
+            )
+            .await,
+        Ok(CallToolResponse::Complete(_))
+    ));
+    mcp_catalog::record_discovery(
+        &pool,
+        RecordDiscovery {
+            tenant_id: fixture.who.tenant_id,
+            server_id: fixture.tool.server_id,
+            operation_id: Uuid::new_v4(),
+            actor: "connector:fixture".into(),
+            expected_server_revision: fixture.tool.server_config_revision,
+            protocol_version: mcp_catalog::PROTOCOL_VERSION.into(),
+            result_type: "complete".into(),
+            supported_versions: vec![mcp_catalog::PROTOCOL_VERSION.into()],
+            capabilities: json!({"tools":{}}),
+            server_info: Some(json!({"name":"fixture","version":"1"})),
+            instructions: None,
+            ttl_ms: 0,
+            cache_scope: CacheScope::Private,
+            tools: vec![fixture.tool.descriptor.clone()],
+            tools_ttl_ms: Some(0),
+            tools_cache_scope: Some(CacheScope::Private),
+            skills: vec![],
+            skills_ttl_ms: None,
+            skills_cache_scope: None,
+            authorization_context_fingerprint: Some("a".repeat(64)),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        mcp_catalog::authorized_tool(&pool, &fixture.who, &fixture.tool.downstream_name)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        mcp_catalog::authorized_tools(&pool, &fixture.who, None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        mcp_catalog::review_tools(&pool, fixture.who.tenant_id, fixture.tool.server_id).await,
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        mcp_catalog::set_tool_grant(
+            &pool,
+            SetToolGrant {
+                tenant_id: fixture.who.tenant_id,
+                key_id: fixture.who.key_id,
+                server_id: fixture.tool.server_id,
+                operation_id: Uuid::new_v4(),
+                actor: "operator:fixture".into(),
+                reason: "must use fresh observation".into(),
+                downstream_name: fixture.tool.downstream_name.clone(),
+                descriptor_sha256: fixture
+                    .tool
+                    .descriptor_hash
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+                active: true,
+            }
+        )
+        .await,
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        fixture
+            .edge
+            .call(&fixture.who, fixture.turn, call_id, fixture.tool, args)
+            .await,
+        Err(Error::Unauthorized)
+    ));
+    assert_eq!(call_count(&fixture.marker), 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn input_approval_survives_identical_refresh_but_not_auth_context_change(pool: PgPool) {
     let fixture = fixture(&pool, "mcp-refresh-approval", false).await;
     common::guardrail(

@@ -241,11 +241,11 @@ async fn current_call_authorized(
            SELECT 1 FROM mcp_discovery_snapshots original
            JOIN mcp_servers s ON s.tenant_id=original.tenant_id AND s.id=original.server_id AND s.active
            JOIN LATERAL (
-             SELECT d.id,d.server_config_revision,d.authorization_context_hash
+             SELECT d.id,d.server_config_revision,d.authorization_context_hash,d.expires_at
              FROM mcp_discovery_snapshots d WHERE d.tenant_id=s.tenant_id AND d.server_id=s.id
-               AND d.server_config_revision=s.config_revision AND d.expires_at>clock_timestamp()
+               AND d.server_config_revision=s.config_revision
              ORDER BY d.observed_at DESC,d.id DESC LIMIT 1
-           ) current ON true
+           ) current ON current.expires_at>clock_timestamp()
            JOIN mcp_discovered_tools t ON t.tenant_id=s.tenant_id AND t.discovery_snapshot_id=current.id
              AND t.server_id=s.id AND t.expires_at>clock_timestamp()
            JOIN mcp_key_tool_grants g ON g.tenant_id=t.tenant_id AND g.key_id=$2 AND g.server_id=t.server_id
