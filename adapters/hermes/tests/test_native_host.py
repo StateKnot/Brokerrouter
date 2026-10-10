@@ -150,6 +150,7 @@ class NativeHostTest(unittest.TestCase):
         )
 
     def agent(self, *, governed=True):
+        os.environ["BROKERROUTER_HERMES_GOVERNANCE"] = "off"
         database = self.Database(self.home / (uuid4().hex + ".db"))
         self.databases.append(database)
         agent = self.Agent(
@@ -165,6 +166,17 @@ class NativeHostTest(unittest.TestCase):
         return agent, database
 
     def bind(self, agent):
+        # Construct the host in off mode, then enable the actual governed runtime
+        # contract. A manually attached fixture Gate must not stand in for the
+        # required-mode history/display settings being exercised here.
+        os.environ.update({
+            "BROKERROUTER_HERMES_GOVERNANCE": "required",
+            "BROKERROUTER_BASE_URL": self.config.base_url,
+            "BROKERROUTER_HERMES_APPROVALS_URL": self.config.approvals_url,
+            "BROKERROUTER_VIRTUAL_KEY": self.config.virtual_key,
+            "BROKERROUTER_HERMES_STATE_DB": str(self.config.state_db),
+            "BROKERROUTER_HERMES_STATE_KEY": self.config.state_key.hex(),
+        })
         clock = Clock()
         agent._brokerrouter_turn_id = self.authority.turn_id
         agent._brokerrouter_governance_gate = GovernanceGate(
@@ -189,8 +201,9 @@ class NativeHostTest(unittest.TestCase):
                 messages = self.run_calls(agent, mode)
                 self.assertNotIn(self.body, repr(messages))
                 durable = database.get_messages(agent.session_id)
-                self.assertTrue(durable, "the real host history flush did not execute")
-                self.assertNotIn(self.body, repr(durable))
+                # A tool release authorizes that tool/model hop; it cannot
+                # authorize an ordinary assistant-turn history projection.
+                self.assertEqual(durable, [], "dedicated final authority has not released this turn")
                 self.assertTrue(agent._tool_guardrail_halt_decision.should_halt)
         self.assertEqual(self.dispatches, [{"number": 1}, {"number": 1}])
         self.assertNotIn(self.body, repr(self.hooks) + repr(self.logs))
@@ -213,7 +226,7 @@ class NativeHostTest(unittest.TestCase):
         posts = [result for name, result in self.hooks if name == "post_tool_call" and self.body in str(result)]
         self.assertCountEqual(posts, results)
         self.assertNotIn("transform_tool_result", [name for name, _ in self.hooks])
-        self.assertIn(self.body, repr(database.get_messages(agent.session_id)))
+        self.assertEqual(database.get_messages(agent.session_id), [])
 
     def test_real_native_restart_rechecks_frozen_text_without_dispatch_or_ordinary_callbacks(self):
         self.register()

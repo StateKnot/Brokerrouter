@@ -1,0 +1,168 @@
+{
+  "date": "2026-10-11",
+  "upstream_revision": "67764dc0863349a384c16425e73ee8571f3a94b7",
+  "base_image": "agentos-mcp-runtime-contract@sha256:943ff581ef4016d9385cbf91b85be7dc5f7176e02091f359fd097432aedfa30f",
+  "host_files": {
+    "agent/tool_executor.py": {
+      "original_sha256": "1610a0893588cbc067aaf84b3d019a683cd83ba0fdb92d69baf4f7b9e6d121b9",
+      "patched_sha256": "4037d2bacf6d2abb2344e8090cb2257e35a0d0816b7da14a8a020d885730a9e8"
+    },
+    "gateway/run_turn.py": {
+      "original_sha256": "dd203228bdfb7f69f1442adf4e24cc7e3196fb348b096ab6e7c2cb2bd2af5214",
+      "patched_sha256": "a518cb574737ae85bc58f3b52de9b8a69d4d949a02031772a3e73ec8b71167c3"
+    },
+    "gateway/run_turn_runner.py": {
+      "original_sha256": "9bfa045616264e944b417ce3bfe0e302168c7b6d0218ceeb253b2dad2629e4ba",
+      "patched_sha256": "b961942e135109c29c969fcdad7ea3df1ff21ddf92a78f1c767aa893905151df"
+    },
+    "model_tools.py": {
+      "original_sha256": "875512e422e3e0d1502f7f7e127d47288bf1f1b350b4442ad5fc210e526b3f67",
+      "patched_sha256": "c9c19a50760e1a1ec7e5884397900ea1a8bfbaf2e5c90bb839f222029276ad06"
+    },
+    "tools/registry.py": {
+      "original_sha256": "ca02644ea36dfa08ab7e12893d283a3b12549a5ffd33ea72c29c632a94e7b201",
+      "patched_sha256": "38c5da3fc20d0ac8c66133216d73a0ae22b46791852c8c4f95482bc0400e5bac"
+    },
+    "gateway/platforms/base.py": {
+      "original_sha256": "14f2bcd915e97ecb2d14cae290e1dc07d36c3247ac9b7599f38c3175670ec52a",
+      "patched_sha256": "8a1c532d3cd7f8be5c26bd29ccf4c62276baa9d805362057459bdc6f0e8fa674"
+    },
+    "gateway/run_voice.py": {
+      "original_sha256": "236853144929c0165f766c9c44927c8acb0c2e575776b68b8a5f6dd0f9e8651f",
+      "patched_sha256": "401f2a830b4fc00a43e84c29ff0f629475d13573ee51c197d2e4936047f96163"
+    },
+    "gateway/delivery_ledger.py": {
+      "original_sha256": "b2656cd6429fb848f8df405fd7bb5e50f2ea6cb0620141c59ccccc3f7c314ab7",
+      "patched_sha256": "d5bafbd4fc6e1598f31d5b4e3e93c27c22e0f9d48c19446fa941e4abb463df63"
+    },
+    "agent/agent_runtime_helpers.py": {
+      "original_sha256": "328f3f8ee5e6956ae530007ec0c22457e3bb681b6125c918cd43ea7124b1767e",
+      "patched_sha256": "18d611d086aac9991c787d7fd751dbeccd814c4bff8f9d7e7c83d8728481c485"
+    },
+    "agent/turn_api_call.py": {
+      "original_sha256": "5dead01b498131df2ee987e431ded73ca21313ef1a52633e9aa802efc2aa00b5",
+      "patched_sha256": "61993076054bf2b1a6dac58f51c3d02c655d4bf389da9d8c69b01708fe436ca0"
+    },
+    "agent/turn_final_response.py": {
+      "original_sha256": "ff414924aa9ffc30fb64b91a602f4621307f22a9f6e5aa3f88e916eabbadbce1",
+      "patched_sha256": "69b424ab6c0f7d57e09d31c78f5c2d42cf6fdb4353b88c526157b0fbb4f33c13"
+    },
+    "agent/turn_finalizer.py": {
+      "original_sha256": "4b79fa4eeb325095b4664df6085df54385d0f38cb6e610c6145c91680f46badd",
+      "patched_sha256": "a303c891581daaeb7a596a7d18c154ea9c2e47b4408d68008a698b32588a3645"
+    },
+    "agent/session_persistence.py": {
+      "original_sha256": "83ee5c9f48a7790deb3f771e45990180e1fd714c7b1fabc24303944f17773a1b",
+      "patched_sha256": "212c8d3606eb445c5f9a4b77a20e01b41c41947bee76e676eb4e9b5b3b599694"
+    },
+    "agent/stream_delivery.py": {
+      "original_sha256": "38d3fda9b9ab09048c14154588e30fa695db89db20efb06fdeb6ffdbf00721c3",
+      "patched_sha256": "e842c348c356fbf340f4304e82a1f1c647b570c53d1d15a492a50f457373de54"
+    },
+    "gateway/session_lifecycle.py": {
+      "original_sha256": "fc8a17d5dd5cbc40fd51abf2b4c75b6c5dd5c1bf1cecbd5f7f4deea8e1f58071",
+      "patched_sha256": "cc2932d5fbd8c6792bc6c02577c1d6156919d0118d90232e9af4a9ab7f821e25"
+    },
+    "agent/auxiliary_client.py": {
+      "original_sha256": "ca46e494e1e518ca793c65c3b4707ae2f3f38c27ee142b2076ff050978d1065b",
+      "patched_sha256": "75bbcfd5f53d475f61d0bff1a47f078cb7f9f0f34a915d315f335b812c9d9e75"
+    },
+    "agent/title_generator.py": {
+      "original_sha256": "1eb801e5f020bb9f32373ed52afb68ab64e384618649260fdf82b12370c13d4b",
+      "patched_sha256": "faf086e96d272cb14cd5afaf0b29f07ea4cea7649fb1d1b966adeb35851e2624"
+    },
+    "agent/chat_completion_helpers.py": {
+      "original_sha256": "2e5308b231ac50cb52b90439f17d7a5e05618d46dd23cffcf45cafb5d77e3073",
+      "patched_sha256": "3011f24301096af685c540b749f5e9a1f6624e8915ae14ead494f10f024b900a"
+    },
+    "gateway/run_inbound.py": {
+      "original_sha256": "d20049510d55674bb60d20cb48f09b71f829880850467b18a9c55a8188e2f9f5",
+      "patched_sha256": "42ebe9fba46e68b096154750ae81a1cbabc0eaf72a852081027ab62f91852f82"
+    }
+  },
+  "adapter_files": {
+    "brokerrouter_hermes/__init__.py": "d5d04f2f1a6ac48a81ee6447dd215b1d0357560f9234ebb240695fa6c682af9c",
+    "brokerrouter_hermes/artifacts.py": "b7fb900b665fb25e528c1080058f1aa6deab7a047e7f725c796530f38060ac13",
+    "brokerrouter_hermes/client.py": "d17b82fea1850ea0a5a350824fa11e13f73bae8b3cb5f711cb0f843afcc49508",
+    "brokerrouter_hermes/config.py": "00654ac25b53629f45b058c650b592f9048176322ede937fe79bffd3cf6b952e",
+    "brokerrouter_hermes/final_publication.py": "3814c886a51b8fe9298136dc9e3108014e29368d22d150b07df9caab2df5ef87",
+    "brokerrouter_hermes/gate.py": "7abbe2ff5ff7a018853425b01990a9f9e043859b62f50c4610e05c6c8a8acd6c",
+    "brokerrouter_hermes/integrity.py": "439a40da472fcdebb32c883d0f4c810ad74a77bb6ad5874d802e5c258b4dba24",
+    "brokerrouter_hermes/model_transport.py": "70897cae199bd1baf776cfb5377ea7b66c45577945d1d0819a47e171b5b4e53c",
+    "brokerrouter_hermes/native.py": "937f03c8395991b598a688a16bf896ee8e9e6741eb5241b3262f45919ad89543",
+    "brokerrouter_hermes/publication.py": "bad5387ac57557d0e0bfbddda9ea68a4b9aab0f1d436ff894e3e4d7de3137a7f",
+    "brokerrouter_hermes/store.py": "1d51056885ba49e4c809b6497b8804950be680c7f3897e5e1ba92974b0a5bbce",
+    "install.py": "6074504fb9944547f7f1ab86d98bdb85ab4fa93ac9b42bf9daab289613731519"
+  },
+  "tests": {
+    "tests/test_adapter.py": "4dd7820f0f5d75e31525322767436b9d426ac4fea87fd1763a86a3cebd411b74",
+    "tests/test_artifact_spool.py": "34d752cb3d8212895ce93c24abe79a505580e00bb9c3217f9946f0dd469a73a6",
+    "tests/test_final_publication.py": "e77cfcff41c65135d9b89a08477304efd98dc7506c5842ab341d678b72beda24",
+    "tests/test_final_publication_boundary.py": "845638086d0ee88aa1fe2dd36bde19ff322f303fad6b4bfaf502e02cdbf4230d",
+    "tests/test_host_contract.py": "f485984a30518f600667ab7a34b8fbb7ba379ea6d75450b716f66bd5de821101",
+    "tests/test_installer.py": "82f4f0ac7aba5477b316f92b9afab53697d1ee37cd83683785c74db593e57ee8",
+    "tests/test_model_transport.py": "4c81007ccab41f45226366cca27e687dee699da7ef70d31cff937548cc2b86bc",
+    "tests/test_native_gate.py": "fa051ade7b4ecc83955e2ba2b7a1f5f840af6ab2e2bf167fa653cb830ee5d4e8",
+    "tests/test_native_host.py": "f6a860ef6ba03fd4f305d0e1e8cdc1e6076bd216bc60781727d5fd8d8fae2d91",
+    "tests/test_native_media.py": "884f49109527fc1a2902b7e3fffe395f736d53b883a80577cb637e831bdbebb0",
+    "tests/test_native_publication.py": "213d3f4c0a03e323c09f4e48792813f2225dacc2cee1454fcf7a9a71bb769fad",
+    "tests/test_native_source.py": "99cd32949d7c454f193ee732cd5a89c6ceef5d5e7dceee2a6e9d88c9222bc9d3",
+    "tests/test_output_gate.py": "e527a3ceaf86b4c9576005c8f5e6fa7e9b505a6a27dbe4fa727b4418c26ce633",
+    "tests/test_results.py": "0b2e73054ec25f2727366b23fa46b5a14f77c71d84f924c62b7c6912a141ef24",
+    "tests/test_transport_tls.py": "824550e09d9d4eb86064749eb344e1248b162e4ed3934d952c9c6ce4b829241b"
+  },
+  "suite": {
+    "tests": 212,
+    "passed": 212,
+    "skipped": 0,
+    "seconds": 69.482,
+    "log": "hermes-final-nineteen-builtins-212.log",
+    "sha256": "ff712ce9b2e29ed1a366f6151363f0812746b414b2a7ae7b7a993b3c41a33f2a",
+    "complete_imports": 19
+  },
+  "limits": [
+    "Local authority/TLS fixtures prove host boundary only; independent native service deployment must still pass actual workbench approval.",
+    "Model transport supports certified OpenAI chat_completions stop/tool_calls only; unsupported auxiliary/provider/proxy/unknown middleware and command extensions remain closed.",
+    "Unknown platform send acknowledgement never blindly retries; isolated local receiver is not external messaging platform certification.",
+    "Binary attachments and voice remain closed until certified opaque artifact byte references are wired.",
+    "Native tools and plugins are trusted Python code; this overlay is not a Python/network sandbox.",
+    "Native fixed off-mode /save renders/writes then calls missing GatewayRunner.get_adapter; this pre-existing upstream behavior is preserved, not certified as successful file delivery.",
+    "Actual wire fields from independent runtime TLS edge were messages/model/stream/stream_options/tools; stream_options include_usage=true was rejected by frozen core540. A corrected service image and fresh native workbench run are still required."
+  ],
+  "closed_required_native_commands": [
+    "review",
+    "refine",
+    "bg",
+    "btw",
+    "compress",
+    "retry",
+    "goal",
+    "subgoal",
+    "heartbeat",
+    "loop",
+    "moa",
+    "save",
+    "debug",
+    "diff",
+    "memory",
+    "skills"
+  ],
+  "logs": {
+    "hermes-final-boundary-red-final.log": "3b5acf1142a7ad6a148c9204bd19849b49eb5d47d77bde919e71222901fb8a01",
+    "hermes-final-boundary-green.log": "4f0fd3aef72aafd5bd62077df81f4ca636d025ceaa287f5c6d60c07fabcee9f3",
+    "hermes-final-full-stable-204.log": "c2bd8f5bd91a154bd371c568f2c5eb71bdc2c2292a4da759c4baacca6999c5ac",
+    "hermes-native-status-red.log": "ecaef7f2b05fc3d94cc0b49d9f270268a2c2179ba09712fc6fab63356be623cd",
+    "hermes-native-status-private-candidate-green.log": "5aad44a02ba7b74c7e93cdd37650ef8297a2f407c9f400e9ee844f12892b2ec2",
+    "hermes-native-control-private-three.log": "f6124c6035a114cc9a556909c7be2229b1ba430cd06877f757c4dc41b2ff24ab",
+    "hermes-final-nineteen-207.log": "d13e39851d764af05d4b2134879dfad202066a29d9a7149131f17d269fe36a52",
+    "hermes-native-builtin-red.log": "ef41389eafe11abaed9d625f2ce57559d263b1c4e8b8ba1aa896914870299b93",
+    "hermes-native-builtin-private-green.log": "c42037acee22e8bb6d6016ac7deaf0ed5e415f890665537b90bd8ecb69da903f",
+    "hermes-native-builtin-five-green.log": "996a9300e9d79ed611cd890b001cb525a0d1321ce154e7a2621735ab08d2c281",
+    "hermes-native-builtin-five-final-green.log": "172845e64e47a554515fd7a43e55e966302eac32709fdd10751dc772fbb6ce0d",
+    "hermes-final-nineteen-builtins-212.log": "ff712ce9b2e29ed1a366f6151363f0812746b414b2a7ae7b7a993b3c41a33f2a"
+  },
+  "status": "fixed nineteen-source host and adapter contracts passed locally; actual native separated-service deployment pending",
+  "whole_base_image_is_official_commit": false,
+  "paid_provider_certification": false,
+  "external_organization_identity_or_channel_certification": false
+}

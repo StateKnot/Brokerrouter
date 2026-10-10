@@ -73,9 +73,13 @@ class NativePublicationTest(unittest.TestCase):
         self.temp.cleanup()
 
     async def final(self, text=None, metadata=None, reply_to=None):
-        result, _adapter = await self.adapter.send_final_ledgered(
+        # This suite tests the existing ledger's once/unknown public seam.
+        # Dedicated current final authority is tested through the real Base
+        # sender in test_final_publication; no local ACK is a release grant.
+        result, _adapter = await self.publication.send_final_once(
+            self.adapter,
             self.event, "fixed-session", self.body if text is None else text,
-            {} if metadata is None else metadata, reply_to=reply_to,
+            {} if metadata is None else metadata, reply_to=reply_to, is_ephemeral_response=False,
         )
         return result
 
@@ -273,7 +277,8 @@ event=SimpleNamespace(text="fixture inbound",message_id="fixed-inbound",ledger_m
  metadata={"brokerrouter_turn":json.loads(os.environ["NATIVE_FIXTURE_BINDING"])},
  source=SimpleNamespace(platform=Platform.TELEGRAM,chat_id="fixed-chat",thread_id=None))
 adapter=Transport(PlatformConfig(),Platform.TELEGRAM)
-asyncio.run(adapter.send_final_ledgered(event,"fixed-session","PRIVATE_RELEASED_TEXT_FIXTURE",{},reply_to=None))
+from brokerrouter_hermes.publication import send_final_once
+asyncio.run(send_final_once(adapter,event,"fixed-session","PRIVATE_RELEASED_TEXT_FIXTURE",{},reply_to=None,is_ephemeral_response=False))
 '''
         process = subprocess.run([sys.executable, "-B", "-c", child], env=dict(os.environ, NATIVE_FIXTURE_BINDING=event),
                                  capture_output=True, text=True, timeout=20)
