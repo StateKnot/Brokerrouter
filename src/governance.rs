@@ -57,6 +57,7 @@ pub(crate) struct Operation {
     pub id: Uuid,
     pub turn_id: Uuid,
     pub key_id: Uuid,
+    pub operation_key: String,
     pub stage: String,
     pub model_id: Option<String>,
     pub tool_name: Option<String>,
@@ -407,7 +408,22 @@ pub(crate) async fn gate_with_grant_deadline(
         return Ok((Gate::Ready, grant_deadline));
     }
     let hash = digest(&json!({"policy":snapshot,"needed":needed}))?;
-    let expires = if op.stage == "post" {
+    let expires = if op.stage == "post"
+        && sqlx::query_scalar::<_, String>(
+            "SELECT operation_key FROM governance_operations WHERE tenant_id=$1 AND id=$2",
+        )
+        .bind(who.tenant_id)
+        .bind(op.id)
+        .fetch_one(&mut **tx)
+        .await?
+        .starts_with(crate::runtime_publications::OUTPUT_PREFIX)
+    {
+        let expiry: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT p.expires_at FROM runtime_final_publications p JOIN governance_operations o ON o.tenant_id=p.tenant_id AND o.key_id=p.key_id AND o.turn_id=p.turn_id AND o.model_id=p.model_id AND o.operation_key=$4||p.id::text WHERE p.tenant_id=$1 AND p.key_id=$2 AND o.id=$3 AND p.result_ciphertext IS NOT NULL AND p.expires_at>clock_timestamp()",
+        ).bind(who.tenant_id).bind(who.key_id).bind(op.id)
+            .bind(crate::runtime_publications::OUTPUT_PREFIX).fetch_optional(&mut **tx).await?;
+        turn.expires_at.min(expiry.ok_or(Error::ResultUnavailable)?)
+    } else if op.stage == "post" {
         let expiry:Option<DateTime<Utc>>=sqlx::query_scalar("SELECT result_expires_at FROM requests WHERE tenant_id=$1 AND governance_turn_id=$2 AND id::text=(SELECT operation_key FROM governance_operations WHERE tenant_id=$1 AND id=$3) AND result_ciphertext IS NOT NULL AND result_expires_at>clock_timestamp()")
             .bind(who.tenant_id).bind(turn.id).bind(op.id).fetch_optional(&mut **tx).await?.flatten();
         turn.expires_at.min(expiry.ok_or(Error::ResultUnavailable)?)
@@ -809,6 +825,7 @@ pub(crate) async fn receipt_in_tx(
 pub async fn maintain(pool: &PgPool) -> Result<()> {
     crate::judge::maintain(pool).await?;
     crate::runtime_results::maintain(pool).await?;
+    crate::runtime_publications::maintain(pool).await?;
     sqlx::query("WITH batch AS (SELECT tenant_id,id FROM governance_operations WHERE state='executing' AND execution_deadline<=clock_timestamp() ORDER BY execution_deadline LIMIT 100 FOR UPDATE SKIP LOCKED) UPDATE governance_operations o SET state='execution_unknown' FROM batch b WHERE o.tenant_id=b.tenant_id AND o.id=b.id").execute(pool).await?;
     sqlx::query("WITH batch AS (SELECT o.tenant_id,o.id FROM governance_operations o JOIN governance_turns t ON o.tenant_id=t.tenant_id AND o.turn_id=t.id WHERE (t.state<>'active' OR t.expires_at<=clock_timestamp()) AND (o.payload_ciphertext IS NOT NULL OR o.receipt_ciphertext IS NOT NULL) ORDER BY t.expires_at,o.id LIMIT 100 FOR UPDATE OF o SKIP LOCKED) UPDATE governance_operations o SET payload_ciphertext=NULL,receipt_ciphertext=NULL FROM batch b WHERE o.tenant_id=b.tenant_id AND o.id=b.id").execute(pool).await?;
     sqlx::query("WITH batch AS (SELECT r.id FROM requests r JOIN governance_turns t ON r.tenant_id=t.tenant_id AND r.governance_turn_id=t.id WHERE (t.state<>'active' OR t.expires_at<=clock_timestamp()) AND r.result_ciphertext IS NOT NULL ORDER BY t.expires_at,r.id LIMIT 100 FOR UPDATE OF r SKIP LOCKED) UPDATE requests r SET result_ciphertext=NULL FROM batch b WHERE r.id=b.id").execute(pool).await?;

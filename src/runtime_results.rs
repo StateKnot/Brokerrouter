@@ -49,7 +49,7 @@ fn metadata(row: &Stored) -> Value {
         "bytes":row.bytes,"expires_at":row.expires_at})
 }
 
-fn ttl_seconds() -> Result<i32> {
+pub(crate) fn ttl_seconds() -> Result<i32> {
     let ttl = match std::env::var("BROKERROUTER_RESULT_TTL_SECONDS") {
         Ok(value) => value.parse().map_err(|_| Error::Configuration)?,
         Err(std::env::VarError::NotPresent) => 86400,

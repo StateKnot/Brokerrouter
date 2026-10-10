@@ -1,0 +1,132 @@
+{
+  "result": "passed",
+  "groups": 16,
+  "facts": [
+    "four independent fixture CAs; separate HUMAN and approvals RSA purposes; generated private Secrets stay outside evidence",
+    "actual release migration31 and canonical grants; isolated ops registered twenty purposes; measured Secret owner with strict TLS/SCRAM",
+    "three independently ready runtime/control/approvals APIs behind separate verified HTTPS; controller created the bound synthetic owner turn",
+    "actual runtime/control/approvals HTTPS succeeds with its own CA and rejects another purpose CA",
+    "separate approvals RSA key cannot mint HUMAN turns even with correct HUMAN kid/type/audience",
+    "actual Agent container mounts only runtime CA; no controller/HUMAN/BFF key, database credential or Docker socket",
+    "one zero-cost real HTTP provider call creates succeeded chat source under the trusted turn; gateway UUID is distinct from provider id",
+    "record acknowledgement body lost on verified HTTPS; exact retry returns one immutable metadata record; replacement conflicts and model remains single-call",
+    "current output policy blocks final plaintext; actual virtual key is rejected by separate approvals API",
+    "actual expired review returns409 with pending approval and zero grants; fresh complete review is required",
+    "real workbench inbox→complete review→explicit acknowledged decision grants only this turn; release returns exact transformed text",
+    "real immutable policy version2 invalidates previous approval; final retry returns only a distinct current pending approval",
+    "gateway process truly restarted; exact publication resumes with policy2 grant and same output operation; provider call/request/publication/settlement remain once",
+    "three purpose-specific runtime/control/approvals LOGIN pools stay <=2 and use actual PostgreSQL TLS",
+    "service logs omit generated credentials, signed assertions, request input and provider/final plaintext",
+    "all own test containers/networks and generated private credentials removed; evidence and frozen source preserved"
+  ],
+  "schema_version": 31,
+  "purpose_registry_count": 20,
+  "synthetic_identity": true,
+  "real_external_idp_verified": false,
+  "native_hermes_history_verified": false,
+  "full_control_plane_verified": false,
+  "model_provider": "isolated_zero_cost_real_HTTP_fixture",
+  "images": {
+    "core": {
+      "reference": "sha256:5401aaad310f24218d1d853206c96d0a1b76c7c46a1304aa1c10d287eebd6e3c",
+      "id": "sha256:5401aaad310f24218d1d853206c96d0a1b76c7c46a1304aa1c10d287eebd6e3c",
+      "revision": null
+    },
+    "provisioner": {
+      "reference": "sha256:2483917b35fd9b6941d2a3b45a95659ec443d96770cc47201d9b7e347ee42847",
+      "id": "sha256:2483917b35fd9b6941d2a3b45a95659ec443d96770cc47201d9b7e347ee42847",
+      "revision": null
+    },
+    "postgres": {
+      "reference": "postgres@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675",
+      "id": "sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675",
+      "revision": null
+    },
+    "node_probe": {
+      "reference": "sha256:595490e76f3a0db1125d1846f84253c506ac219140c0fb82f00e8cc5582854a6",
+      "id": "sha256:595490e76f3a0db1125d1846f84253c506ac219140c0fb82f00e8cc5582854a6",
+      "revision": null
+    },
+    "nginx": {
+      "reference": "nginx@sha256:dc5069ad14f19660b141b21236140b91656bf89bbc3e2417c70ae650cd66104c",
+      "id": "sha256:dc5069ad14f19660b141b21236140b91656bf89bbc3e2417c70ae650cd66104c",
+      "revision": null
+    }
+  },
+  "source_sha256": {
+    "deploy/permissions.sql": "f1291ddeb323e4221da98e6c1afd6f638619a5ef871ce053611d8b41d48df7d8",
+    "deploy/production/control-plane-nginx.conf": "2514d3fcd33894747ccf19cf8e0b4318c424dd8980ede01ddf7fca243dda35db",
+    "deploy/production/create-purpose-secrets.sh": "804ca9dfdc2ad2fd95f55262fedb332cf5e6a970f4aa80a264cf02a66ae08f00",
+    "deploy/production/pg_hba.conf": "41545a20731fd06fd8be721689c7d8e9f68f57cb4b6c27867025f86e7c1b1a8e",
+    "deploy/production/prepare-purpose-admin.py": "a32bd4d5e29a622d5156abb1dab83139940958ce82db867b540a570f2c1338c1",
+    "deploy/production/purpose-logins.py": "4314d3f73e9b28765a9edc511442fcebb97dab49d29bc5fea41b313a5c43e225",
+    "migrations/0001_core.sql": "a424fa4dae5f5d037bf6d28e6eff1807845de9d360e8318362d610a95ffc9dbd",
+    "migrations/0002_accounting_invariants.sql": "603ecca36e725a856e93021fa58fd42c2ddd3318e8a3d139035a9300d94e6b83",
+    "migrations/0003_text_gateway.sql": "10e17fa6fadc227145d14f872dfa59d07dd88a89d096c745e1adabad11ad8da4",
+    "migrations/0004_governance.sql": "9e41baa417ed0258268287714332c60381699b7aa6a762c0aba6ad0808120abc",
+    "migrations/0005_semantic_guardrails.sql": "c005a3a6fd9dd6f0cdcf12206cbb41eb5f0056906cfa80280fc7dcb4dfb8adb2",
+    "migrations/0006_private_assets.sql": "a6b28055358316742e95aebf8a828ffd9b02d6ca128ee1bb201b38981344e51f",
+    "migrations/0007_media_jobs.sql": "928bcf03161a789fe163cb941b60633701d51f62a68700c05840b8252fcd3d19",
+    "migrations/0008_output_quarantine.sql": "d051e0bd7479324a6339b65ccd6b5a20517653dc7b1642ce6b92ae62f05a4686",
+    "migrations/0009_output_scan_evidence.sql": "25afc721b6c722995be4ddea7a13ada30b27a1aa5c9375bf84ec2f0c1982106f",
+    "migrations/0010_output_delivery.sql": "7d6c5661c9942919ef4c3cafd1a33fe509da3374c00461b464eed0294d74cdf6",
+    "migrations/0011_console_reporting.sql": "60e9ce99306b51ef18d231921f0ff1ad9bbee109e84226af57537170b781f005",
+    "migrations/0012_oidc_bff.sql": "ac3258528360a177103b800cf67e41a4604e3c0c72fec32770d3746526b90450",
+    "migrations/0013_catalog_management.sql": "406c479fa6374a88c4285221e4edce53bc218ffe75933f1ccb5ef4a6a10506a7",
+    "migrations/0014_key_fx_management.sql": "7c89bb9125e21d3a9a0992f0a01253ebca72dabe5c2a75c93573d515f115519f",
+    "migrations/0015_governance_settings.sql": "e2e188f2a778f1e12f7648bb565e5dcea89441aafc71f148c4a6fe24a132e738",
+    "migrations/0016_guardrail_monitoring.sql": "71d0820bd1d59319df133719ec767e3b42d6eeef61a09dd93f516fb46668e10e",
+    "migrations/0017_approval_reviews.sql": "955b7ce565ccd27f78979fcee1b9994db360b0ca8f03856f1c9368285786fcea",
+    "migrations/0018_media_reviews.sql": "fb19b541469ff8a7359a798a09c78e0fb8d573b6495ec250926d04e2eb1867a8",
+    "migrations/0019_execution_traces.sql": "4e253c1fef0e49484c910aebdf7ad1d9183d79a48c0282a956bd5b449fb510c9",
+    "migrations/0020_mcp_catalog.sql": "331215ba05eee5ed58e4c66dc649332666c3830c23a3a6b878378aea0f3ca2ad",
+    "migrations/0021_mcp_tool_catalog.sql": "01970591a938a1204f13dcc759d1140d382c0cc2ec55970612ecb71be84272ae",
+    "migrations/0022_mcp_oauth_principals.sql": "c7215d4eca4c0f5c36cc0d4698a2f021dac1e672044f0a3407cab04ddca8ad47",
+    "migrations/0023_chat_streaming.sql": "96b8fbc0da365611cf76f26a923fc0025b873360dcfb77a921c0f6e21e746339",
+    "migrations/0024_mcp_tool_calls.sql": "0ae9edb88e22c7d67b4f919a17cc9faa816db12b2fa7b83ff29aa91e08ce40a9",
+    "migrations/0025_mcp_skill_catalog.sql": "f59612b77746d90f828041caa298514a6b8ec4f849d137661ffa7fd563ff331c",
+    "migrations/0026_mcp_skill_get.sql": "76aa114bc4d24db6cf7821627742c2fc415d8ccb50ac23aa256f1dcf5e5505b5",
+    "migrations/0027_mcp_skill_approvals.sql": "6e06e82e12e426fec4e3a48e41c8661596615696ec26ee9700bca557b36d6176",
+    "migrations/0028_mcp_skill_resources.sql": "88a51c78c122e74d363490d5a1537fcb687259c578637a5622e7f1f0a402efe4",
+    "migrations/0029_runtime_tool_results.sql": "ae9fba98bce6f5598e44db1a3e38db4b5c1ed92a788c445021296b97102ae358",
+    "migrations/0030_runtime_artifact_quarantine.sql": "d758428b1302092f2da3afdb01482bd2fc419b82b2864465b8f2247620979ac2",
+    "migrations/0031_runtime_final_publications.sql": "504d75e8da08ab3d3c293eb95da101da59a9a7ef05dde44515b84bf005c39fbd"
+  },
+  "test_source_sha256": {
+    "acceptance.py": "8cb9e7415c6f2c948dc5f9d51a74ecab0dacd32263d4ed1b8047e2e201ee2843",
+    "provider.js": "fce9695efd840367deadd49fa82afd2220651d90d354573cbf9c33d26740a563",
+    "../identity/acceptance.py": "fe36149ca474ab6c899216688733f60bb82a2d851fc997fb2b872a50bc97142b"
+  },
+  "roundtrip": {
+    "gateway_request_id": "16934db3-9048-481a-bdbc-cb8e305c3389",
+    "publication_id": "638e19a6-a4c3-4898-83dc-87ac135fbcb4",
+    "approval_ids": [
+      "ba1dace8-700c-4d7c-abe3-715e6e1aa3ea",
+      "e049a337-0d75-4c82-bf27-fd48f471f272"
+    ],
+    "provider_calls": 1,
+    "counts": {
+      "requests": 1,
+      "publications": 1,
+      "approvals": 2,
+      "grants": 2,
+      "finalize_ledger_entries": 1
+    },
+    "text_sha256": "77fe4afe9e03b31ce2abc2452946683ae48a0b8fd6f3380db82fba5319d3f999",
+    "text_bytes": 65
+  },
+  "own_cleanup_verified": true,
+  "duration_seconds": 64.09,
+  "logs_sha256": {
+    "r1-final-publications-services.log": "9768d63db3c6c09c2217651e8c6afd278b26558bdfb5efdaa700a8d33be16ce8"
+  },
+  "core_input_manifest_sha256": "653333d6939d3cfad3514dfda257a1c3acd7ae04c8e1767d0bc76bdf8d390d84",
+  "core_input_count": 100,
+  "matching_compiled_migrations_verified": true,
+  "formal_root_quality_status": "pending_parent_final_verification",
+  "actual_run_log_sha256": "48886473fdc5ab0b13d4221ba64315e27dce562793b7bdbebe3676b378fefd3e",
+  "retained_red_evidence": {
+    "r1-final-publications-run1.log": "26a05597009ebcd9dc4c50a952ee4aa4b5af56ab868c36aa01af9777617f5246",
+    "cause": "new fixture expected200 while actual schema-aware ready API returns204; fixed fixture and fresh run2 passed"
+  }
+}

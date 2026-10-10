@@ -494,6 +494,13 @@ async fn resolve_inner(
     if op.stage == "media_output" {
         crate::output_delivery::validate_operation(&mut tx, &who, &op).await?;
     }
+    if decision.decision == "continue_this_turn"
+        && op
+            .operation_key
+            .starts_with(crate::runtime_publications::OUTPUT_PREFIX)
+    {
+        crate::runtime_publications::validate_approval(&mut tx, cipher, &who, &op).await?;
+    }
     let current = governance::selected(
         &mut tx,
         &who,
@@ -563,6 +570,17 @@ async fn resolve_inner(
             .bind(human.tenant_id).bind(id.to_string()).bind(json!({"user_id":human.id,"review_id":review_id,"operation_id":op.id,"state":state,"approved_guardrail_ids":decision.approved_guardrail_ids})).execute(&mut *tx).await?;
     }
     crate::approval_workbench::fresh(&mut tx, human).await?;
+    if decision.decision == "continue_this_turn"
+        && op
+            .operation_key
+            .starts_with(crate::runtime_publications::OUTPUT_PREFIX)
+    {
+        crate::runtime_publications::validate_approval(&mut tx, cipher, &who, &op).await?;
+    }
+    if let Some(review_id) = review_id {
+        crate::approval_workbench::validate_review(&mut tx, human, review_id, &a, &op, &decision)
+            .await?;
+    }
     tx.commit().await?;
     let mut result = governance::approval_view(&a);
     result["state"] = state.into();

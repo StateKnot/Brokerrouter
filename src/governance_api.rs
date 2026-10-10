@@ -3,7 +3,8 @@ use crate::{
     cipher::ResultCipher,
     error::{Error, Result},
     gateway::Gateway,
-    governance, human, mcp_skill_approvals, mcp_skill_resources, runtime_results,
+    governance, human, mcp_skill_approvals, mcp_skill_resources, runtime_publications,
+    runtime_results,
 };
 use axum::{
     Json, Router,
@@ -21,6 +22,14 @@ pub fn runtime_routes(gateway: Gateway) -> Router {
     Router::new()
         .route("/v1/governance/checks", post(check))
         .route("/v1/governance/tool-results", post(record_tool_result))
+        .route(
+            "/v1/governance/final-publications",
+            post(record_final_publication),
+        )
+        .route(
+            "/v1/governance/final-publications/{id}/release",
+            post(release_final_publication),
+        )
         .route(
             "/v1/governance/tool-results/{id}/release",
             post(release_tool_result),
@@ -95,8 +104,11 @@ async fn check(
     if check
         .operation_key
         .starts_with(runtime_results::OUTPUT_PREFIX)
+        || check
+            .operation_key
+            .starts_with(runtime_publications::OUTPUT_PREFIX)
     {
-        return Err(Error::Invalid("reserved tool result operation key"));
+        return Err(Error::Invalid("reserved runtime output operation key"));
     }
     if !matches!(
         check.stage.as_str(),
@@ -154,12 +166,39 @@ async fn generic_operation(g: &Gateway, who: &crate::store::Identity, id: Uuid) 
     .fetch_optional(&g.pool)
     .await?
     .ok_or(Error::NotFound)?;
-    if key.starts_with(runtime_results::OUTPUT_PREFIX) {
+    if key.starts_with(runtime_results::OUTPUT_PREFIX)
+        || key.starts_with(runtime_publications::OUTPUT_PREFIX)
+    {
         return Err(Error::Invalid(
-            "tool result outputs are released without runtime claims or receipts",
+            "runtime outputs are released without claims or receipts",
         ));
     }
     Ok(())
+}
+async fn record_final_publication(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Json(body): Json<runtime_publications::Record>,
+) -> Result<Json<Value>> {
+    let who = api::identity(&g.pool, &headers).await?;
+    let worker = g.clone();
+    let task = g.tasks.spawn(async move {
+        runtime_publications::record(&worker.pool, &worker.cipher, &who, body).await
+    });
+    Ok(Json(task.await.map_err(|_| Error::Configuration)??))
+}
+async fn release_final_publication(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(_): Json<ReleaseToolResult>,
+) -> Result<Json<Value>> {
+    let who = api::identity(&g.pool, &headers).await?;
+    let worker = g.clone();
+    let task = g
+        .tasks
+        .spawn(async move { runtime_publications::release(&worker, &who, id).await });
+    Ok(Json(task.await.map_err(|_| Error::Configuration)??))
 }
 async fn operation(
     State(g): State<Gateway>,

@@ -47,6 +47,11 @@ struct Chunk {
     sha256: Vec<u8>,
     state: String,
 }
+#[derive(Clone)]
+enum WriteOwner {
+    Media(Uuid),
+    Runtime { batch: Uuid, claim: Vec<u8> },
+}
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateAsset {
@@ -169,6 +174,7 @@ impl Assets {
     pub async fn create(&self, who: &Identity, idem: &str, body: CreateAsset) -> Result<Value> {
         if !governance::valid_text(idem, 200)
             || idem.starts_with("_br_output:")
+            || idem.starts_with(crate::runtime_artifacts::ASSET_PREFIX)
             || !(1..=MAX_ASSET_BYTES).contains(&body.byte_length)
             || !(60..=2592000).contains(&body.ttl_seconds)
             || !valid_media_type(&body.media_type)
@@ -248,8 +254,26 @@ impl Assets {
         bytes: Bytes,
         owner: Uuid,
     ) -> Result<Value> {
-        self.put_chunk_inner(who, id, ordinal, bytes, Some(owner))
+        self.put_chunk_inner(who, id, ordinal, bytes, Some(WriteOwner::Media(owner)))
             .await
+    }
+    pub(crate) async fn put_runtime_chunk(
+        &self,
+        who: &Identity,
+        id: Uuid,
+        ordinal: i32,
+        bytes: Bytes,
+        batch: Uuid,
+        claim: Vec<u8>,
+    ) -> Result<Value> {
+        self.put_chunk_inner(
+            who,
+            id,
+            ordinal,
+            bytes,
+            Some(WriteOwner::Runtime { batch, claim }),
+        )
+        .await
     }
     async fn put_chunk_inner(
         &self,
@@ -257,7 +281,7 @@ impl Assets {
         id: Uuid,
         ordinal: i32,
         bytes: Bytes,
-        owner: Option<Uuid>,
+        owner: Option<WriteOwner>,
     ) -> Result<Value> {
         if bytes.is_empty() || bytes.len() > CHUNK_BYTES {
             return Err(Error::Invalid("invalid asset chunk size"));
@@ -266,7 +290,7 @@ impl Assets {
         let mut tx = self.pool.begin().await?;
         authorize(&mut tx, who).await?;
         let a = asset(&mut tx, who, id).await?;
-        write_authority(&mut tx, who, &a, owner).await?;
+        write_authority(&mut tx, who, &a, owner.as_ref()).await?;
         writable(&a)?;
         if ordinal < 0
             || ordinal >= a.chunk_count
@@ -312,9 +336,12 @@ impl Assets {
         let mut tx = self.pool.begin().await?;
         authorize(&mut tx, who).await?;
         let current = asset(&mut tx, who, id).await?;
-        write_authority(&mut tx, who, &current, owner).await?;
+        write_authority(&mut tx, who, &current, owner.as_ref()).await?;
         writable(&current)?;
         sqlx::query("UPDATE asset_chunks SET state='stored' WHERE tenant_id=$1 AND asset_id=$2 AND ordinal=$3").bind(who.tenant_id).bind(id).bind(ordinal).execute(&mut *tx).await?;
+        if matches!(owner, Some(WriteOwner::Runtime { .. })) {
+            write_authority(&mut tx, who, &current, owner.as_ref()).await?;
+        }
         tx.commit().await?;
         Ok(
             json!({"asset_id":id,"ordinal":ordinal,"state":"stored","sha256":governance::hex(&hash)}),
@@ -360,18 +387,39 @@ impl Assets {
         id: Uuid,
         owner: Uuid,
     ) -> Result<Value> {
-        self.complete_inner(who, id, Some(owner)).await
+        self.complete_inner(who, id, Some(WriteOwner::Media(owner)))
+            .await
     }
-    async fn complete_inner(&self, who: &Identity, id: Uuid, owner: Option<Uuid>) -> Result<Value> {
+    pub(crate) async fn complete_runtime(
+        &self,
+        who: &Identity,
+        id: Uuid,
+        batch: Uuid,
+        claim: Vec<u8>,
+    ) -> Result<Value> {
+        self.complete_inner(who, id, Some(WriteOwner::Runtime { batch, claim }))
+            .await
+    }
+    async fn complete_inner(
+        &self,
+        who: &Identity,
+        id: Uuid,
+        owner: Option<WriteOwner>,
+    ) -> Result<Value> {
         let mut tx = self.pool.begin().await?;
         authorize(&mut tx, who).await?;
         let a = asset(&mut tx, who, id).await?;
-        write_authority(&mut tx, who, &a, owner).await?;
-        if a.state == "available" && a.expires_at > Utc::now() {
+        write_authority(&mut tx, who, &a, owner.as_ref()).await?;
+        let runtime = matches!(owner, Some(WriteOwner::Runtime { .. }));
+        if !runtime && a.state == "available" && a.expires_at > Utc::now() {
             tx.commit().await?;
             return Ok(view(&a));
         }
-        writable(&a)?;
+        if runtime && a.state == "available" {
+            readable(&a)?;
+        } else {
+            writable(&a)?;
+        }
         let chunks: Vec<Chunk> = sqlx::query_as(
             "SELECT * FROM asset_chunks WHERE tenant_id=$1 AND asset_id=$2 ORDER BY ordinal",
         )
@@ -404,7 +452,7 @@ impl Assets {
         let mut tx = self.pool.begin().await?;
         authorize(&mut tx, who).await?;
         let a = asset(&mut tx, who, id).await?;
-        write_authority(&mut tx, who, &a, owner).await?;
+        write_authority(&mut tx, who, &a, owner.as_ref()).await?;
         if a.state == "available" && a.expires_at > Utc::now() {
             tx.commit().await?;
             return Ok(view(&a));
@@ -423,6 +471,9 @@ impl Assets {
             json!({"bytes":a.byte_length,"content_safety":"not_evaluated"}),
         )
         .await?;
+        if runtime {
+            write_authority(&mut tx, who, &a, owner.as_ref()).await?;
+        }
         tx.commit().await?;
         Ok(view(&a))
     }
@@ -532,15 +583,25 @@ async fn write_authority(
     tx: &mut Tx<'_>,
     who: &Identity,
     a: &Asset,
-    owner: Option<Uuid>,
+    owner: Option<&WriteOwner>,
 ) -> Result<()> {
     match owner {
         None => input_only(a),
-        Some(token) if a.kind == "output" => {
-            crate::outputs::write_authority(tx, who, a.id, token).await
+        Some(WriteOwner::Media(token)) if a.kind == "output" => {
+            crate::outputs::write_authority(tx, who, a.id, *token).await
+        }
+        Some(WriteOwner::Runtime { batch, claim }) if a.kind == "runtime_output" => {
+            crate::runtime_artifacts::write_authority(tx, who, a.id, *batch, claim).await
         }
         Some(_) => Err(Error::NotFound),
     }
+}
+pub(crate) async fn tombstone_runtime(tx: &mut Tx<'_>, who: &Identity, id: Uuid) -> Result<()> {
+    let a = asset(tx, who, id).await?;
+    if a.kind != "runtime_output" {
+        return Err(Error::NotFound);
+    }
+    tombstone(tx, &a).await
 }
 pub(crate) async fn tombstone_output(tx: &mut Tx<'_>, who: &Identity, id: Uuid) -> Result<()> {
     let a = asset(tx, who, id).await?;

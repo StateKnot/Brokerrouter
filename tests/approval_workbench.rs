@@ -73,6 +73,41 @@ async fn proof_expiring_during_decision_audit_rolls_back_grants_and_decision(poo
         "pending"
     );
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn review_expiring_during_decision_audit_rolls_back_grants_and_decision(pool: PgPool) {
+    let f = setup(&pool, "alice").await;
+    let mut r = review(&pool, &f).await;
+    let id = Uuid::new_v4();
+    sqlx::query("WITH moment AS MATERIALIZED (SELECT clock_timestamp() AS now) INSERT INTO approval_reviews SELECT tenant_id,$1,approval_id,user_id,payload_hash,policy_hash,can_continue,now-interval '294 seconds',now+interval '6 seconds' FROM approval_reviews CROSS JOIN moment WHERE id=$2")
+        .bind(id).bind(Uuid::parse_str(r["review_id"].as_str().unwrap()).unwrap()).execute(&pool).await.unwrap();
+    r["review_id"] = json!(id);
+    let body = decision(&f, &r);
+    sqlx::raw_sql("CREATE SEQUENCE fixture_review_decision_reached; CREATE FUNCTION slow_review_decision_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action='approval.decided' THEN PERFORM nextval('fixture_review_decision_reached'); PERFORM pg_sleep(7); END IF; RETURN NEW; END $$; CREATE TRIGGER slow_review_decision BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION slow_review_decision_audit();")
+        .execute(&pool).await.unwrap();
+    assert_eq!(call(&pool, &f, "alice", DECIDE, &body).await.0, 409);
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT is_called FROM fixture_review_decision_reached")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM guardrail_grants")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM approvals WHERE id=$1")
+            .bind(f.approval)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "pending"
+    );
+}
 struct Fixture {
     who: store::Identity,
     turn: Uuid,

@@ -175,7 +175,18 @@ pub async fn review(pool: &PgPool, cipher: &ResultCipher, who: &Human, q: Review
                 {
                     return Err(Error::ResultUnavailable);
                 }
-                can_continue = reviewable(&op.stage, &value);
+                can_continue = if op
+                    .operation_key
+                    .starts_with(crate::runtime_publications::OUTPUT_PREFIX)
+                {
+                    crate::runtime_publications::review_payload(
+                        &mut tx, &identity, &op, &turn, &value,
+                    )
+                    .await?;
+                    true
+                } else {
+                    reviewable(&op.stage, &value)
+                };
                 if can_continue {
                     payload = Value::String(
                         String::from_utf8(plain).map_err(|_| Error::ResultUnavailable)?,

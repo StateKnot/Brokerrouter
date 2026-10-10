@@ -152,6 +152,9 @@ enum Command {
     ServeAssets {
         #[arg(long, default_value = "127.0.0.1:8082")]
         bind: SocketAddr,
+        /// Serve only private native tool output capture with its isolated DB role.
+        #[arg(long)]
+        runtime_output: bool,
     },
     AssetQuotaSet {
         #[arg(long)]
@@ -1071,22 +1074,44 @@ async fn main() -> anyhow::Result<()> {
         Command::AssetQuotaSet { tenant, key, bytes } => {
             brokerrouter::assets::set_quota(&pool, tenant, key, bytes).await?;
         }
-        Command::ServeAssets { bind } => {
+        Command::ServeAssets {
+            bind,
+            runtime_output,
+        } => {
             brokerrouter::check_schema(&pool).await?;
             let assets = brokerrouter::assets::Assets::from_env(pool.clone())?;
+            let artifacts = if runtime_output {
+                Some(brokerrouter::runtime_artifacts::RuntimeArtifacts::new(
+                    assets.clone(),
+                    brokerrouter::cipher::ResultCipher::from_env()?,
+                ))
+            } else {
+                None
+            };
             let worker = assets.clone();
+            let artifact_worker = artifacts.clone();
             let maintenance = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
                 loop {
                     interval.tick().await;
-                    if worker.maintain().await.is_err() {
+                    let result = if let Some(artifacts) = &artifact_worker {
+                        artifacts.maintain().await
+                    } else {
+                        worker.maintain().await
+                    };
+                    if result.is_err() {
                         tracing::error!("asset maintenance failed");
                     }
                 }
             });
             let listener = tokio::net::TcpListener::bind(bind).await?;
             tracing::info!(address=%bind,"brokerrouter assets listening");
-            axum::serve(listener, brokerrouter::asset_api::router(assets.clone()))
+            let router = if let Some(artifacts) = artifacts {
+                brokerrouter::runtime_artifact_api::router(artifacts)
+            } else {
+                brokerrouter::asset_api::router(assets.clone())
+            };
+            axum::serve(listener, router)
                 .with_graceful_shutdown(shutdown())
                 .await?;
             assets.drain().await;

@@ -369,4 +369,52 @@ GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_mcp_catalog,brokerro
 -- operation but cannot read, replace or delete the separately held body.
 GRANT SELECT,INSERT ON runtime_tool_results TO brokerrouter_runtime;
 GRANT UPDATE(result_ciphertext) ON runtime_tool_results TO brokerrouter_runtime;
+GRANT SELECT,INSERT ON runtime_final_publications TO brokerrouter_runtime;
+GRANT UPDATE(result_ciphertext) ON runtime_final_publications TO brokerrouter_runtime;
+GRANT SELECT ON runtime_final_publication_review_facts
+    TO brokerrouter_runtime,brokerrouter_approvals,brokerrouter_governance_control;
+-- Append to deploy/permissions.sql after 0030. Separate storage purpose; never
+-- inherit runtime/input/media/scanner/delivery/human roles.
+DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_runtime_assets') THEN
+    CREATE ROLE brokerrouter_runtime_assets NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+END IF; END $$;
+REVOKE brokerrouter_runtime,brokerrouter_assets,brokerrouter_media_outputs,
+    brokerrouter_output_scan,brokerrouter_output_delivery,brokerrouter_media_review,
+    brokerrouter_approvals,brokerrouter_governance_control FROM brokerrouter_runtime_assets;
+GRANT USAGE ON SCHEMA public TO brokerrouter_runtime_assets;
+GRANT SELECT ON _sqlx_migrations,governance_users,runtime_bindings,governance_turns,
+    governance_operations,models,key_models,runtime_artifact_batches,runtime_artifacts,
+    assets,asset_chunks TO brokerrouter_runtime_assets;
+GRANT SELECT(id,active,asset_used_bytes,asset_quota_bytes) ON tenants TO brokerrouter_runtime_assets;
+GRANT SELECT(tenant_id,id,key_hash,revoked_at,expires_at,asset_used_bytes,asset_quota_bytes)
+    ON virtual_keys TO brokerrouter_runtime_assets;
+GRANT UPDATE(governance_lock,asset_used_bytes) ON tenants TO brokerrouter_runtime_assets;
+GRANT UPDATE(asset_used_bytes) ON virtual_keys TO brokerrouter_runtime_assets;
+GRANT INSERT ON runtime_artifact_batches,runtime_artifacts,assets,asset_chunks,
+    governance_events,audit_events TO brokerrouter_runtime_assets;
+GRANT UPDATE(state,reserved_bytes,manifest_hash,receipt_hash,evidence_ref)
+    ON runtime_artifact_batches TO brokerrouter_runtime_assets;
+GRANT UPDATE(state,receipt_hash,receipt_ciphertext,payload_ciphertext)
+    ON governance_operations TO brokerrouter_runtime_assets;
+GRANT UPDATE(event_clock) ON governance_turns TO brokerrouter_runtime_assets;
+GRANT UPDATE(state,completed_at,deleted_at,gc_after,gc_checked_at,gc_cursor,sha256)
+    ON assets TO brokerrouter_runtime_assets;
+GRANT UPDATE(state) ON asset_chunks TO brokerrouter_runtime_assets;
+GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_runtime_assets;
+DROP POLICY IF EXISTS brokerrouter_runtime_asset_storage ON assets;
+CREATE POLICY brokerrouter_runtime_asset_storage ON assets TO brokerrouter_runtime_assets
+    USING(kind='runtime_output') WITH CHECK(kind='runtime_output');
+DROP POLICY IF EXISTS brokerrouter_runtime_asset_purpose ON assets;
+CREATE POLICY brokerrouter_runtime_asset_purpose ON assets AS RESTRICTIVE TO brokerrouter_runtime_assets
+    USING(kind='runtime_output') WITH CHECK(kind='runtime_output');
+DROP POLICY IF EXISTS brokerrouter_runtime_chunk_storage ON asset_chunks;
+CREATE POLICY brokerrouter_runtime_chunk_storage ON asset_chunks TO brokerrouter_runtime_assets
+    USING(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id AND a.id=asset_chunks.asset_id AND a.kind='runtime_output'))
+    WITH CHECK(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id AND a.id=asset_chunks.asset_id AND a.kind='runtime_output'));
+DROP POLICY IF EXISTS brokerrouter_runtime_chunk_purpose ON asset_chunks;
+CREATE POLICY brokerrouter_runtime_chunk_purpose ON asset_chunks AS RESTRICTIVE TO brokerrouter_runtime_assets
+    USING(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id AND a.id=asset_chunks.asset_id AND a.kind='runtime_output'))
+    WITH CHECK(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id AND a.id=asset_chunks.asset_id AND a.kind='runtime_output'));
+GRANT SELECT ON runtime_artifact_batches,runtime_artifacts TO brokerrouter_operator;
+
 COMMIT;
