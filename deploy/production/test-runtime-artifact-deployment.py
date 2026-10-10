@@ -90,6 +90,37 @@ class ArtifactPurposeUpgrade(unittest.TestCase):
         self.call("upgrade-runtime-artifacts",str(self.root))
         self.assertFalse((self.root/"purpose-logins-v2").exists())
 
+    def test_dangling_pending_links_fail_closed_without_changing_committed_secrets(self):
+        legacy=self.legacy();original=self.snapshot(legacy)
+        old_pending=self.root/".purpose-logins.pending"
+        old_pending.symlink_to(self.root/"missing-old-release")
+        self.call("create",str(self.root),success=False)
+        self.assertEqual(self.snapshot(legacy),original)
+        old_pending.unlink()
+        self.call("upgrade-runtime-artifacts",str(self.root))
+        release=self.root/"purpose-logins-v2";upgraded=self.snapshot(release)
+        pending=self.root/".purpose-logins-v2.pending"
+        pending.symlink_to(self.root/"missing-upgrade-release")
+        self.assertFalse(pending.exists());self.assertTrue(pending.is_symlink())
+        self.call("upgrade-runtime-artifacts",str(self.root),success=False)
+        with self.assertRaises(ValueError):helper.select_manifest(self.root,True)
+        # The independent, original v1 release remains usable by default.
+        self.assertEqual(helper.select_manifest(self.root,False)["version"],1)
+        self.assertEqual(self.snapshot(legacy),original)
+        self.assertEqual(self.snapshot(release),upgraded)
+
+    def test_fresh_version2_never_ignores_dangling_second_release_paths(self):
+        self.call("create",str(self.root))
+        original=self.snapshot(self.root/"purpose-logins")
+        for name in (".purpose-logins-v2.pending","purpose-logins-v2"):
+            with self.subTest(path=name):
+                conflict=self.root/name;conflict.symlink_to(self.root/"missing-second-release")
+                self.call("upgrade-runtime-artifacts",str(self.root),success=False)
+                for explicit in (False,True):
+                    with self.assertRaises(ValueError):helper.select_manifest(self.root,explicit)
+                self.assertEqual(self.snapshot(self.root/"purpose-logins"),original)
+                conflict.unlink()
+
 class OptionalArtifactDeployment(unittest.TestCase):
     def test_actual_compose_profile_is_separate_and_default_service_budget_unchanged(self):
         env = {name:value for name,value in os.environ.items() if not name.startswith("BROKERROUTER_")}

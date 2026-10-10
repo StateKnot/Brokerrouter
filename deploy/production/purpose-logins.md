@@ -103,6 +103,8 @@ sh deploy/production/apply-purpose-logins.sh --with-runtime-artifacts \
 
 升级核对完整旧集，将原 57 份 Secret 原字节保存在独立 `purpose-logins-v2`，只生成新增用途的 password/env/SCRAM；旧 `purpose-logins` 与旧 manifest 不变。中断恢复继续使用已提交的新密码；任何字节、角色、继承或已注册密码冲突都失败关闭。SQL 核对原 19 个注册事实并与新增身份同事务提交，不重置已有 LOGIN。
 
+发布或待发布路径中的悬空 symlink 也视为已有状态，不能因目标不存在而跳过冲突检查。显式升级拒绝此状态，保留已发布 Secret 原字节；新装 version 2 同样拒绝第二份发布或待发布目录的悬空链接。原 version 1 的默认应用仍只使用其独立、已验证的旧发布集。
+
 旧环境为产物 profile 选择 `$BROKERROUTER_SECRET_DIR/purpose-logins-v2/runtime-assets.env`；新装选择 `$BROKERROUTER_SECRET_DIR/purpose-logins/runtime-assets.env`。独立配置 JSON 只含 `runtime-assets`，用 `control-plane-config.py` 发布到新的受保护外部目录；旧 14 组件配置目录保持不变。
 
 ```sh

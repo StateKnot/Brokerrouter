@@ -39,6 +39,11 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def present(path):
+    # Dangling links are state too: never ignore a conflicting release path.
+    return path.exists() or path.is_symlink()
+
+
 class DatabaseFailure(ValueError):
     def __init__(self, code):
         self.code = code
@@ -156,12 +161,12 @@ def validate(directory):
 def create(root):
     target = root / "purpose-logins"
     pending = root / ".purpose-logins.pending"
-    if target.exists() or target.is_symlink():
+    if present(target):
         validate(target)
-        require(not pending.exists(), "published and pending state coexist; inspect before recovery")
+        require(not present(pending), "published and pending state coexist; inspect before recovery")
         print("Existing purpose secrets verified; no files replaced")
         return
-    if not pending.exists():
+    if not present(pending):
         pending.mkdir(mode=0o700)
     private(pending, True)
     # Discard only uncommitted atomic-write links before validating a complete
@@ -169,7 +174,7 @@ def create(root):
     for temporary in pending.glob(".writing-*"):
         private(temporary)
         temporary.unlink()
-    if (pending / "manifest.json").exists():
+    if present(pending / "manifest.json"):
         previous = validate(pending)
         if previous["version"] == 1:
             sync_directory(pending)
@@ -213,9 +218,13 @@ def create(root):
 
 def select_manifest(root, with_runtime_artifacts=False):
     base = validate(root / "purpose-logins")
-    if not with_runtime_artifacts or base["version"] == 2:
+    if base["version"] == 2:
+        require(not present(root / ".purpose-logins-v2.pending") and not present(root / "purpose-logins-v2"),
+                "unexpected second version 2 release")
         return base
-    require(not (root / ".purpose-logins-v2.pending").exists(), "published and pending upgrades coexist; inspect before recovery")
+    if not with_runtime_artifacts:
+        return base
+    require(not present(root / ".purpose-logins-v2.pending"), "published and pending upgrades coexist; inspect before recovery")
     upgraded = validate(root / "purpose-logins-v2")
     require(upgraded["version"] == 2, "runtime artifact purpose requires version 2")
     require([entry for entry in upgraded["roles"] if entry["purpose"] != "runtime-assets"] == base["roles"],
@@ -232,15 +241,15 @@ def upgrade_runtime_artifacts(root):
     base = validate(root / "purpose-logins")
     target, pending = root / "purpose-logins-v2", root / ".purpose-logins-v2.pending"
     if base["version"] == 2:
-        require(not pending.exists() and not target.exists(), "unexpected second version 2 release")
+        require(not present(pending) and not present(target), "unexpected second version 2 release")
         print("Version 2 already contains the isolated artifact purpose; no files replaced")
         return
-    if target.exists() or target.is_symlink():
+    if present(target):
         select_manifest(root, True)
-        require(not pending.exists(), "published and pending upgrades coexist; inspect before recovery")
+        require(not present(pending), "published and pending upgrades coexist; inspect before recovery")
         print("Existing version 2 extension verified; original release unchanged")
         return
-    if not pending.exists():
+    if not present(pending):
         pending.mkdir(mode=0o700)
     private(pending, True)
     for temporary in pending.glob(".writing-*"):
