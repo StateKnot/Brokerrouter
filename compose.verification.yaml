@@ -1,0 +1,20 @@
+# Overlay for compose.production.yaml. Never use with production credentials.
+services:
+  verification-provider:
+    image: python@sha256:fd95fa221297a88e1cf49c55ec1828edd7c5a428187e67b5d1805692d11588db
+    command: [python, /fixture/provider.py]
+    volumes:
+      - ./deploy/verification/provider.py:/fixture/provider.py:ro
+    networks: [backend]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.5
+  gateway:
+    environment:
+      BROKERROUTER_LOCAL_PROVIDER_KEY: local-zero-cost-fixture
+  mcp-judge:
+    environment:
+      BROKERROUTER_LOCAL_PROVIDER_KEY: local-zero-cost-fixture

@@ -1116,9 +1116,13 @@ async fn main() -> anyhow::Result<()> {
             });
             let listener = tokio::net::TcpListener::bind(bind).await?;
             tracing::info!(address=%bind,"brokerrouter listening");
-            axum::serve(listener, api::gateway_router(gateway.clone()))
-                .with_graceful_shutdown(shutdown())
-                .await?;
+            let listener = brokerrouter::transport::BoundedListener::from_env(listener)?;
+            brokerrouter::transport::serve_h1(
+                listener,
+                api::gateway_router(gateway.clone()),
+                shutdown(),
+            )
+            .await;
             gateway.drain().await;
             maintenance.abort();
         }

@@ -15,12 +15,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 FROM debian@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
 
-RUN sed -i \
-      -e 's|http://deb.debian.org/debian-security|http://mirrors.cloud.tencent.com/debian-security|g' \
-      -e 's|http://deb.debian.org/debian|http://mirrors.cloud.tencent.com/debian|g' \
-      /etc/apt/sources.list.d/debian.sources && \
-    apt-get -o Acquire::ForceIPv4=true update && \
-    apt-get install --yes --no-install-recommends ca-certificates curl gosu && \
+RUN apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=30 \
+      -o Acquire::Retries=2 -o APT::Update::Error-Mode=any update && \
+    apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=30 \
+      -o Acquire::Retries=2 install --yes --no-install-recommends ca-certificates curl gosu && \
     rm -rf /var/lib/apt/lists/* && \
     groupadd --gid 10001 brokerrouter && \
     useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent \
