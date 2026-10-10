@@ -7,6 +7,7 @@ import {
   approvalLabels,
   approvalSchema,
   inboxSchema,
+  isolatedReview,
   reviewSchema,
 } from "./approval-contracts";
 import type { Decision, Review } from "./approval-contracts";
@@ -74,6 +75,7 @@ function GuardrailApprovals({
   const [epoch, setEpoch] = useState(0);
   const [review, setReview] = useState<Review | null>(null);
   const [frozen, setFrozen] = useState<Decision | null>(null);
+  const [frozenArtifact, setFrozenArtifact] = useState(false);
   useEffect(() => onFrozenChange(frozen !== null), [frozen, onFrozenChange]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
@@ -194,6 +196,9 @@ function GuardrailApprovals({
       return;
     }
     setFrozen(body);
+    setFrozenArtifact(
+      review.approval.scope === "current_artifact_in_original_turn",
+    );
     setError(null);
     setNotice("");
     setAttempted(false);
@@ -362,16 +367,18 @@ function GuardrailApprovals({
           </p>
           <p className="notice">
             {review.approval.scope_notice}{" "}
-            同轮豁免不超过审批/轮次有效期。批准后仍需重新校验预算、权限与护栏；本页不执行节点。
+            {review.approval.scope === "current_artifact_in_original_turn"
+              ? "文件授权不超过原来源有效期。批准后仍需核对当前扫描、权限与策略；本页不执行工具。"
+              : "同轮豁免不超过审批/轮次有效期。批准后仍需重新校验预算、权限与护栏；本页不执行节点。"}
           </p>
           <p>
             审阅有效至 {time(review.review_expires_at, "Asia/Shanghai")}；原文
             与上下文 SHA-256 <code>{review.operation_sha256}</code>
           </p>
-          {review.stage === "media_output" ? (
+          {isolatedReview(review) ? (
             <MediaReview
               key={review.approval.id}
-              approvalId={review.approval.id}
+              review={review}
               previewOrigin={previewOrigin}
               disabled={frozen !== null || busy}
               completed={review.media !== undefined}
@@ -427,7 +434,10 @@ function GuardrailApprovals({
                     value="continue_this_turn"
                     disabled={!review.can_continue}
                   >
-                    同意本轮跳过所选护栏
+                    {review.approval.scope ===
+                    "current_artifact_in_original_turn"
+                      ? "批准本文件的所选护栏"
+                      : "同意本轮跳过所选护栏"}
                   </option>
                   <option value="reject">拒绝本次操作</option>
                   <option value="feedback">提出其他意见，关闭原轮次</option>
@@ -440,13 +450,15 @@ function GuardrailApprovals({
               <label className="check">
                 <input type="checkbox" required />
                 <span>
-                  我已核对操作与风险，并理解同轮后续动作也可能跳过所选版本护栏；审批不等于执行完成。
+                  {review.approval.scope === "current_artifact_in_original_turn"
+                    ? "我已核对本次决定，理解批准仅覆盖本文件、当前扫描与策略；其他文件或版本仍需核对。审批不等于执行完成。"
+                    : "我已核对操作与风险，并理解同轮后续动作也可能跳过所选版本护栏；审批不等于执行完成。"}
                 </span>
               </label>
               <button>核对本次决定</button>
             </fieldset>
           </form>
-          {review.stage === "media_output" && !review.media && (
+          {isolatedReview(review) && !review.media && (
             <p className="notice">
               放行前必须完整加载并确认隔离审阅；JSON
               描述不能代替视频。可不观看内容而明确拒绝或反馈，不发放豁免。
@@ -472,7 +484,9 @@ function GuardrailApprovals({
           </p>
           <p>
             {frozen.decision.decision === "continue_this_turn"
-              ? "同意本轮跳过所选护栏"
+              ? frozenArtifact
+                ? "批准本文件的所选护栏"
+                : "同意本轮跳过所选护栏"
               : frozen.decision.decision === "reject"
                 ? "拒绝本次操作"
                 : "提出其他意见并关闭原轮次"}
