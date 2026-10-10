@@ -19,6 +19,9 @@
   见 [结果契约](../../docs/m6-hermes-tool-results.md)。
 - 原生附件发送、自动及显式 TTS 目前明确返回不支持，且不读取文件、下载远端资源或调用 TTS 供应商。
   文件字节隔离、扫描、本人审阅及发布管线完成后，才按格式逐项开放；路径或 URL 的文本审批不能授权附件。
+- 原生最终文本发送复用 Hermes 持久发送台账：正文摘要及目标不可变，同一发送只由一个实例领取。
+  发送失败、取消或确认丢失保留不确定状态，不自动重发；明确成功的回执用于抑制重复发送。
+  该台账约束发送恢复，最终助手文本的服务端治理授权及会话写入边界继续收口。
 
 claim 响应丢失、授权后重启、工具异常和回执失败都不自动重派发。原始参数不写适配器数据库，claim
 token 使用 AES-256-GCM 加密。审批通知有独立持久租约：明确失败可重试，超时的不确定发送按已发送处理，
@@ -35,9 +38,9 @@ PYTHONPATH=/opt/hermes python -m unittest discover -s /build/brokerrouter-hermes
 ```
 
 首次命令同时核验 `agent/tool_executor.py`、`gateway/run_turn.py` 和
-`gateway/run_turn_runner.py`、`model_tools.py`、`tools/registry.py`、`gateway/platforms/base.py` 和 `gateway/run_voice.py` 的固定源码摘要；`--apply` 原子写入 overlay、保存固定源码备份并
+`gateway/run_turn_runner.py`、`model_tools.py`、`tools/registry.py`、`gateway/platforms/base.py`、`gateway/run_voice.py` 和 `gateway/delivery_ledger.py` 的固定源码摘要；`--apply` 原子写入 overlay、保存固定源码备份并
 生成安装清单。安装中断只允许从精确的“原始/已审计补丁”混合态恢复；任何其他漂移都拒绝。治理模式在
-Gateway 模块导入时重新校验七个宿主文件、适配器全文件集与清单，不匹配则进程无法接受 turn。镜像发布必须
+Gateway 模块导入时重新校验八个宿主文件、适配器全文件集与清单，不匹配则进程无法接受 turn。镜像发布必须
 固定内容 digest，不使用浮动 tag。
 
 治理模式必须由受管部署设置：
@@ -73,5 +76,6 @@ BROKERROUTER_HERMES_GATEWAY_CA_FILE=/run/secrets/gateway-ca.pem
 ## 尚未宣称完成的边界
 
 本包不会热修改用户当前容器，也不声明生产部署已认证。当前通知是 Hermes 原生通道中的安全链接，不是在聊天
-消息内直接签署的批准按钮；决定仍只能由现有本人审批 BFF 提交。`tool_output`/`artifact` 与 Hermes 会话结果的隔离发布事务、
-真实进程逐点终止/多实例/工具矩阵、受管镜像滚动与 OpenClaw 适配仍属后续包。在完成前，不能宣称完整输入输出治理闭环。
+消息内直接签署的批准按钮；决定仍只能由现有本人审批 BFF 提交。工具最终文本已有服务端当前策略释放；
+助手最终文本、真实二进制产物和 Hermes 会话结果的完整隔离发布、逐点终止/多实例矩阵、
+受管镜像滚动与 OpenClaw 适配继续开发。在完成前，不能宣称完整输入输出治理闭环。

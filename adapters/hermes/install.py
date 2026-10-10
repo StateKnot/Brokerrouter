@@ -26,6 +26,7 @@ MODEL_TOOLS_SHA256 = "875512e422e3e0d1502f7f7e127d47288bf1f1b350b4442ad5fc210e52
 REGISTRY_SHA256 = "ca02644ea36dfa08ab7e12893d283a3b12549a5ffd33ea72c29c632a94e7b201"
 PLATFORM_BASE_SHA256 = "14f2bcd915e97ecb2d14cae290e1dc07d36c3247ac9b7599f38c3175670ec52a"
 RUN_VOICE_SHA256 = "236853144929c0165f766c9c44927c8acb0c2e575776b68b8a5f6dd0f9e8651f"
+DELIVERY_LEDGER_SHA256 = "b2656cd6429fb848f8df405fd7bb5e50f2ea6cb0620141c59ccccc3f7c314ab7"
 
 OLD = '''    if ref.name == "memory":
         agent._turns_since_memory = 0
@@ -337,6 +338,76 @@ PLATFORM_BASE_REPLACEMENTS = (
         self.config = config
 ''',
     ),
+    (
+        '''        delivery_adapter = self._final_delivery_adapter(event.source)
+        logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
+''',
+        '''        from brokerrouter_hermes.publication import send_final_once
+        governed = await send_final_once(
+            self, event, session_key, text_content, metadata,
+            reply_to=reply_to, is_ephemeral_response=is_ephemeral_response,
+        )
+        if governed is not None:
+            return governed
+        delivery_adapter = self._final_delivery_adapter(event.source)
+        logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
+''',
+    ),
+)
+
+
+DELIVERY_LEDGER_REPLACEMENTS = (
+    (
+        '''    because the runtime sweep matches profiles exactly and could otherwise never claim it."""
+    now, (pid, started) = now if now is not None else time.time(), _owner_stamp()
+''',
+        '''    because the runtime sweep matches profiles exactly and could otherwise never claim it."""
+    from brokerrouter_hermes.publication import hold_required_recovery
+    import gateway.delivery_ledger as _ledger
+    if hold_required_recovery(_ledger):
+        return []
+    now, (pid, started) = now if now is not None else time.time(), _owner_stamp()
+''',
+    ),
+    (
+        '''    infer): the reconnect one, or the rate-limit one for a flood-refused row."""
+    now, (pid, started) = now if now is not None else time.time(), _owner_stamp()
+''',
+        '''    infer): the reconnect one, or the rate-limit one for a flood-refused row."""
+    from brokerrouter_hermes.publication import hold_required_recovery
+    import gateway.delivery_ledger as _ledger
+    if hold_required_recovery(_ledger):
+        return []
+    now, (pid, started) = now if now is not None else time.time(), _owner_stamp()
+''',
+    ),
+    (
+        '''    Rows past the attempts cap or stale cutoff are left for the sweeps to abandon."""
+    now, (pid, started) = now if now is not None else time.time(), _owner_stamp()
+''',
+        '''    Rows past the attempts cap or stale cutoff are left for the sweeps to abandon."""
+    from brokerrouter_hermes.publication import hold_required_recovery
+    import gateway.delivery_ledger as _ledger
+    if hold_required_recovery(_ledger):
+        return []
+    now, (pid, started) = now if now is not None else time.time(), _owner_stamp()
+''',
+    ),
+    (
+        '''            total = conn.execute("SELECT COUNT(*) FROM delivery_obligations").fetchone()[0]
+''',
+        '''            total = conn.execute("SELECT COUNT(*) FROM delivery_obligations WHERE obligation_id NOT LIKE 'br-final-v1:%'").fetchone()[0]
+''',
+    ),
+    (
+        '''                         SELECT obligation_id FROM delivery_obligations
+                         ORDER BY CASE state
+''',
+        '''                         SELECT obligation_id FROM delivery_obligations
+                         WHERE obligation_id NOT LIKE 'br-final-v1:%'
+                         ORDER BY CASE state
+''',
+    ),
 )
 
 RUN_VOICE_REPLACEMENTS = (
@@ -533,6 +604,10 @@ def patched_platform_base_bytes(source: bytes) -> bytes:
     return _replace_exact(source, PLATFORM_BASE_REPLACEMENTS, "gateway/platforms/base.py")
 
 
+def patched_delivery_ledger_bytes(source: bytes) -> bytes:
+    return _replace_exact(source, DELIVERY_LEDGER_REPLACEMENTS, "gateway/delivery_ledger.py")
+
+
 def patched_run_voice_bytes(source: bytes) -> bytes:
     return _replace_exact(source, RUN_VOICE_REPLACEMENTS, "gateway/run_voice.py")
 
@@ -549,6 +624,7 @@ PATCHES: tuple[tuple[str, str, Callable[[bytes], bytes]], ...] = (
     ("tools/registry.py", REGISTRY_SHA256, patched_registry_bytes),
     ("gateway/platforms/base.py", PLATFORM_BASE_SHA256, patched_platform_base_bytes),
     ("gateway/run_voice.py", RUN_VOICE_SHA256, patched_run_voice_bytes),
+    ("gateway/delivery_ledger.py", DELIVERY_LEDGER_SHA256, patched_delivery_ledger_bytes),
 )
 
 

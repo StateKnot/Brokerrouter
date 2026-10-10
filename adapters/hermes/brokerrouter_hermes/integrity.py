@@ -34,11 +34,15 @@ HOST_FILES = {
     },
     "gateway/platforms/base.py": {
         "original_sha256": "14f2bcd915e97ecb2d14cae290e1dc07d36c3247ac9b7599f38c3175670ec52a",
-        "patched_sha256": "b1b1d6e7a3a43562f885dda3788b59a0b71f237b7998a40b5fd249e4af6f790c",
+        "patched_sha256": "3ee05ff93efcd2d80a95c46f6730714c2a95bb5421032758396854c827ab77b5",
     },
     "gateway/run_voice.py": {
         "original_sha256": "236853144929c0165f766c9c44927c8acb0c2e575776b68b8a5f6dd0f9e8651f",
         "patched_sha256": "401f2a830b4fc00a43e84c29ff0f629475d13573ee51c197d2e4936047f96163",
+    },
+    "gateway/delivery_ledger.py": {
+        "original_sha256": "b2656cd6429fb848f8df405fd7bb5e50f2ea6cb0620141c59ccccc3f7c314ab7",
+        "patched_sha256": "d5bafbd4fc6e1598f31d5b4e3e93c27c22e0f9d48c19446fa941e4abb463df63",
     },
 }
 MAX_MANIFEST_BYTES = 1024 * 1024

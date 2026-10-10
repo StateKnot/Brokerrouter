@@ -63,6 +63,14 @@ class InstallerTest(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     patcher(source + source)
 
+    def test_native_final_ledger_anchors_are_exact(self):
+        source = "\n".join(old for old, _ in installer.DELIVERY_LEDGER_REPLACEMENTS).encode()
+        patched = installer.patched_delivery_ledger_bytes(source)
+        self.assertIn(b"hold_required_recovery", patched)
+        self.assertIn(b"obligation_id NOT LIKE 'br-final-v1:%'", patched)
+        with self.assertRaises(RuntimeError):
+            installer.patched_delivery_ledger_bytes(source.replace(b"otherwise never claim", b"drifted"))
+
     def test_apply_resumes_an_exact_partial_installation(self):
         tool = "\n".join(old for old, _ in installer.TOOL_EXECUTOR_REPLACEMENTS).encode()
         turn = "\n".join(old for old, _ in installer.RUN_TURN_REPLACEMENTS).encode()

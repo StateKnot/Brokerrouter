@@ -23,6 +23,7 @@ jobs:
             tools/registry.py
             gateway/platforms/base.py
             gateway/run_voice.py
+            gateway/delivery_ledger.py
           sparse-checkout-cone-mode: false
           persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -47,6 +48,7 @@ jobs:
           cp hermes-upstream/tools/registry.py /tmp/hermes-contract/tools/registry.py
           cp hermes-upstream/gateway/platforms/base.py /tmp/hermes-contract/gateway/platforms/base.py
           cp hermes-upstream/gateway/run_voice.py /tmp/hermes-contract/gateway/run_voice.py
+          cp hermes-upstream/gateway/delivery_ledger.py /tmp/hermes-contract/gateway/delivery_ledger.py
           echo '1610a0893588cbc067aaf84b3d019a683cd83ba0fdb92d69baf4f7b9e6d121b9  /tmp/hermes-contract/agent/tool_executor.py' | sha256sum --check --strict
           echo 'dd203228bdfb7f69f1442adf4e24cc7e3196fb348b096ab6e7c2cb2bd2af5214  /tmp/hermes-contract/gateway/run_turn.py' | sha256sum --check --strict
           echo '9bfa045616264e944b417ce3bfe0e302168c7b6d0218ceeb253b2dad2629e4ba  /tmp/hermes-contract/gateway/run_turn_runner.py' | sha256sum --check --strict
@@ -54,6 +56,7 @@ jobs:
           echo 'ca02644ea36dfa08ab7e12893d283a3b12549a5ffd33ea72c29c632a94e7b201  /tmp/hermes-contract/tools/registry.py' | sha256sum --check --strict
           echo '14f2bcd915e97ecb2d14cae290e1dc07d36c3247ac9b7599f38c3175670ec52a  /tmp/hermes-contract/gateway/platforms/base.py' | sha256sum --check --strict
           echo '236853144929c0165f766c9c44927c8acb0c2e575776b68b8a5f6dd0f9e8651f  /tmp/hermes-contract/gateway/run_voice.py' | sha256sum --check --strict
+          echo 'b2656cd6429fb848f8df405fd7bb5e50f2ea6cb0620141c59ccccc3f7c314ab7  /tmp/hermes-contract/gateway/delivery_ledger.py' | sha256sum --check --strict
           python adapters/hermes/install.py --source /tmp/hermes-contract
           python adapters/hermes/install.py --source /tmp/hermes-contract --apply
           python adapters/hermes/install.py --source /tmp/hermes-contract
@@ -65,6 +68,7 @@ jobs:
             /tmp/hermes-contract/tools/registry.py \
             /tmp/hermes-contract/gateway/platforms/base.py \
             /tmp/hermes-contract/gateway/run_voice.py \
+            /tmp/hermes-contract/gateway/delivery_ledger.py \
             /tmp/hermes-contract/brokerrouter_hermes/*.py
           PYTHONPATH=/tmp/hermes-contract \
             BROKERROUTER_HERMES_GOVERNANCE=required \
