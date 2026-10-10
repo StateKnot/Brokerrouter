@@ -468,4 +468,34 @@ CREATE POLICY brokerrouter_review_chunk_read ON asset_chunks FOR SELECT TO broke
 -- mint grant/write source/decide; approved control/approvals cannot read chunks.
 -- Original input/media Assets restrictive policies are unchanged.
 
+
+-- Coupled native text/artifact publication after 0033. Runtime can observe
+-- immutable source facts and evaluate exact file policies, never read chunk
+-- rows, write producer bytes or create human grants.
+GRANT SELECT ON runtime_artifact_source_facts,runtime_tool_result_review_facts,
+    runtime_output_set_freezes TO brokerrouter_runtime,brokerrouter_operator,
+    brokerrouter_approvals,brokerrouter_governance_control;
+GRANT SELECT ON runtime_output_set_freezes TO brokerrouter_runtime_assets;
+GRANT SELECT ON runtime_artifacts,runtime_artifact_batches,output_scans,
+    output_scan_profiles,runtime_artifact_deliveries,runtime_artifact_grants
+    TO brokerrouter_runtime;
+GRANT INSERT ON runtime_artifact_deliveries TO brokerrouter_runtime;
+GRANT SELECT(tenant_id,operation_id,guardrail_id,version,state)
+    ON guardrail_evaluations TO brokerrouter_approvals;
+
+GRANT SELECT ON runtime_artifact_asset_facts TO brokerrouter_runtime,brokerrouter_operator,
+    brokerrouter_output_delivery,brokerrouter_media_review,brokerrouter_approvals,
+    brokerrouter_governance_control;
+GRANT UPDATE(governance_lock) ON tenants TO brokerrouter_runtime;
+GRANT EXECUTE ON FUNCTION runtime_artifact_set_digest(jsonb),
+    runtime_artifact_operation_files(uuid,uuid,uuid),runtime_artifact_turn_files(uuid,uuid,uuid)
+    TO brokerrouter_runtime,brokerrouter_operator,brokerrouter_approvals,brokerrouter_governance_control;
+GRANT SELECT(governance_lock) ON tenants TO brokerrouter_runtime_assets;
+GRANT SELECT(tenant_id,key_id,turn_id,input_operation_id) ON runtime_output_set_freezes
+    TO brokerrouter_mcp_server,brokerrouter_mcp_worker;
+-- Preserve legacy input/media metadata, while native capture facts are read
+-- only through the narrow projection above. Runtime gets no chunk authority.
+DROP POLICY IF EXISTS brokerrouter_runtime_native_metadata ON assets;
+CREATE POLICY brokerrouter_runtime_native_metadata ON assets AS RESTRICTIVE
+    FOR SELECT TO brokerrouter_runtime USING(kind IN ('input','output'));
 COMMIT;

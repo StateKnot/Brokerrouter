@@ -295,6 +295,66 @@ pub(crate) async fn gate(
         .0)
 }
 
+/// Body-free result facts have already authenticated this tool output. Human
+/// review can only observe existing permission; it cannot start paid detection,
+/// create an approval or update an operation through this read-only path.
+pub(crate) async fn require_ready_readonly(
+    tx: &mut Tx<'_>,
+    who: &Identity,
+    turn: &Turn,
+    op: &Operation,
+    payload: &Value,
+) -> Result<Option<DateTime<Utc>>> {
+    if matches!(op.state.as_str(), "rejected" | "feedback") {
+        return Err(Error::ActionRejected);
+    }
+    if op.stage != "tool_output"
+        || !op
+            .operation_key
+            .starts_with(crate::runtime_results::OUTPUT_PREFIX)
+    {
+        return Err(Error::Invalid("original runtime tool output required"));
+    }
+    let rules = selected(
+        tx,
+        who,
+        &op.stage,
+        op.model_id.as_deref(),
+        op.tool_name.as_deref(),
+    )
+    .await?;
+    if rules
+        .iter()
+        .filter(|rule| rule.rule["kind"] == "model_judge")
+        .count()
+        > 8
+    {
+        return Err(Error::Configuration);
+    }
+    let mut text = String::new();
+    strings(payload, &mut text);
+    let mut deadline: Option<DateTime<Utc>> = None;
+    for rule in rules {
+        let grant: Option<DateTime<Utc>> = sqlx::query_scalar("SELECT expires_at FROM guardrail_grants WHERE tenant_id=$1 AND turn_id=$2 AND guardrail_id=$3 AND version=$4 AND expires_at>clock_timestamp()")
+            .bind(who.tenant_id).bind(turn.id).bind(&rule.id).bind(rule.version)
+            .fetch_optional(&mut **tx).await?;
+        if let Some(d) = grant {
+            deadline = Some(deadline.map_or(d, |old| old.min(d)));
+            continue;
+        }
+        let passed = match rule.rule["kind"].as_str() {
+            Some("model_judge") => crate::judge::passed(tx, who, op, &rule).await?,
+            Some("always" | "contains_any") => !risk(&rule.rule, &text)?,
+            _ => return Err(Error::Configuration),
+        };
+        if !passed {
+            return Err(Error::InProgress);
+        }
+    }
+    require_live_grants(tx, deadline).await?;
+    Ok(deadline)
+}
+
 /// Capture only grants actually used by this decision. Publication and claim
 /// callers must recheck this deadline after their remaining transactional work.
 pub(crate) async fn gate_with_grant_deadline(
@@ -451,6 +511,15 @@ pub(crate) async fn gate_with_grant_deadline(
         ).bind(who.tenant_id).bind(who.key_id).bind(op.id)
             .bind(crate::runtime_publications::OUTPUT_PREFIX).fetch_optional(&mut **tx).await?;
         turn.expires_at.min(expiry.ok_or(Error::ResultUnavailable)?)
+    } else if op.stage == "tool_output"
+        && op
+            .operation_key
+            .starts_with(crate::runtime_results::OUTPUT_PREFIX)
+    {
+        let expiry: Option<DateTime<Utc>> = sqlx::query_scalar("SELECT r.expires_at FROM runtime_tool_result_review_facts r WHERE r.tenant_id=$1 AND r.key_id=$2 AND $3=$4||r.id::text AND r.available")
+            .bind(who.tenant_id).bind(who.key_id).bind(&op.operation_key)
+            .bind(crate::runtime_results::OUTPUT_PREFIX).fetch_optional(&mut **tx).await?;
+        turn.expires_at.min(expiry.ok_or(Error::ResultUnavailable)?)
     } else if op.stage == "post" {
         let expiry:Option<DateTime<Utc>>=sqlx::query_scalar("SELECT result_expires_at FROM requests WHERE tenant_id=$1 AND governance_turn_id=$2 AND id::text=(SELECT operation_key FROM governance_operations WHERE tenant_id=$1 AND id=$3) AND result_ciphertext IS NOT NULL AND result_expires_at>clock_timestamp()")
             .bind(who.tenant_id).bind(turn.id).bind(op.id).fetch_optional(&mut **tx).await?.flatten();
@@ -561,6 +630,9 @@ pub async fn check(
         let result = operation_view(&op);
         tx.commit().await?;
         return Ok(result);
+    }
+    if op.stage == "tool_input" {
+        require_unfrozen_output_set(&mut tx, who, turn.id).await?;
     }
     let waiting = gate(&mut tx, who, &turn, &op, &check.payload).await?;
     tx.commit().await?;
@@ -743,6 +815,9 @@ pub async fn claim(
     ) {
         return Err(Error::InProgress);
     }
+    if op.stage == "tool_input" {
+        require_unfrozen_output_set(&mut tx, who, turn.id).await?;
+    }
     let payload: Value = serde_json::from_slice(
         &cipher.decrypt(
             who.tenant_id,
@@ -919,4 +994,14 @@ pub async fn close_runtime(pool: &PgPool, who: &Identity, id: Uuid, state: &str)
     }
     tx.commit().await?;
     Ok(json!({"id":id,"state":state}))
+}
+
+// Tenant lock serializes final freezing with new dispatch. No captured body is read.
+async fn require_unfrozen_output_set(tx: &mut Tx<'_>, who: &Identity, turn: Uuid) -> Result<()> {
+    let frozen: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM runtime_output_set_freezes WHERE tenant_id=$1 AND turn_id=$2 AND input_operation_id IS NULL)")
+        .bind(who.tenant_id).bind(turn).fetch_one(&mut **tx).await?;
+    if frozen {
+        return Err(Error::Conflict);
+    }
+    Ok(())
 }

@@ -44,6 +44,7 @@ pub mod protocol;
 pub mod runtime_artifact_api;
 pub mod runtime_artifact_delivery;
 pub mod runtime_artifact_delivery_api;
+mod runtime_artifact_sets;
 pub mod runtime_artifacts;
 pub mod runtime_publications;
 pub mod runtime_results;

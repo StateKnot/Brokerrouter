@@ -1079,3 +1079,6 @@ async fn semantic_final_release_settles_one_evaluation_and_does_not_repeat_the_m
     assert_eq!(facts, (2, 1, 2, 5));
     assert_eq!(f.calls.load(Ordering::SeqCst), 2);
 }
+
+#[path = "runtime_publications_artifacts/mod.rs"]
+mod runtime_publications_artifacts;

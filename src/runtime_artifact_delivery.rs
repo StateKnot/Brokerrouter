@@ -78,7 +78,7 @@ async fn pending_scan(tx: &mut Tx<'_>, who: &Identity, asset: Uuid) -> Result<Op
                s.expires_at AS scan_expires_at,LEAST(a.expires_at,b.expires_at,t.expires_at) AS expires_at
         FROM runtime_artifacts r
         JOIN runtime_artifact_batches b ON b.tenant_id=r.tenant_id AND b.id=r.batch_id
-        JOIN assets a ON a.tenant_id=r.tenant_id AND a.id=r.asset_id
+        JOIN runtime_artifact_asset_facts a ON a.tenant_id=r.tenant_id AND a.id=r.asset_id
         JOIN governance_operations origin ON origin.tenant_id=b.tenant_id AND origin.id=b.input_operation_id
         JOIN governance_turns t ON t.tenant_id=b.tenant_id AND t.id=b.turn_id
         JOIN models m ON m.tenant_id=b.tenant_id AND m.id=b.model_id
@@ -139,7 +139,7 @@ async fn current(tx: &mut Tx<'_>, who: &Identity, asset: Uuid) -> Result<(Eviden
                LEAST(s.expires_at,a.expires_at,b.expires_at,t.expires_at) AS expires_at
         FROM runtime_artifacts r
         JOIN runtime_artifact_batches b ON b.tenant_id=r.tenant_id AND b.id=r.batch_id
-        JOIN assets a ON a.tenant_id=r.tenant_id AND a.id=r.asset_id
+        JOIN runtime_artifact_asset_facts a ON a.tenant_id=r.tenant_id AND a.id=r.asset_id
         JOIN governance_operations origin ON origin.tenant_id=b.tenant_id AND origin.id=b.input_operation_id
         JOIN governance_turns t ON t.tenant_id=b.tenant_id AND t.id=b.turn_id
         JOIN models m ON m.tenant_id=b.tenant_id AND m.id=b.model_id
@@ -296,32 +296,7 @@ impl Delivery {
     pub async fn release(&self, who: &Identity, asset: Uuid) -> Result<Value> {
         let mut tx = self.assets.pool.begin().await?;
         governance::tenant_lock(&mut tx, who.tenant_id).await?;
-        if let Some(status) = pending_scan(&mut tx, who, asset).await? {
-            tx.commit().await?;
-            return Ok(status);
-        }
-        let (e, turn) = current(&mut tx, who, asset).await?;
-        policies(&mut tx, who, &e).await?;
-        let payload = e.view();
-        let key = e.operation_key();
-        sqlx::query("INSERT INTO governance_operations(tenant_id,id,turn_id,key_id,operation_key,stage,model_id,tool_name,payload_hash) VALUES($1,$2,$3,$4,$5,'artifact',$6,$7,$8) ON CONFLICT(tenant_id,key_id,operation_key,stage) DO NOTHING")
-            .bind(who.tenant_id).bind(Uuid::new_v4()).bind(turn.id).bind(who.key_id).bind(&key)
-            .bind(&e.model_id).bind(&e.tool_name).bind(governance::digest(&payload)?).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO runtime_artifact_deliveries(tenant_id,scan_id,asset_id,operation_id) SELECT $1,$2,$3,id FROM governance_operations WHERE tenant_id=$1 AND key_id=$4 AND operation_key=$5 AND stage='artifact' ON CONFLICT(tenant_id,scan_id) DO NOTHING")
-            .bind(who.tenant_id).bind(e.scan_id).bind(asset).bind(who.key_id).bind(key).execute(&mut *tx).await?;
-        let op = operation(&mut tx, who, &e).await?;
-        bind(&op, &e)?;
-        let (gate, deadline) =
-            governance::gate_with_grant_deadline(&mut tx, who, &turn, &op, &payload).await?;
-        let result = match gate {
-            Gate::Ready => json!({"state":"ready","operation_id":op.id,"output":payload}),
-            Gate::Approval(a) => {
-                json!({"state":"waiting_approval","operation_id":op.id,"approval":a})
-            }
-            Gate::Checking(_) => return Err(Error::Configuration),
-        };
-        require_live_output(&mut tx, who, &e, None).await?;
-        governance::require_live_grants(&mut tx, deadline).await?;
+        let result = release_in_tx(&mut tx, who, asset).await?;
         tx.commit().await?;
         Ok(result)
     }
@@ -363,7 +338,7 @@ impl Delivery {
         Ok(bytes)
     }
 }
-async fn released(
+pub(crate) async fn released(
     tx: &mut Tx<'_>,
     who: &Identity,
     asset: Uuid,
@@ -436,4 +411,34 @@ async fn require_live_deadline(
         return Err(Error::ResultUnavailable);
     }
     Ok(())
+}
+
+/// The caller holds the tenant lock and commits the whole publication together.
+pub(crate) async fn release_in_tx(tx: &mut Tx<'_>, who: &Identity, asset: Uuid) -> Result<Value> {
+    if let Some(status) = pending_scan(tx, who, asset).await? {
+        return Ok(status);
+    }
+    let (e, turn) = current(tx, who, asset).await?;
+    policies(tx, who, &e).await?;
+    let payload = e.view();
+    let key = e.operation_key();
+    sqlx::query("INSERT INTO governance_operations(tenant_id,id,turn_id,key_id,operation_key,stage,model_id,tool_name,payload_hash) VALUES($1,$2,$3,$4,$5,'artifact',$6,$7,$8) ON CONFLICT(tenant_id,key_id,operation_key,stage) DO NOTHING")
+            .bind(who.tenant_id).bind(Uuid::new_v4()).bind(turn.id).bind(who.key_id).bind(&key)
+            .bind(&e.model_id).bind(&e.tool_name).bind(governance::digest(&payload)?).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO runtime_artifact_deliveries(tenant_id,scan_id,asset_id,operation_id) SELECT $1,$2,$3,id FROM governance_operations WHERE tenant_id=$1 AND key_id=$4 AND operation_key=$5 AND stage='artifact' ON CONFLICT(tenant_id,scan_id) DO NOTHING")
+            .bind(who.tenant_id).bind(e.scan_id).bind(asset).bind(who.key_id).bind(key).execute(&mut **tx).await?;
+    let op = operation(tx, who, &e).await?;
+    bind(&op, &e)?;
+    let (gate, deadline) =
+        governance::gate_with_grant_deadline(tx, who, &turn, &op, &payload).await?;
+    let result = match gate {
+        Gate::Ready => json!({"state":"ready","operation_id":op.id,"output":payload}),
+        Gate::Approval(a) => {
+            json!({"state":"waiting_approval","operation_id":op.id,"approval":a})
+        }
+        Gate::Checking(_) => return Err(Error::Configuration),
+    };
+    require_live_output(tx, who, &e, None).await?;
+    governance::require_live_grants(tx, deadline).await?;
+    Ok(result)
 }

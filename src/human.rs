@@ -510,6 +510,13 @@ async fn resolve_inner(
     {
         crate::runtime_publications::validate_approval(&mut tx, cipher, &who, &op).await?;
     }
+    if decision.decision == "continue_this_turn"
+        && op
+            .operation_key
+            .starts_with(crate::runtime_results::OUTPUT_PREFIX)
+    {
+        crate::runtime_results::validate_approval(&mut tx, cipher, &who, &op).await?;
+    }
     let current = governance::selected(
         &mut tx,
         &who,
@@ -602,6 +609,13 @@ async fn resolve_inner(
             .starts_with(crate::runtime_publications::OUTPUT_PREFIX)
     {
         crate::runtime_publications::validate_approval(&mut tx, cipher, &who, &op).await?;
+    }
+    if decision.decision == "continue_this_turn"
+        && op
+            .operation_key
+            .starts_with(crate::runtime_results::OUTPUT_PREFIX)
+    {
+        crate::runtime_results::validate_approval(&mut tx, cipher, &who, &op).await?;
     }
     if let Some(review_id) = review_id {
         crate::approval_workbench::validate_review(&mut tx, human, review_id, &a, &op, &decision)

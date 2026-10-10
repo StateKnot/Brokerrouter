@@ -180,9 +180,16 @@ pub async fn review(pool: &PgPool, cipher: &ResultCipher, who: &Human, q: Review
                     .starts_with(crate::runtime_publications::OUTPUT_PREFIX)
                 {
                     crate::runtime_publications::review_payload(
-                        &mut tx, &identity, &op, &turn, &value,
+                        &mut tx, cipher, &identity, &op, &turn, &value,
                     )
                     .await?;
+                    true
+                } else if op
+                    .operation_key
+                    .starts_with(crate::runtime_results::OUTPUT_PREFIX)
+                {
+                    crate::runtime_results::review_payload(&mut tx, &identity, &op, &turn, &value)
+                        .await?;
                     true
                 } else {
                     reviewable(&op.stage, &value)
@@ -211,6 +218,29 @@ pub async fn review(pool: &PgPool, cipher: &ResultCipher, who: &Human, q: Review
     sqlx::query("INSERT INTO audit_events(tenant_id,action,object_id,details) VALUES($1,'approval.reviewed',$2,$3)")
         .bind(who.tenant_id).bind(a.id.to_string()).bind(json!({"user_id":who.id,"review_id":id,"operation_id":op.id,"operation_sha256":governance::hex(&op.payload_hash),"content_delivered":can_continue,"expires_at":expires_at})).execute(&mut *tx).await?;
     fresh(&mut tx, who).await?;
+    // Locks preserve identities, not wall-clock authority. Review can only
+    // deliver plaintext while every original source and used grant is current
+    // after the final audit. These checks never register or drive paid work.
+    if can_continue {
+        if op
+            .operation_key
+            .starts_with(crate::runtime_publications::OUTPUT_PREFIX)
+        {
+            crate::runtime_publications::validate_approval(&mut tx, cipher, &identity, &op).await?;
+        } else if op
+            .operation_key
+            .starts_with(crate::runtime_results::OUTPUT_PREFIX)
+        {
+            crate::runtime_results::validate_approval(&mut tx, cipher, &identity, &op).await?;
+        }
+        let live: bool = sqlx::query_scalar("SELECT clock_timestamp()<$1")
+            .bind(expires_at)
+            .fetch_one(&mut *tx)
+            .await?;
+        if !live {
+            return Err(Error::ActionRejected);
+        }
+    }
     tx.commit().await?;
     Ok(
         json!({"approval":governance::approval_view(&a),"review_id":id,"review_expires_at":expires_at,"stage":op.stage,"model_id":op.model_id,"tool_name":op.tool_name,"operation_state":op.state,"payload_text":payload,"operation_sha256":governance::hex(&op.payload_hash),"can_continue":can_continue,"unavailable_reason":unavailable}),

@@ -339,17 +339,19 @@ async fn least_privilege_mcp_roles_execute_without_crossing_secret_or_approval_b
     .with_stdio_registry_path(fixture.registry.clone());
     let call_id = Uuid::new_v4();
     let args = json!({"id":"restricted-role"});
-    assert!(matches!(
-        edge.call(
+    let pending = edge
+        .call(
             &fixture.who,
             fixture.turn,
             call_id,
             fixture.tool.clone(),
-            args.clone()
+            args.clone(),
         )
-        .await,
-        Err(Error::InProgress)
-    ));
+        .await;
+    assert!(
+        matches!(pending, Err(Error::InProgress)),
+        "restricted MCP enqueue: {pending:?}"
+    );
     assert!(worker.tick().await.unwrap());
     assert!(matches!(
         edge.call(
@@ -1794,3 +1796,5 @@ async fn expired_worker_lease_is_audited_and_never_redispatched(pool: PgPool) {
         .bind(fixture.who.tenant_id).bind(call_id.to_string()).fetch_one(&pool).await.unwrap();
     assert_eq!(audit_count, 1);
 }
+
+mod mcp_calls_freeze;

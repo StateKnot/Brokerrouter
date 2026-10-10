@@ -521,7 +521,11 @@ impl Worker {
                 return Ok(());
             }
             Err(
-                Error::TurnClosed | Error::ActionRejected | Error::NotFound | Error::Unauthorized,
+                Error::TurnClosed
+                | Error::ActionRejected
+                | Error::NotFound
+                | Error::Unauthorized
+                | Error::Conflict,
             ) => {
                 return self
                     .fail_before_submit(&row, "governance_claim_denied")

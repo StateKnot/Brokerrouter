@@ -431,6 +431,10 @@ async fn artifact_id(tx: &mut Tx<'_>, who: &Identity, id: Uuid, ordinal: i32) ->
         .bind(who.tenant_id).bind(who.key_id).bind(id).bind(ordinal).fetch_optional(&mut **tx).await?.ok_or(Error::NotFound)
 }
 async fn metadata(tx: &mut Tx<'_>, who: &Identity, b: &Batch) -> Result<Value> {
+    let execution: (String, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT state,execution_deadline FROM governance_operations WHERE tenant_id=$1 AND key_id=$2 AND id=$3",
+    ).bind(who.tenant_id).bind(who.key_id).bind(b.input_operation_id)
+        .fetch_one(&mut **tx).await?;
     let live: bool = sqlx::query_scalar(
         "SELECT $1>clock_timestamp() AND ($2='quarantined' OR $3>clock_timestamp())",
     )
@@ -445,6 +449,10 @@ async fn metadata(tx: &mut Tx<'_>, who: &Identity, b: &Batch) -> Result<Value> {
         "state":if live {b.state.as_str()} else {"expired"},"maximum_bytes":b.maximum_bytes,
         "maximum_artifacts":b.maximum_artifacts,"manifest_sha256":b.manifest_hash.as_ref().map(|v|governance::hex(v)),
         "content_safety":"not_evaluated","upload_expires_at":b.upload_expires_at,"expires_at":b.expires_at,
+        "source":{"input_operation_id":b.input_operation_id,"turn_id":b.turn_id,"model_id":b.model_id,
+            "tool_name":b.tool_name,"input_payload_sha256":governance::hex(&b.input_payload_hash),
+            "original_payload_sha256":governance::hex(&b.original_payload_hash)},
+        "execution":{"state":execution.0,"deadline":execution.1},
         "artifacts":files.into_iter().map(|f|json!({"ordinal":f.ordinal,"id":f.asset_id,"sha256":governance::hex(&f.sha256),
             "byte_length":f.byte_length,"media_type":f.declared_media_type,"producer_revision":governance::hex(&f.producer_revision),
             "chunk_bytes":CHUNK_BYTES,"chunk_count":(f.byte_length+CHUNK_BYTES as i64-1)/CHUNK_BYTES as i64})).collect::<Vec<_>>()}),

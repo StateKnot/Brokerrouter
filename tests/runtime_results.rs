@@ -770,11 +770,27 @@ async fn expired_fixture(
         .bind(who.tenant_id).bind(id).bind(&request.evidence_ref)
         .bind(store::hash(request.text.as_bytes())).bind(i32::try_from(request.text.len()).unwrap())
         .bind(ciphertext).bind(request.input_operation_id).execute(pool).await.unwrap();
-    governance::check(pool, &common::cipher(), who, Check {
-        turn_id: turn, operation_key: format!("runtime-result-output:{id}"), stage: "tool_output".into(),
-        model_id: Some("model".into()), tool_name: Some("fixture_tool".into()),
-        payload: json!({"result_id":id,"input_operation_id":request.input_operation_id,"text":request.text}),
-    }).await.unwrap();
+    // Import the matching historical encrypted output too. A new approval
+    // cannot be created from an already expired result; this fixture verifies
+    // maintenance of facts that were recorded before their deadline.
+    let output = Uuid::new_v4();
+    let payload =
+        json!({"result_id":id,"input_operation_id":request.input_operation_id,"text":request.text});
+    let hash = governance::digest(
+        &json!({"turn":turn,"model":"model","tool":"fixture_tool","payload":payload}),
+    )
+    .unwrap();
+    let encrypted = common::cipher()
+        .encrypt(
+            who.tenant_id,
+            output,
+            &serde_json::to_vec(&payload).unwrap(),
+        )
+        .unwrap();
+    sqlx::query("INSERT INTO governance_operations(tenant_id,id,turn_id,key_id,operation_key,stage,model_id,tool_name,payload_hash,payload_ciphertext,created_at) VALUES($1,$2,$3,$4,$5,'tool_output','model','fixture_tool',$6,$7,clock_timestamp()-interval '61 seconds')")
+        .bind(who.tenant_id).bind(output).bind(turn).bind(who.key_id)
+        .bind(format!("runtime-result-output:{id}")).bind(hash).bind(encrypted)
+        .execute(pool).await.unwrap();
     id
 }
 
@@ -1017,3 +1033,5 @@ async fn semantic_release_drives_one_paid_evaluation_then_replays_without_tool_e
     assert_eq!(facts, (1, 7, 1));
     server.abort();
 }
+
+mod runtime_results_authorization;

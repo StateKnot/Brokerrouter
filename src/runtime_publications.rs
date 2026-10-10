@@ -34,13 +34,22 @@ struct Stored {
     bytes: i32,
     result_ciphertext: Option<Vec<u8>>,
     expires_at: DateTime<Utc>,
+    artifact_set: Option<Value>,
+    artifact_set_hash: Option<Vec<u8>>,
 }
 
 fn metadata(row: &Stored) -> Value {
-    json!({"id":row.id,"state":"recorded","turn_id":row.turn_id,
+    let mut value = json!({"id":row.id,"state":"recorded","turn_id":row.turn_id,
         "model_id":row.model_id,"source_request_ids":source_ids(row),
         "text_sha256":governance::hex(&row.text_sha256),"bytes":row.bytes,
-        "expires_at":row.expires_at})
+        "expires_at":row.expires_at});
+    if let Some(set) = crate::runtime_artifact_sets::view(
+        row.artifact_set.as_ref(),
+        row.artifact_set_hash.as_deref(),
+    ) {
+        value["artifact_set"] = set;
+    }
+    value
 }
 fn source_ids(row: &Stored) -> Vec<Value> {
     row.source_requests
@@ -105,6 +114,14 @@ pub async fn record(
         {
             return Err(Error::Conflict);
         }
+        let source =
+            crate::runtime_artifact_sets::derive_turn(&mut tx, who, turn.id, &row.model_id, false)
+                .await?;
+        crate::runtime_artifact_sets::require_set(
+            &source,
+            row.artifact_set.as_ref(),
+            row.artifact_set_hash.as_deref(),
+        )?;
         let response = metadata(&row);
         tx.commit().await?;
         return Ok(response);
@@ -124,13 +141,21 @@ pub async fn record(
         );
         earliest = Some(earliest.map_or(expiry, |old| old.min(expiry)));
     }
+    let source =
+        crate::runtime_artifact_sets::derive_turn(&mut tx, who, turn.id, &request.model_id, true)
+            .await?;
+    let set_hash = crate::runtime_artifact_sets::set_hash(source.set.as_ref())?;
+    if let Some(deadline) = source.deadline {
+        earliest = Some(earliest.map_or(deadline, |old| old.min(deadline)));
+    }
     let id = Uuid::new_v4();
     let encrypted = cipher.encrypt(who.tenant_id, id, request.text.as_bytes())?;
     let row:Stored=sqlx::query_as(
-        "INSERT INTO runtime_final_publications(tenant_id,id,key_id,turn_id,model_id,source_requests,text_sha256,bytes,result_ciphertext,created_at,expires_at) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,stamp.ts,LEAST(stamp.ts+make_interval(secs=>$10::integer),$11) FROM (SELECT clock_timestamp() AS ts) stamp RETURNING *"
+        "INSERT INTO runtime_final_publications(tenant_id,id,key_id,turn_id,model_id,source_requests,text_sha256,bytes,result_ciphertext,created_at,expires_at,artifact_set,artifact_set_hash) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,stamp.ts,LEAST(stamp.ts+make_interval(secs=>$10::integer),$11),$12,$13 FROM (SELECT clock_timestamp() AS ts) stamp RETURNING *"
     ).bind(who.tenant_id).bind(id).bind(who.key_id).bind(turn.id).bind(request.model_id)
         .bind(json!(sources)).bind(hash).bind(i32::try_from(request.text.len()).map_err(|_|Error::Configuration)?)
         .bind(encrypted).bind(ttl).bind(earliest.ok_or(Error::Configuration)?)
+        .bind(source.set).bind(set_hash)
         .fetch_one(&mut *tx).await?;
     governance::event(
         &mut tx,
@@ -162,6 +187,14 @@ async fn current(
     if !valid {
         return Err(Error::ResultUnavailable);
     }
+    let source =
+        crate::runtime_artifact_sets::derive_turn(tx, who, row.turn_id, &row.model_id, true)
+            .await?;
+    crate::runtime_artifact_sets::require_set(
+        &source,
+        row.artifact_set.as_ref(),
+        row.artifact_set_hash.as_deref(),
+    )?;
     let text = String::from_utf8(
         cipher.decrypt(
             who.tenant_id,
@@ -180,15 +213,22 @@ async fn current(
     Ok((row, turn, text))
 }
 fn output(row: &Stored, turn: &governance::Turn, text: &str) -> governance::Check {
+    let mut payload = json!({"publication_id":row.id,"source_request_ids":source_ids(row),
+        "session_id":turn.session_id,"message_id":turn.message_id,"run_id":turn.run_id,
+        "generation":turn.generation,"text":text});
+    if let Some(set) = crate::runtime_artifact_sets::view(
+        row.artifact_set.as_ref(),
+        row.artifact_set_hash.as_deref(),
+    ) {
+        payload["artifact_set"] = set;
+    }
     governance::Check {
         turn_id: row.turn_id,
         operation_key: format!("{OUTPUT_PREFIX}{}", row.id),
         stage: "post".into(),
         model_id: Some(row.model_id.clone()),
         tool_name: None,
-        payload: json!({"publication_id":row.id,"source_request_ids":source_ids(row),
-            "session_id":turn.session_id,"message_id":turn.message_id,"run_id":turn.run_id,
-            "generation":turn.generation,"text":text}),
+        payload,
     }
 }
 
@@ -196,6 +236,7 @@ fn output(row: &Stored, turn: &governance::Turn, text: &str) -> governance::Chec
 /// This does not give human review access to the separately stored ciphertext.
 pub(crate) async fn review_payload(
     tx: &mut Tx<'_>,
+    cipher: &ResultCipher,
     who: &Identity,
     op: &Operation,
     turn: &governance::Turn,
@@ -214,7 +255,7 @@ pub(crate) async fn review_payload(
         return Err(Error::ResultUnavailable);
     }
     let row: Option<Stored> = sqlx::query_as(
-        "SELECT id,turn_id,model_id,source_requests,text_sha256,bytes,NULL::bytea AS result_ciphertext,expires_at FROM runtime_final_publication_review_facts WHERE tenant_id=$1 AND key_id=$2 AND turn_id=$3 AND id=$4 AND available"
+        "SELECT id,turn_id,model_id,source_requests,text_sha256,bytes,NULL::bytea AS result_ciphertext,expires_at,artifact_set,artifact_set_hash FROM runtime_final_publication_review_facts WHERE tenant_id=$1 AND key_id=$2 AND turn_id=$3 AND id=$4 AND available"
     ).bind(who.tenant_id).bind(op.key_id).bind(op.turn_id).bind(id).fetch_optional(&mut **tx).await?;
     let row = row.ok_or(Error::ResultUnavailable)?;
     let text = payload["text"].as_str().ok_or(Error::ResultUnavailable)?;
@@ -226,6 +267,7 @@ pub(crate) async fn review_payload(
     {
         return Err(Error::ResultUnavailable);
     }
+    authorize_artifacts(tx, cipher, who, &row).await?;
     Ok(())
 }
 
@@ -258,14 +300,52 @@ pub(crate) async fn validate_approval(
     {
         return Err(Error::ResultUnavailable);
     }
-    review_payload(tx, who, op, &turn, &value).await
+    review_payload(tx, cipher, who, op, &turn, &value).await
 }
 
 /// POST may drive paid semantic evaluation; no output execution claim is made.
 pub async fn release(gateway: &Gateway, who: &Identity, id: Uuid) -> Result<Value> {
     let mut tx = gateway.pool.begin().await?;
     governance::tenant_lock(&mut tx, who.tenant_id).await?;
+    let (row, _, _) = current(&mut tx, &gateway.cipher, who, id).await?;
+    // No original-tool classifier may run until every file in the final turn
+    // is authorized. Checking one batch here would permit paid work for a
+    // partially approved final publication.
+    if let Some(pending) =
+        crate::runtime_artifact_sets::gate_all(&mut tx, who, row.artifact_set.as_ref()).await?
+    {
+        let response = artifact_pending(&row, pending);
+        tx.commit().await?;
+        return Ok(response);
+    }
+    let source =
+        crate::runtime_artifact_sets::derive_turn(&mut tx, who, row.turn_id, &row.model_id, true)
+            .await?;
+    tx.commit().await?;
+    for result_id in source.result_ids {
+        let mut result = runtime_results::release(gateway, who, result_id).await?;
+        if result["state"] != "ready" {
+            result
+                .as_object_mut()
+                .ok_or(Error::Configuration)?
+                .remove("text");
+            let mut response = metadata(&row);
+            response["publication_id"] = json!(row.id);
+            response["state"] = json!("waiting_tool_outputs");
+            response["tool_outputs"] = json!([result]);
+            return Ok(response);
+        }
+    }
+    let mut tx = gateway.pool.begin().await?;
+    governance::tenant_lock(&mut tx, who.tenant_id).await?;
     let (row, turn, text) = current(&mut tx, &gateway.cipher, who, id).await?;
+    if let Some(pending) =
+        crate::runtime_artifact_sets::gate_all(&mut tx, who, row.artifact_set.as_ref()).await?
+    {
+        let response = artifact_pending(&row, pending);
+        tx.commit().await?;
+        return Ok(response);
+    }
     let check = output(&row, &turn, &text);
     tx.commit().await?;
     let checked = gateway.check(who, check).await?;
@@ -274,6 +354,13 @@ pub async fn release(gateway: &Gateway, who: &Identity, id: Uuid) -> Result<Valu
     let mut tx = gateway.pool.begin().await?;
     governance::tenant_lock(&mut tx, who.tenant_id).await?;
     let (row, turn, text) = current(&mut tx, &gateway.cipher, who, id).await?;
+    if let Some(pending) =
+        crate::runtime_artifact_sets::gate_all(&mut tx, who, row.artifact_set.as_ref()).await?
+    {
+        let response = artifact_pending(&row, pending);
+        tx.commit().await?;
+        return Ok(response);
+    }
     let check = output(&row, &turn, &text);
     let hash = governance::digest(&json!({"turn":check.turn_id,"model":check.model_id,
         "tool":check.tool_name,"payload":check.payload}))?;
@@ -301,6 +388,13 @@ pub async fn release(gateway: &Gateway, who: &Identity, id: Uuid) -> Result<Valu
     // Locks cannot stop clock expiry. Repeat authority, source and content checks
     // after observation/event writes and immediately before returning plaintext.
     current(&mut tx, &gateway.cipher, who, id).await?;
+    let artifact_deadline = authorize_artifacts(&mut tx, &gateway.cipher, who, &row).await?;
+    governance::turn_locked(&mut tx, who, row.turn_id, true).await?;
+    let deadline = deadline
+        .into_iter()
+        .chain(artifact_deadline)
+        .chain([row.expires_at, turn.expires_at])
+        .min();
     governance::require_live_grants(&mut tx, deadline).await?;
     let mut response = metadata(&row);
     response["id"] = json!(op.id);
@@ -327,6 +421,47 @@ pub async fn release(gateway: &Gateway, who: &Identity, id: Uuid) -> Result<Valu
     tx.commit().await?;
     Ok(response)
 }
+fn artifact_pending(row: &Stored, pending: Value) -> Value {
+    let mut value = metadata(row);
+    value["publication_id"] = json!(row.id);
+    value["state"] = pending["state"].clone();
+    value["artifacts"] = pending["artifacts"].clone();
+    value
+}
+
+async fn authorize_artifacts(
+    tx: &mut Tx<'_>,
+    cipher: &ResultCipher,
+    who: &Identity,
+    row: &Stored,
+) -> Result<Option<DateTime<Utc>>> {
+    let source =
+        crate::runtime_artifact_sets::derive_turn(tx, who, row.turn_id, &row.model_id, true)
+            .await?;
+    crate::runtime_artifact_sets::require_set(
+        &source,
+        row.artifact_set.as_ref(),
+        row.artifact_set_hash.as_deref(),
+    )?;
+    let mut deadline = Some(
+        source
+            .deadline
+            .map_or(row.expires_at, |d| d.min(row.expires_at)),
+    );
+    if let Some(d) =
+        crate::runtime_artifact_sets::authorize_all(tx, who, row.artifact_set.as_ref()).await?
+    {
+        deadline = Some(deadline.map_or(d, |old| old.min(d)));
+    }
+    for id in source.result_ids {
+        if let Some(d) = runtime_results::authorize_source_result(tx, cipher, who, id).await? {
+            deadline = Some(deadline.map_or(d, |old| old.min(d)));
+        }
+    }
+    governance::require_live_grants(tx, deadline).await?;
+    Ok(deadline)
+}
+
 pub async fn maintain(pool: &PgPool) -> Result<u64> {
     let mut tx = pool.begin().await?;
     let rows:Vec<(Uuid,Uuid,Uuid)>=sqlx::query_as(
