@@ -1,0 +1,50 @@
+# Optional, isolated native byte capture. Add with production/control-plane files
+# only after 0030 + purpose registration. No download or scan authority is added.
+# Secrets are explicit existing files, so the default 14-service deployment and
+# its existing Secret release remain unchanged.
+services:
+  runtime-assets:
+    image: brokerrouter:${BROKERROUTER_IMAGE_TAG:?set immutable tested image tag}
+    profiles: [runtime-artifacts]
+    restart: unless-stopped
+    entrypoint: [/usr/local/bin/control-plane-entrypoint]
+    command: [serve-assets, --runtime-output, --bind, "0.0.0.0:8082"]
+    volumes:
+      - ./deploy/production/control-plane-entrypoint.sh:/usr/local/bin/control-plane-entrypoint:ro
+    environment:
+      BROKERROUTER_COMPONENT: runtime-assets
+      BROKERROUTER_DATABASE_MAX_CONNECTIONS: "2"
+      BROKERROUTER_ASSET_S3_CA_FILE: /run/secrets/asset_s3_ca
+      RUST_LOG: brokerrouter=info
+    secrets:
+      - source: pg_ca
+        target: pg_ca
+      - source: asset_s3_ca
+        target: asset_s3_ca
+      - source: runtime_artifact_purpose
+        target: purpose_env
+      - source: runtime_artifact_config
+        target: component_config
+    networks: [backend, egress]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    cap_add: [SETGID, SETUID]
+    read_only: true
+    tmpfs: ["/tmp:size=16m,mode=1777"]
+    init: true
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 0.5
+    stop_grace_period: 1m
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+secrets:
+  runtime_artifact_purpose:
+    file: ${BROKERROUTER_RUNTIME_ARTIFACT_PURPOSE_FILE:?set validated v2 runtime-assets.env path}
+  runtime_artifact_config:
+    file: ${BROKERROUTER_RUNTIME_ARTIFACT_CONFIG_FILE:?set independent encoded runtime-assets.env path}

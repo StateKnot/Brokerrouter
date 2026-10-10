@@ -121,16 +121,15 @@ class ProductionPurposeLogins(unittest.TestCase):
     def passed(self, label):
         print("purpose-login scenario: " + label + " passed", flush=True)
 
-    @unittest.skipUnless(os.environ.get("BROKERROUTER_PROVISIONER_TEST_IMAGE"), "set independent provisioner test image after building it")
-    def test_isolated_ops_image_fresh_upgrade_and_conflict(self):
+    def provision_image(self, expect=0, with_runtime_artifacts=False, plaintext_admin=False):
         image = os.environ.get("BROKERROUTER_PROVISIONER_TEST_IMAGE")
-        self.create()
         service = self.root / "purpose-admin.service"
         passfile = self.root / "purpose-admin.passfile"
         self.write(passfile, "postgres:5432:brokerrouter:brokerrouter_migration:" + self.passwords["migration"] + "\n")
         self.write(service, "[purpose]\nhost=postgres\nhostaddr=127.0.0.1\nport=5432\ndbname=brokerrouter\nuser=brokerrouter_migration\nsslmode=verify-full\nsslrootcert=/run/secrets/pg_ca\npassfile=/run/secrets/purpose_admin_passfile\nconnect_timeout=5\n")
-        def provision(expect=0):
-            return self.call(["docker", "run", "--rm", "--network", "container:" + self.name,
+        if plaintext_admin:
+            self.write(service, service.read_text().replace("sslmode=verify-full", "sslmode=disable"))
+        command = ["docker", "run", "--rm", "--network", "container:" + self.name,
                               "--user", str(os.geteuid()) + ":" + str(os.getegid()), "--read-only", "--cap-drop", "ALL",
                               "--security-opt", "no-new-privileges", "--memory", "128m", "--cpus", "0.5", "--pids-limit", "32",
                               "--tmpfs", "/run/purpose-secrets:size=1m,mode=0700,uid=" + str(os.geteuid()) + ",gid=" + str(os.getegid()),
@@ -139,10 +138,21 @@ class ProductionPurposeLogins(unittest.TestCase):
                               "--mount", "type=bind,src=" + str(self.secret_dir / ".purpose-logins.lock") + ",dst=/run/purpose-secrets/.purpose-logins.lock",
                               "--mount", "type=bind,src=" + str(service) + ",dst=/run/secrets/purpose_admin_service,readonly",
                               "--mount", "type=bind,src=" + str(passfile) + ",dst=/run/secrets/purpose_admin_passfile,readonly",
-                              "--mount", "type=bind,src=" + str(self.root / "ca.crt") + ",dst=/run/secrets/pg_ca,readonly", image], expect=expect)
+                              "--mount", "type=bind,src=" + str(self.root / "ca.crt") + ",dst=/run/secrets/pg_ca,readonly"]
+        if with_runtime_artifacts:
+            command += ["--mount", "type=bind,src=" + str(self.secret_dir / "purpose-logins-v2") + ",dst=/run/purpose-secrets/purpose-logins-v2,readonly"]
+        command.append(image)
+        if with_runtime_artifacts:
+            command.append("--with-runtime-artifacts")
+        return self.call(command, expect=expect)
+
+    @unittest.skipUnless(os.environ.get("BROKERROUTER_PROVISIONER_TEST_IMAGE"), "set independent provisioner test image after building it")
+    def test_isolated_ops_image_fresh_upgrade_and_conflict(self):
+        self.create()
+        provision = self.provision_image
         original = self.snapshot(self.secret_dir / "purpose-logins")
         provision()
-        self.assertEqual(self.count_logins(), 19)
+        self.assertEqual(self.count_logins(), len(helper.GROUPS))
         provision()
         self.assertEqual(self.snapshot(self.secret_dir / "purpose-logins"), original)
         self.assertEqual(self.admin("SELECT rolname,encode(sha256(convert_to(rolpassword,'UTF8')),'hex') FROM pg_authid WHERE rolname IN('brokerrouter_migration','brokerrouter_runtime_login','brokerrouter_operator_login') ORDER BY rolname;").stdout, self.core_db)
@@ -151,9 +161,67 @@ class ProductionPurposeLogins(unittest.TestCase):
         provision(expect=1)
         self.admin("REVOKE brokerrouter_approvals FROM brokerrouter_console;")
         self.passed("isolated ops image rejects recursive role conflict without partial mutation")
-        self.write(service, service.read_text().replace("sslmode=verify-full", "sslmode=disable"))
-        provision(expect=1)
+        provision(expect=1, plaintext_admin=True)
         self.passed("isolated ops image refuses administrator plaintext configuration")
+
+    def create_legacy_19(self):
+        directory = self.secret_dir / "purpose-logins"
+        directory.mkdir(mode=0o700)
+        entries = []
+        for purpose, group in helper.GROUPS.items():
+            if purpose == "runtime-assets":
+                continue
+            password = secrets.token_hex(32).encode("ascii")
+            environment, verifier = helper.env_content(purpose, password), helper.scram(password)
+            for suffix, body in ((".password", password), (".env", environment), (".scram", verifier.encode())):
+                self.write(directory / (purpose + suffix), body.decode())
+            entries.append({"purpose":purpose,"login":helper.LOGINS[purpose],"group":group,
+                "password_sha256":helper.digest(password),"env_sha256":helper.digest(environment),"scram":verifier})
+        self.write(directory / "manifest.json", json.dumps({"version":1,"roles":entries},sort_keys=True,indent=2)+"\n")
+        # The actual old creator leaves this deployment-owned lock beside its
+        # immutable release; the image must share it without writable Secrets.
+        self.write(self.secret_dir / ".purpose-logins.lock", "")
+        return directory
+
+    @unittest.skipUnless(os.environ.get("BROKERROUTER_PROVISIONER_TEST_IMAGE"), "set independent provisioner test image after building it")
+    def test_isolated_ops_image_legacy_19_to_version2_extension(self):
+        directory = self.create_legacy_19()
+        original = self.snapshot(directory)
+        self.provision_image()
+        self.assertEqual(self.count_logins(), 19)
+        registered = self.admin("SELECT login,password_sha256 FROM brokerrouter_deployment.purpose_logins ORDER BY login;").stdout
+        self.call(["sh", str(HERE / "upgrade-runtime-artifact-secrets.sh"), str(self.secret_dir)], env=self.environment)
+        extension = self.snapshot(self.secret_dir / "purpose-logins-v2")
+        self.provision_image()
+        self.assertEqual(self.count_logins(), 19)
+        self.provision_image(with_runtime_artifacts=True)
+        self.assertEqual(self.count_logins(), 20)
+        self.provision_image(with_runtime_artifacts=True)
+        self.assertEqual(self.admin("SELECT login,password_sha256 FROM brokerrouter_deployment.purpose_logins WHERE purpose<>'runtime-assets' ORDER BY login;").stdout, registered)
+        self.assertEqual(self.snapshot(directory), original)
+        self.assertEqual(self.snapshot(self.secret_dir / "purpose-logins-v2"), extension)
+        self.assertEqual(self.admin("SELECT rolname,encode(sha256(convert_to(rolpassword,'UTF8')),'hex') FROM pg_authid WHERE rolname IN('brokerrouter_migration','brokerrouter_runtime_login','brokerrouter_operator_login') ORDER BY rolname;").stdout, self.core_db)
+        self.passed("isolated ops image explicit version 2 read-only mount upgrades 19→20 without Secret rotation")
+
+    def test_actual_legacy_19_registration_and_explicit_version2_upgrade(self):
+        directory = self.create_legacy_19()
+        original = self.snapshot(directory)
+        self.apply()
+        self.assertEqual(self.count_logins(),19)
+        registered = self.admin("SELECT login,password_sha256 FROM brokerrouter_deployment.purpose_logins ORDER BY login;").stdout
+        self.call(["sh",str(HERE/"upgrade-runtime-artifact-secrets.sh"),str(self.secret_dir)],env=self.environment)
+        self.assertEqual(self.snapshot(directory),original)
+        self.apply()  # default cannot silently register the extension
+        self.assertEqual(self.count_logins(),19)
+        self.call(["sh",str(HERE/"apply-purpose-logins.sh"),"--with-runtime-artifacts",str(self.secret_dir),str(self.service),"admin"],env=self.environment)
+        self.assertEqual(self.count_logins(),20)
+        unchanged = self.admin("SELECT login,password_sha256 FROM brokerrouter_deployment.purpose_logins WHERE purpose<>'runtime-assets' ORDER BY login;").stdout
+        self.assertEqual(registered,unchanged)
+        self.assertEqual(self.snapshot(directory),original)
+        self.call(["sh",str(HERE/"apply-purpose-logins.sh"),"--with-runtime-artifacts",str(self.secret_dir),str(self.service),"admin"],env=self.environment)
+        self.assertEqual(self.count_logins(),20)
+        self.assertEqual(self.admin("SELECT rolname,encode(sha256(convert_to(rolpassword,'UTF8')),'hex') FROM pg_authid WHERE rolname IN('brokerrouter_migration','brokerrouter_runtime_login','brokerrouter_operator_login') ORDER BY rolname;").stdout,self.core_db)
+        self.passed("actual TLS 19→20 extension preserves every original login and Secret without rotation")
 
     def test_real_scripts_and_permissions(self):
         self.create()

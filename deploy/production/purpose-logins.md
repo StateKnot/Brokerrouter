@@ -55,6 +55,7 @@ connect_timeout=5
 | mcp-server | brokerrouter_mcp_server_login | brokerrouter_mcp_server |
 | mcp-worker | brokerrouter_mcp_worker_login | brokerrouter_mcp_worker |
 | reconciler | brokerrouter_reconciler_login | brokerrouter_reconciler |
+| runtime-assets（version 2） | brokerrouter_runtime_assets_login | brokerrouter_runtime_assets |
 
 reconciler 保留现有权限组对 runtime 的必要继承，不以“唯一直属组”假称没有间接继承。其他用途的递归 membership 集合必须与清单一致；角色的 INHERIT/SET/ADMIN 选项均实际检查。各登录 INHERIT、NOSUPERUSER/NOCREATEDB/NOCREATEROLE/NOREPLICATION/NOBYPASSRLS，只有数据库 CONNECT 与用途组权限；没有 schema CREATE、数据库 CREATE/TEMP、额外直接 ACL、对象所有权或其他角色管理权。每登录连接上限 8、statement/lock/idle-transaction 超时为 15s/3s/60s；全服务连接池与 PostgreSQL max_connections 的总容量仍须编排时明确分配并压测，不能将本包权限测试作为容量认证。
 
@@ -86,4 +87,41 @@ df -h . /private/tmp
 PYTHONDONTWRITEBYTECODE=1 python3 deploy/production/test-purpose-logins.py
 ```
 
-测试只创建任务专用、无外部网络、512 MiB memory/256 MiB PGDATA tmpfs 的锁定 PostgreSQL 容器，使用真实迁移与权限 SQL；不挂 Docker 数据卷，不触碰其他数据库。验证新装、重跑、冲突回滚、递归/实际关键授权漂移、生成器中断保留密码、CREATE ROLE 后终止 backend 全批回滚、坏 manifest、symlink、并发锁、19 用途实际 TLS/SCRAM 连接及 SET ROLE/敏感表正反矩阵；最后删除自身容器与临时凭据。这里只认证本包，不认证完整 R1 编排、真实身份、供应商或恢复产品。
+测试只创建任务专用、无外部网络、512 MiB memory/256 MiB PGDATA tmpfs 的锁定 PostgreSQL 容器，使用真实迁移与权限 SQL；不挂 Docker 数据卷，不触碰其他数据库。验证新装、重跑、冲突回滚、递归/实际关键授权漂移、生成器中断保留密码、CREATE ROLE 后终止 backend 全批回滚、坏 manifest、symlink、并发锁、20 用途实际 TLS/SCRAM 连接及 SET ROLE/敏感表正反矩阵，以及旧 19 用途的显式升级；最后删除自身容器与临时凭据。这里只认证本包，不认证完整 R1 编排、真实身份、供应商或恢复产品。
+
+### 原生产物接收身份的显式升级
+
+0030 增加 `runtime-assets → brokerrouter_runtime_assets`。新装生成 version 2 的精确 20 用途 manifest，默认 apply 按该 manifest 注册；已发布的 version 1/19 用途执行 create/apply 时继续验证原 19 用途，绝不隐式扩展或轮换密码。
+
+旧环境先应用 0030 和更新后的 `deploy/permissions.sql`，再执行：
+
+```sh
+sh deploy/production/upgrade-runtime-artifact-secrets.sh "$BROKERROUTER_SECRET_DIR"
+sh deploy/production/apply-purpose-logins.sh --with-runtime-artifacts \
+  "$BROKERROUTER_SECRET_DIR" /absolute/protected/admin.service purpose
+```
+
+升级核对完整旧集，将原 57 份 Secret 原字节保存在独立 `purpose-logins-v2`，只生成新增用途的 password/env/SCRAM；旧 `purpose-logins` 与旧 manifest 不变。中断恢复继续使用已提交的新密码；任何字节、角色、继承或已注册密码冲突都失败关闭。SQL 核对原 19 个注册事实并与新增身份同事务提交，不重置已有 LOGIN。
+
+旧环境为产物 profile 选择 `$BROKERROUTER_SECRET_DIR/purpose-logins-v2/runtime-assets.env`；新装选择 `$BROKERROUTER_SECRET_DIR/purpose-logins/runtime-assets.env`。独立配置 JSON 只含 `runtime-assets`，用 `control-plane-config.py` 发布到新的受保护外部目录；旧 14 组件配置目录保持不变。
+
+```sh
+python3 deploy/production/control-plane-config.py /absolute/runtime-assets.json /absolute/runtime-config-release
+export BROKERROUTER_RUNTIME_ARTIFACT_PURPOSE_FILE=/absolute/validated-v2/runtime-assets.env
+export BROKERROUTER_RUNTIME_ARTIFACT_CONFIG_FILE=/absolute/runtime-config-release/component-config/runtime-assets.env
+docker compose -f compose.production.yaml -f compose.control-plane.yaml \
+  -f compose.runtime-artifacts.yaml --profile runtime-artifacts up -d runtime-assets
+```
+
+此服务在 backend 网络接收，并通过现有 egress 网络连接受信配置的固定 S3 HTTPS 端点；它运行 `serve-assets --runtime-output`，独立数据库 LOGIN、2 个连接、独立 Secret；无输入媒体、下载、扫描、审批或模型调用权限。远程 broker 连接仍须通过受控私有 HTTPS 入口。它仅接收有原 claim 的私有候选字节；MP4 声明不是格式认证，完整扫描、真实字节审阅、当前授权和宿主隔离尚未完成时不开放产物发布。默认 14 个组件和原 48/80 连接预算保持不变；启用本 profile 后增加 2 个数据库连接。
+
+已有 Docker 运维工具链也可使用新版本 purpose-provisioner（精确镜像需包含 version 2 验证器），给独立升级目录增加只读挂载；原 admin service/passfile/CA 和 19 用途目录保持原挂载：
+
+```sh
+docker compose -f compose.production.yaml -f compose.control-plane.yaml --profile ops \
+  run --rm --no-deps \
+  --volume "$BROKERROUTER_SECRET_DIR/purpose-logins-v2:/run/purpose-secrets/purpose-logins-v2:ro" \
+  purpose-provisioner --with-runtime-artifacts
+```
+
+新装 version 2 的默认目录已有完整 20 集，不需要第二个目录挂载。注册器始终通过管理员 TLS/SCRAM 事务核对已有 LOGIN，不将管理员凭据挂入产物接收服务。

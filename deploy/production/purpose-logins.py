@@ -27,6 +27,8 @@ GROUPS = {
     "mcp-worker": "mcp_worker", "reconciler": "reconciler",
 }
 GROUPS = {purpose: "brokerrouter_" + group for purpose, group in GROUPS.items()}
+LEGACY_PURPOSES = frozenset(GROUPS)
+GROUPS["runtime-assets"] = "brokerrouter_runtime_assets"
 LOGINS = {purpose: "brokerrouter_" + purpose.replace("-", "_") + "_login" for purpose in GROUPS}
 REPOSITORY = Path(__file__).resolve().parents[2]
 LIMIT = 1024 * 1024
@@ -127,13 +129,15 @@ def validate(directory):
     private(directory, True)
     manifest_bytes = read(directory / "manifest.json")
     manifest = json.loads(manifest_bytes)
-    require(set(manifest) == {"version", "roles"} and manifest["version"] == 1, "unsupported purpose manifest")
-    require(isinstance(manifest["roles"], list) and len(manifest["roles"]) == len(GROUPS), "invalid purpose manifest roles")
+    require(set(manifest) == {"version", "roles"} and type(manifest["version"]) is int
+            and manifest["version"] in (1, 2), "unsupported purpose manifest")
+    purposes = LEGACY_PURPOSES if manifest["version"] == 1 else frozenset(GROUPS)
+    require(isinstance(manifest["roles"], list) and len(manifest["roles"]) == len(purposes), "invalid purpose manifest roles")
     seen = set()
     for entry in manifest["roles"]:
         require(set(entry) == {"purpose", "login", "group", "password_sha256", "env_sha256", "scram"}, "invalid purpose entry")
         purpose = entry["purpose"]
-        require(purpose in GROUPS and purpose not in seen and entry["login"] == LOGINS[purpose]
+        require(purpose in purposes and purpose not in seen and entry["login"] == LOGINS[purpose]
                 and entry["group"] == GROUPS[purpose], "purpose identity differs from fixed role contract")
         seen.add(purpose)
         password = read(directory / (purpose + ".password"))
@@ -142,7 +146,7 @@ def validate(directory):
         expected = env_content(purpose, password)
         require(read(directory / (purpose + ".env")) == expected and digest(expected) == entry["env_sha256"], "environment state mismatch")
         verify_scram(password, entry["scram"])
-    allowed = {"manifest.json"} | {purpose + extension for purpose in GROUPS for extension in [".password", ".env", ".scram"]}
+    allowed = {"manifest.json"} | {purpose + extension for purpose in purposes for extension in [".password", ".env", ".scram"]}
     require({path.name for path in directory.iterdir()} == allowed, "unexpected or partial purpose state")
     for entry in manifest["roles"]:
         require(read(directory / (entry["purpose"] + ".scram")).decode("ascii") == entry["scram"], "SCRAM file differs from manifest")
@@ -160,6 +164,19 @@ def create(root):
     if not pending.exists():
         pending.mkdir(mode=0o700)
     private(pending, True)
+    # Discard only uncommitted atomic-write links before validating a complete
+    # interrupted release; already committed password paths never change.
+    for temporary in pending.glob(".writing-*"):
+        private(temporary)
+        temporary.unlink()
+    if (pending / "manifest.json").exists():
+        previous = validate(pending)
+        if previous["version"] == 1:
+            sync_directory(pending)
+            os.rename(pending, target)
+            sync_directory(root)
+            print("Committed legacy pending release recovered; no Secrets replaced")
+            return
     # An interrupted atomic write has not been linked into committed state.
     for temporary in pending.glob(".writing-*"):
         private(temporary)
@@ -183,7 +200,7 @@ def create(root):
         verify_scram(password, verifier)
         entries.append({"purpose": purpose, "login": LOGINS[purpose], "group": group,
                         "password_sha256": digest(password), "env_sha256": digest(expected), "scram": verifier})
-    content = (json.dumps({"version": 1, "roles": entries}, sort_keys=True, indent=2) + "\n").encode()
+    content = (json.dumps({"version": 2, "roles": entries}, sort_keys=True, indent=2) + "\n").encode()
     if not (pending / "manifest.json").exists():
         atomic_new(pending / "manifest.json", content)
     require(read(pending / "manifest.json") == content, "partial manifest state mismatch")
@@ -191,6 +208,83 @@ def create(root):
     os.rename(pending, target)
     sync_directory(root)
     print("Purpose secrets published atomically; component configuration is still required")
+
+
+
+def select_manifest(root, with_runtime_artifacts=False):
+    base = validate(root / "purpose-logins")
+    if not with_runtime_artifacts or base["version"] == 2:
+        return base
+    require(not (root / ".purpose-logins-v2.pending").exists(), "published and pending upgrades coexist; inspect before recovery")
+    upgraded = validate(root / "purpose-logins-v2")
+    require(upgraded["version"] == 2, "runtime artifact purpose requires version 2")
+    require([entry for entry in upgraded["roles"] if entry["purpose"] != "runtime-assets"] == base["roles"],
+            "upgraded purpose identities differ from the original release")
+    for entry in base["roles"]:
+        for extension in (".password", ".env", ".scram"):
+            name = entry["purpose"] + extension
+            require(read(root / "purpose-logins-v2" / name) == read(root / "purpose-logins" / name),
+                    "upgraded release changed an original purpose Secret")
+    return upgraded
+
+
+def upgrade_runtime_artifacts(root):
+    base = validate(root / "purpose-logins")
+    target, pending = root / "purpose-logins-v2", root / ".purpose-logins-v2.pending"
+    if base["version"] == 2:
+        require(not pending.exists() and not target.exists(), "unexpected second version 2 release")
+        print("Version 2 already contains the isolated artifact purpose; no files replaced")
+        return
+    if target.exists() or target.is_symlink():
+        select_manifest(root, True)
+        require(not pending.exists(), "published and pending upgrades coexist; inspect before recovery")
+        print("Existing version 2 extension verified; original release unchanged")
+        return
+    if not pending.exists():
+        pending.mkdir(mode=0o700)
+    private(pending, True)
+    for temporary in pending.glob(".writing-*"):
+        private(temporary)
+        temporary.unlink()
+    # The original manifest and all 57 original files remain untouched. Only
+    # this explicit, independently published extension holds a full new set.
+    for entry in base["roles"]:
+        for extension in (".password", ".env", ".scram"):
+            name = entry["purpose"] + extension
+            content = read(root / "purpose-logins" / name)
+            destination = pending / name
+            if not destination.exists() and not destination.is_symlink():
+                atomic_new(destination, content)
+            require(read(destination) == content, "partial upgrade changed an original Secret")
+    purpose = "runtime-assets"
+    password_path = pending / (purpose + ".password")
+    if not password_path.exists() and not password_path.is_symlink():
+        atomic_new(password_path, secrets.token_hex(32).encode("ascii"))
+    password = read(password_path)
+    require(re.fullmatch(b"[0-9a-f]{64}", password) is not None, "partial artifact password requires inspection")
+    expected = env_content(purpose, password)
+    environment = pending / (purpose + ".env")
+    if not environment.exists() and not environment.is_symlink():
+        atomic_new(environment, expected)
+    require(read(environment) == expected, "partial artifact environment requires inspection")
+    verifier_file = pending / (purpose + ".scram")
+    if not verifier_file.exists() and not verifier_file.is_symlink():
+        atomic_new(verifier_file, scram(password).encode("ascii"))
+    verifier = read(verifier_file).decode("ascii")
+    verify_scram(password, verifier)
+    entries = base["roles"] + [{"purpose": purpose, "login": LOGINS[purpose], "group": GROUPS[purpose],
+        "password_sha256": digest(password), "env_sha256": digest(expected), "scram": verifier}]
+    content = (json.dumps({"version": 2, "roles": entries}, sort_keys=True, indent=2) + "\n").encode()
+    manifest = pending / "manifest.json"
+    if not manifest.exists() and not manifest.is_symlink():
+        atomic_new(manifest, content)
+    require(read(manifest) == content, "partial upgrade manifest conflict")
+    validate(pending)
+    sync_directory(pending)
+    os.rename(pending, target)
+    sync_directory(root)
+    select_manifest(root, True)
+    print("Version 2 artifact purpose published atomically; all original Secrets unchanged")
 
 
 def literal(value):
@@ -255,7 +349,7 @@ BEGIN
     RAISE EXCEPTION 'purpose group has administrative ownership or flags' USING ERRCODE='BR012';
   END IF;
   IF has_column_privilege(g,'public.approvals','state','UPDATE')<>(r.purpose IN('control','approvals'))
-     OR has_table_privilege(g,'public.asset_chunks','SELECT')<>(r.purpose IN('assets','output-worker','output-scan','output-delivery','media-review'))
+     OR has_table_privilege(g,'public.asset_chunks','SELECT')<>(r.purpose IN('assets','output-worker','output-scan','output-delivery','media-review','runtime-assets'))
      OR NOT has_table_privilege(g,'public._sqlx_migrations','SELECT') THEN
     RAISE EXCEPTION 'purpose group critical permission contract mismatch' USING ERRCODE='BR013';
   END IF;
@@ -307,8 +401,8 @@ COMMIT;
 """
 
 
-def apply(root, service_file, service):
-    manifest = validate(root / "purpose-logins")
+def apply(root, service_file, service, with_runtime_artifacts=False):
+    manifest = select_manifest(root, with_runtime_artifacts)
     require(service_file.is_absolute() and service_file.resolve() == service_file, "admin service file must be absolute and canonical")
     config = configparser.ConfigParser(interpolation=None)
     config.read_string(read(service_file).decode("utf-8"))
@@ -341,7 +435,10 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     create_parser = commands.add_parser("create")
     create_parser.add_argument("secret_directory", type=Path)
+    upgrade_parser = commands.add_parser("upgrade-runtime-artifacts")
+    upgrade_parser.add_argument("secret_directory", type=Path)
     apply_parser = commands.add_parser("apply")
+    apply_parser.add_argument("--with-runtime-artifacts", action="store_true")
     apply_parser.add_argument("secret_directory", type=Path)
     apply_parser.add_argument("admin_service_file", type=Path)
     apply_parser.add_argument("service")
@@ -351,8 +448,10 @@ def main():
         with locked_root(arguments.secret_directory) as root:
             if arguments.command == "create":
                 create(root)
+            elif arguments.command == "upgrade-runtime-artifacts":
+                upgrade_runtime_artifacts(root)
             else:
-                apply(root, arguments.admin_service_file, arguments.service)
+                apply(root, arguments.admin_service_file, arguments.service, arguments.with_runtime_artifacts)
     except DatabaseFailure as error:
         print("Purpose transaction failed closed; SQLSTATE=" + error.code, file=sys.stderr)
         return 1

@@ -83,6 +83,13 @@ class ConfigurationTest(unittest.TestCase):
                     assertion.write_text("\n".join("[ \"$(printf '%s' \"$" + name + "\" | sha256sum | cut -d' ' -f1)\" = " + hashlib.sha256(value.encode()).hexdigest() + " ]" for name, value in entries.items()) + "\n")
                     load(purpose, cfg.encode(purpose, entries))
                 print("PASS: all 14 purpose loaders preserve UTF-8 multiline/trailing-newline values and never execute shell text", flush=True)
+                runtime = dict(values["assets"])
+                runtime["BROKERROUTER_RUNTIME_ARTIFACT_TTL_SECONDS"] = "86400"
+                assertion.write_text("\n".join("[ \"$(printf '%s' \"$" + name + "\" | sha256sum | cut -d' ' -f1)\" = " + hashlib.sha256(value.encode()).hexdigest() + " ]" for name, value in runtime.items()) + "\n")
+                load("runtime-assets", cfg.encode("runtime-assets", runtime))
+                for forbidden in ("BROKERROUTER_HUMAN_PUBLIC_KEYS", "BROKERROUTER_PROVIDER_PRIMARY_KEY", "BROKERROUTER_ASSET_S3_CA_FILE"):
+                    load("runtime-assets", cfg.encode("runtime-assets", runtime) + forbidden.encode() + b"=c3ludGhldGlj\n", False)
+                print("PASS: independent runtime-assets loader permits only S3/result/TTL and rejects approval/provider/CA override material", flush=True)
                 purpose = "bff"
                 assertion.write_text(":\n")
                 good = cfg.encode(purpose, values[purpose])

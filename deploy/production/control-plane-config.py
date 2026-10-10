@@ -37,10 +37,13 @@ for purpose in ("console", "catalog", "settings", "approvals", "media-review"):
     signer = "BFF" if purpose == "console" else "BFF_" + verifier
     REQUIRED["bff"] |= {PREFIX + "BFF_" + verifier + "_ORIGIN", PREFIX + verifier + "_AUDIENCE",
                         PREFIX + signer + "_SIGNING_KID", PREFIX + signer + "_SIGNING_PRIVATE_KEY"}
-OPTIONAL = {purpose: set() for purpose in REQUIRED}
+BASE_PURPOSES = frozenset(REQUIRED)
+RUNTIME_REQUIRED = {"runtime-assets": S3}
+OPTIONAL = {purpose: set() for purpose in REQUIRED | RUNTIME_REQUIRED}
 OPTIONAL["catalog"] = {PREFIX + "CATALOG_CONNECTIONS"}
-for purpose in ("assets", "output-scan", "output-worker", "output-delivery", "media-review"):
+for purpose in ("assets", "output-scan", "output-worker", "output-delivery", "media-review", "runtime-assets"):
     OPTIONAL[purpose] = {PREFIX + "ASSET_S3_SESSION_TOKEN", PREFIX + "ASSET_CONCURRENCY"}
+OPTIONAL["runtime-assets"] |= {PREFIX + "RUNTIME_ARTIFACT_TTL_SECONDS"}
 for purpose in ("media-api", "media-worker", "mcp-judge"):
     OPTIONAL[purpose] = PROVIDERS
 
@@ -65,8 +68,9 @@ def text(value):
 
 
 def encode(purpose, config):
-    require(purpose in REQUIRED and isinstance(config, dict), "unknown purpose or invalid configuration object")
-    require(REQUIRED[purpose] <= config.keys() and config.keys() <= REQUIRED[purpose] | OPTIONAL[purpose], "missing or unknown purpose configuration name")
+    required = (REQUIRED | RUNTIME_REQUIRED).get(purpose)
+    require(required is not None and isinstance(config, dict), "unknown purpose or invalid configuration object")
+    require(required <= config.keys() and config.keys() <= required | OPTIONAL[purpose], "missing or unknown purpose configuration name")
     for name, value in config.items():
         text(value)
         if name.endswith("_ORIGIN") or name.endswith("_ISSUER") or name.endswith("_S3_ENDPOINT"):
@@ -110,7 +114,7 @@ def main():
             result[key] = value
         return result
     configuration = json.loads(source.read_text(encoding="utf-8"), object_pairs_hook=object_pairs)
-    require(isinstance(configuration, dict) and configuration.keys() == REQUIRED.keys(), "all existing control-plane purposes must be explicitly configured")
+    require(isinstance(configuration, dict) and frozenset(configuration) in (BASE_PURPOSES, frozenset(RUNTIME_REQUIRED)), "all existing control-plane purposes must be explicitly configured")
     files = {purpose + ".env": encode(purpose, config) for purpose, config in configuration.items()}
     lock_path = root / ".component-config.lock"
     descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
