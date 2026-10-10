@@ -461,6 +461,7 @@ async fn resolve_inner(
         key_id: op.key_id,
     };
     let turn = governance::turn_locked(&mut tx, &who, a.turn_id, false).await?;
+    let native_artifact = governance::runtime_artifact(&op);
     if let Some(hash) = a.decision_hash.as_ref() {
         if hash != &decision_hash {
             return Err(Error::Conflict);
@@ -472,6 +473,11 @@ async fn resolve_inner(
     if let Some(review_id) = review_id {
         crate::approval_workbench::validate_review(&mut tx, human, review_id, &a, &op, &decision)
             .await?;
+    }
+    if native_artifact && decision.decision == "continue_this_turn" && review_id.is_none() {
+        return Err(Error::Invalid(
+            "native artifact approval requires a completed isolated review",
+        ));
     }
     if turn.state != "active"
         || turn.expires_at <= chrono::Utc::now()
@@ -494,6 +500,9 @@ async fn resolve_inner(
     if op.stage == "media_output" {
         crate::output_delivery::validate_operation(&mut tx, &who, &op).await?;
     }
+    if native_artifact && decision.decision == "continue_this_turn" {
+        crate::runtime_artifact_delivery::validate_operation(&mut tx, &who, &op).await?;
+    }
     if decision.decision == "continue_this_turn"
         && op
             .operation_key
@@ -509,10 +518,16 @@ async fn resolve_inner(
         op.tool_name.as_deref(),
     )
     .await?;
-    if serde_json::to_value(current).map_err(|_| Error::Configuration)? != a.policy_snapshot {
+    let current = serde_json::to_value(current).map_err(|_| Error::Configuration)?;
+    if current != a.policy_snapshot {
         return Err(Error::PolicyChanged);
     }
     let risks = a.guardrails.as_array().ok_or(Error::Configuration)?;
+    let native_deadline = if native_artifact && decision.decision == "continue_this_turn" {
+        Some(crate::runtime_artifact_delivery::grant_until(&mut tx, &who, &op).await?)
+    } else {
+        None
+    };
     for selected in &decision.approved_guardrail_ids {
         let r = risks
             .iter()
@@ -524,7 +539,14 @@ async fn resolve_inner(
         } else {
             a.expires_at
         };
-        sqlx::query("INSERT INTO guardrail_grants(tenant_id,turn_id,guardrail_id,version,approval_id,expires_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING").bind(who.tenant_id).bind(turn.id).bind(selected).bind(version).bind(id).bind(grant_expiry).execute(&mut *tx).await?;
+        if let Some(expiry) = native_deadline {
+            sqlx::query("INSERT INTO runtime_artifact_grants(tenant_id,operation_id,approval_id,guardrail_id,version,payload_hash,policy_hash,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING")
+                .bind(who.tenant_id).bind(op.id).bind(id).bind(selected).bind(version)
+                .bind(&op.payload_hash).bind(governance::digest(&current)?).bind(expiry)
+                .execute(&mut *tx).await?;
+        } else {
+            sqlx::query("INSERT INTO guardrail_grants(tenant_id,turn_id,guardrail_id,version,approval_id,expires_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING").bind(who.tenant_id).bind(turn.id).bind(selected).bind(version).bind(id).bind(grant_expiry).execute(&mut *tx).await?;
+        }
     }
     let state = match decision.decision.as_str() {
         "continue_this_turn" => "approved",
@@ -570,6 +592,10 @@ async fn resolve_inner(
             .bind(human.tenant_id).bind(id.to_string()).bind(json!({"user_id":human.id,"review_id":review_id,"operation_id":op.id,"state":state,"approved_guardrail_ids":decision.approved_guardrail_ids})).execute(&mut *tx).await?;
     }
     crate::approval_workbench::fresh(&mut tx, human).await?;
+    if native_artifact && decision.decision == "continue_this_turn" {
+        crate::runtime_artifact_delivery::validate_operation(&mut tx, &who, &op).await?;
+        governance::require_live_grants(&mut tx, native_deadline).await?;
+    }
     if decision.decision == "continue_this_turn"
         && op
             .operation_key
@@ -658,10 +684,11 @@ pub(crate) fn validate_guardrail(rule: &Guardrail) -> Result<()> {
     governance::validate_rule(&rule.rule)?;
     if (rule.stage == "media_output"
         && !matches!(rule.rule["kind"].as_str(), Some("asset_scan" | "always")))
-        || (rule.stage != "media_output" && rule.rule["kind"] == "asset_scan")
+        || (!matches!(rule.stage.as_str(), "media_output" | "artifact")
+            && rule.rule["kind"] == "asset_scan")
     {
         return Err(Error::Invalid(
-            "asset_scan is server-only media_output; binary output does not support text rules",
+            "asset_scan requires server-owned binary output; binary media does not support text rules",
         ));
     }
     Ok(())

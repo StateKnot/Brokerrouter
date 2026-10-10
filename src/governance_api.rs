@@ -107,6 +107,9 @@ async fn check(
         || check
             .operation_key
             .starts_with(runtime_publications::OUTPUT_PREFIX)
+        || check
+            .operation_key
+            .starts_with(crate::runtime_artifact_delivery::OUTPUT_PREFIX)
     {
         return Err(Error::Invalid("reserved runtime output operation key"));
     }
@@ -168,6 +171,7 @@ async fn generic_operation(g: &Gateway, who: &crate::store::Identity, id: Uuid) 
     .ok_or(Error::NotFound)?;
     if key.starts_with(runtime_results::OUTPUT_PREFIX)
         || key.starts_with(runtime_publications::OUTPUT_PREFIX)
+        || key.starts_with(crate::runtime_artifact_delivery::OUTPUT_PREFIX)
     {
         return Err(Error::Invalid(
             "runtime outputs are released without claims or receipts",

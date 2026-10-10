@@ -691,7 +691,10 @@ async fn output_delivery_closed_without_policy_or_trusted_turn_and_rules_are_str
         Err(Error::OutputPolicyMissing)
     ));
     for (stage, rule) in [
-        ("artifact", json!({"kind":"asset_scan","profile_id":p.id})),
+        (
+            "tool_output",
+            json!({"kind":"asset_scan","profile_id":p.id}),
+        ),
         (
             "media_output",
             json!({"kind":"contains_any","case_sensitive":false,"terms":["risk"]}),

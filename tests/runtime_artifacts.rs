@@ -644,7 +644,28 @@ async fn runtime_storage_role_captures_original_claim_but_cannot_read_input_or_e
                 .fetch_one(&connection)
                 .await
                 .unwrap();
-        assert_eq!(readable, 0, "unreviewed runtime asset visible to {role}");
+        let expected = match role {
+            "brokerrouter_output_scan"
+            | "brokerrouter_output_delivery"
+            | "brokerrouter_media_review" => 1,
+            _ => 0,
+        };
+        assert_eq!(
+            readable, expected,
+            "native asset metadata scope differs for {role}"
+        );
+        // The source-aware scan, delivery and isolated review purposes need
+        // encrypted candidate reads. Their service interfaces still require
+        // exact current scan/review/grants before returning plaintext. None of
+        // these readers can seal a batch, execute a tool or mint a file grant.
+        let authority: (bool, bool, bool) = sqlx::query_as(
+            "SELECT has_table_privilege(current_user,'runtime_artifact_batches','INSERT'), has_column_privilege(current_user,'governance_operations','claim_hash','UPDATE'), has_table_privilege(current_user,'runtime_artifact_grants','INSERT')",
+        ).fetch_one(&connection).await.unwrap();
+        assert_eq!(
+            authority,
+            (false, false, false),
+            "reader gained producer, execution or human authority: {role}"
+        );
         connection.close().await;
     }
     expire_fixture(&pool, b).await;

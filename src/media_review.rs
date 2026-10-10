@@ -4,7 +4,8 @@ use crate::{
     error::{Error, Result},
     governance::{self, Approval, Tx},
     human::Human,
-    output_delivery::{self, Delivery, Evidence},
+    output_delivery::{self, Delivery},
+    runtime_artifact_delivery,
     store::{self, Identity},
 };
 use bytes::Bytes;
@@ -12,6 +13,79 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
+
+// One isolated player; two explicitly owned sources. The media branch delegates
+// its original view unchanged, so published media payload digests stay stable.
+enum Evidence {
+    Media(output_delivery::Evidence),
+    Native(runtime_artifact_delivery::Evidence),
+}
+impl Evidence {
+    fn view(&self) -> Value {
+        match self {
+            Self::Media(e) => e.view(),
+            Self::Native(e) => e.view(),
+        }
+    }
+    fn asset_id(&self) -> Uuid {
+        match self {
+            Self::Media(e) => e.asset_id,
+            Self::Native(e) => e.asset_id,
+        }
+    }
+    fn sha256(&self) -> &[u8] {
+        match self {
+            Self::Media(e) => &e.sha256,
+            Self::Native(e) => &e.sha256,
+        }
+    }
+    fn byte_length(&self) -> i64 {
+        match self {
+            Self::Media(e) => e.byte_length,
+            Self::Native(e) => e.byte_length,
+        }
+    }
+    fn chunk_count(&self) -> i32 {
+        match self {
+            Self::Media(e) => e.chunk_count,
+            Self::Native(e) => e.chunk_count,
+        }
+    }
+    fn expires_at(&self) -> DateTime<Utc> {
+        match self {
+            Self::Media(e) => e.expires_at,
+            Self::Native(e) => e.expires_at,
+        }
+    }
+    async fn read(&self, d: &Delivery, who: &Identity, ordinal: i32) -> Result<Bytes> {
+        match self {
+            Self::Media(_) => {
+                d.assets
+                    .quarantined_chunk(who, self.asset_id(), ordinal)
+                    .await
+            }
+            Self::Native(_) => {
+                d.assets
+                    .quarantined_runtime_chunk(who, self.asset_id(), ordinal)
+                    .await
+            }
+        }
+    }
+}
+async fn source(tx: &mut Tx<'_>, who: &Human, id: Uuid) -> Result<(Identity, Evidence)> {
+    crate::human::authorize(tx, who).await?;
+    let (stage, key): (String, String) = sqlx::query_as("SELECT o.stage,o.operation_key FROM approvals a JOIN governance_operations o ON o.tenant_id=a.tenant_id AND o.id=a.operation_id WHERE a.tenant_id=$1 AND a.id=$2")
+        .bind(who.tenant_id).bind(id).fetch_optional(&mut **tx).await?.ok_or(Error::NotFound)?;
+    if stage == "media_output" {
+        let (identity, evidence) = output_delivery::review(tx, who, id).await?;
+        Ok((identity, Evidence::Media(evidence)))
+    } else if stage == "artifact" && key.starts_with(runtime_artifact_delivery::OUTPUT_PREFIX) {
+        let (identity, evidence) = runtime_artifact_delivery::review(tx, who, id).await?;
+        Ok((identity, Evidence::Native(evidence)))
+    } else {
+        Err(Error::ResultUnavailable)
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -80,13 +154,13 @@ async fn session(
     crate::human::authorize(tx, who).await?;
     let s:Session=sqlx::query_as("SELECT * FROM media_review_sessions WHERE tenant_id=$1 AND id=$2 AND user_id=$3 AND expires_at>clock_timestamp()")
         .bind(who.tenant_id).bind(id).bind(who.id).fetch_optional(&mut **tx).await?.ok_or(Error::ResultUnavailable)?;
-    let (identity, e) = output_delivery::review(tx, who, s.approval_id).await?;
+    let (identity, e) = source(tx, who, s.approval_id).await?;
     let a = approval(tx, who, s.approval_id).await?;
     if governance::digest(&e.view())? != s.payload_hash
         || governance::digest(&a.policy_snapshot)? != s.policy_hash
-        || e.sha256 != s.sha256
-        || e.byte_length != s.byte_length
-        || e.chunk_count != s.chunk_count
+        || e.sha256() != s.sha256.as_slice()
+        || e.byte_length() != s.byte_length
+        || e.chunk_count() != s.chunk_count
     {
         return Err(Error::PolicyChanged);
     }
@@ -95,10 +169,10 @@ async fn session(
 }
 pub async fn start(d: &Delivery, who: &Human, q: Start) -> Result<Value> {
     let mut tx = begin(d).await?;
-    let (_, e) = output_delivery::review(&mut tx, who, q.approval_id).await?;
-    if e.byte_length > 67108864
-        || e.byte_length <= 0
-        || i64::from(e.chunk_count) != (e.byte_length + 4194303) / 4194304
+    let (_, e) = source(&mut tx, who, q.approval_id).await?;
+    if e.byte_length() > 67108864
+        || e.byte_length() <= 0
+        || i64::from(e.chunk_count()) != (e.byte_length() + 4194303) / 4194304
     {
         return Err(Error::Invalid(
             "isolated MP4 review supports at most 64 MiB",
@@ -126,14 +200,14 @@ pub async fn start(d: &Delivery, who: &Human, q: Start) -> Result<Value> {
             .fetch_one(&mut *tx)
             .await?;
         let expires = e
-            .expires_at
+            .expires_at()
             .min(a.expires_at)
             .min(now + chrono::Duration::minutes(5));
         if expires <= now {
             return Err(Error::ResultUnavailable);
         }
         sqlx::query("INSERT INTO media_review_sessions(tenant_id,id,approval_id,user_id,payload_hash,policy_hash,sha256,byte_length,chunk_count,created_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)")
-            .bind(who.tenant_id).bind(q.session_id).bind(q.approval_id).bind(who.id).bind(governance::digest(&e.view())?).bind(governance::digest(&a.policy_snapshot)?).bind(&e.sha256).bind(e.byte_length).bind(e.chunk_count).bind(now).bind(expires).execute(&mut *tx).await?;
+            .bind(who.tenant_id).bind(q.session_id).bind(q.approval_id).bind(who.id).bind(governance::digest(&e.view())?).bind(governance::digest(&a.policy_snapshot)?).bind(e.sha256()).bind(e.byte_length()).bind(e.chunk_count()).bind(now).bind(expires).execute(&mut *tx).await?;
         audit(
             &mut tx,
             who,
@@ -157,10 +231,7 @@ pub async fn chunk(d: &Delivery, who: &Human, q: Chunk) -> Result<Bytes> {
         return Err(Error::NotFound);
     }
     tx.commit().await?;
-    let bytes = d
-        .assets
-        .quarantined_chunk(&identity, e.asset_id, q.ordinal)
-        .await?;
+    let bytes = e.read(d, &identity, q.ordinal).await?;
     let expected = (s.byte_length - i64::from(q.ordinal) * 4194304).min(4194304) as usize;
     if bytes.len() != expected {
         return Err(Error::ResultUnavailable);
@@ -177,7 +248,7 @@ pub async fn chunk(d: &Delivery, who: &Human, q: Chunk) -> Result<Bytes> {
         json!({"review_id":s.id,"ordinal":q.ordinal,"byte_length":bytes.len()}),
     )
     .await?;
-    still_live(&mut tx, who, &s).await?;
+    session(&mut tx, who, q.session_id).await?;
     tx.commit().await?;
     Ok(bytes)
 }
@@ -214,18 +285,24 @@ pub async fn complete(d: &Delivery, who: &Human, q: Complete) -> Result<Value> {
             .await?;
         audit(&mut tx,who,s.approval_id,"approval.reviewed",json!({"review_id":s.id,"operation_id":a.operation_id,"review_kind":"isolated_mp4","sha256":q.sha256,"byte_length":s.byte_length,"expires_at":s.expires_at,"human_attested":true})).await?;
     }
-    let model: Option<String> = sqlx::query_scalar(
-        "SELECT model_id FROM governance_operations WHERE tenant_id=$1 AND id=$2",
+    let (model, tool): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT model_id,tool_name FROM governance_operations WHERE tenant_id=$1 AND id=$2",
     )
     .bind(who.tenant_id)
     .bind(a.operation_id)
     .fetch_one(&mut *tx)
     .await?;
-    still_live(&mut tx, who, &s).await?;
+    session(&mut tx, who, q.session_id).await?;
     tx.commit().await?;
-    Ok(
-        json!({"approval":governance::approval_view(&a),"review_id":s.id,"review_expires_at":s.expires_at,"stage":"media_output","model_id":model,"tool_name":null,"operation_state":"waiting_approval","payload_text":null,"operation_sha256":governance::hex(&s.payload_hash),"can_continue":true,"unavailable_reason":"","media":{"kind":"isolated_mp4","sha256":governance::hex(&e.sha256),"byte_length":e.byte_length}}),
-    )
+    let mut response = json!({"approval":governance::approval_view(&a),"review_id":s.id,"review_expires_at":s.expires_at,"stage":"media_output","model_id":model,"tool_name":null,"operation_state":"waiting_approval","payload_text":null,"operation_sha256":governance::hex(&s.payload_hash),"can_continue":true,"unavailable_reason":"","media":{"kind":"isolated_mp4","sha256":governance::hex(e.sha256()),"byte_length":e.byte_length()}});
+    if matches!(e, Evidence::Native(_)) {
+        response["stage"] = json!("artifact");
+        response["tool_name"] = json!(tool);
+        response["media"]["source"] = json!("runtime_artifact");
+        response["media"]["scope"] = json!("current_artifact_in_original_turn");
+        response["media"]["output"] = e.view();
+    }
+    Ok(response)
 }
 async fn audit(
     tx: &mut Tx<'_>,

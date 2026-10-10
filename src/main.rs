@@ -76,6 +76,9 @@ enum Command {
     ServeOutputDelivery {
         #[arg(long, default_value = "127.0.0.1:8085")]
         bind: SocketAddr,
+        /// Serve only scanned native artifacts with the independent read purpose.
+        #[arg(long)]
+        runtime_output: bool,
     },
     ServeOutputScans {
         #[arg(long, default_value = "127.0.0.1:8084")]
@@ -512,19 +515,30 @@ async fn main() -> anyhow::Result<()> {
             .await?;
             println!("Console permission saved");
         }
-        Command::ServeOutputDelivery { bind } => {
+        Command::ServeOutputDelivery {
+            bind,
+            runtime_output,
+        } => {
             brokerrouter::check_schema(&pool).await?;
-            let service = brokerrouter::output_delivery_api::Service {
-                delivery: brokerrouter::output_delivery::Delivery::new(
-                    brokerrouter::assets::Assets::from_env(pool.clone())?,
-                ),
-                verifier: std::sync::Arc::new(brokerrouter::human::Verifier::from_env()?),
+            let assets = brokerrouter::assets::Assets::from_env(pool.clone())?;
+            let router = if runtime_output {
+                brokerrouter::runtime_artifact_delivery_api::router(
+                    brokerrouter::runtime_artifact_delivery::Delivery::new(assets.clone()),
+                )
+            } else {
+                brokerrouter::output_delivery_api::router(
+                    brokerrouter::output_delivery_api::Service {
+                        delivery: brokerrouter::output_delivery::Delivery::new(assets.clone()),
+                        verifier: std::sync::Arc::new(brokerrouter::human::Verifier::from_env()?),
+                    },
+                )
             };
             let listener = tokio::net::TcpListener::bind(bind).await?;
             tracing::info!(address=%bind,"current-turn output delivery listening; human decisions remain on the separate control service");
-            axum::serve(listener, brokerrouter::output_delivery_api::router(service))
+            axum::serve(listener, router)
                 .with_graceful_shutdown(shutdown())
                 .await?;
+            assets.drain().await;
         }
         Command::OutputScanProfilePublish { file } => {
             brokerrouter::output_scans::publish(

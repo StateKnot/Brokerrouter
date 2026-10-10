@@ -2,6 +2,10 @@ mod common;
 #[path = "outputs_delivery/mod.rs"]
 mod delivery_tests;
 mod detector;
+#[path = "outputs_runtime_artifact_delivery/mod.rs"]
+mod runtime_artifact_delivery_tests;
+#[path = "outputs_runtime_artifacts/mod.rs"]
+mod runtime_artifact_scan_tests;
 use axum::{
     Json, Router,
     body::Body,

@@ -1772,7 +1772,12 @@ async fn stalled_stream_keeps_delivery_slot_after_upstream_settles(pool: PgPool)
 
 #[sqlx::test(migrations = "./migrations")]
 async fn incomplete_sse_is_unknown_and_never_emits_done(pool: PgPool) {
-    for reply in [Reply::StreamBroken, Reply::StreamNoUsage] {
+    for (reply, include_usage) in [
+        (Reply::StreamBroken, true),
+        (Reply::StreamNoUsage, true),
+        (Reply::StreamBroken, false),
+        (Reply::StreamNoUsage, false),
+    ] {
         let upstream = Mock::start(reply).await;
         let (who, key, endpoint) = setup(&pool, "chat", &upstream.url).await;
         sqlx::query("UPDATE endpoints SET supports_streaming=true WHERE id=$1")
@@ -1782,13 +1787,12 @@ async fn incomplete_sse_is_unknown_and_never_emits_done(pool: PgPool) {
             .unwrap();
         let app = api::gateway_router(gateway(pool.clone(), 5));
         let idem = Uuid::new_v4().to_string();
+        let mut request_body = streaming_chat();
+        if !include_usage {
+            request_body["stream_options"] = json!({"include_usage":false});
+        }
         let response = app
-            .oneshot(request(
-                &key,
-                &idem,
-                streaming_chat(),
-                "/v1/chat/completions",
-            ))
+            .oneshot(request(&key, &idem, request_body, "/v1/chat/completions"))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1814,6 +1818,20 @@ async fn incomplete_sse_is_unknown_and_never_emits_done(pool: PgPool) {
             "submission_unknown"
         );
         assert_eq!(upstream.count(), 1);
+        assert_eq!(
+            upstream.state.received.lock().unwrap()[0]["body"]["stream_options"],
+            json!({"include_usage":true})
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM ledger_entries WHERE tenant_id=$1 AND kind='finalize'",
+            )
+            .bind(who.tenant_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
     }
 }
 
@@ -2149,4 +2167,166 @@ async fn output_rejection_destroys_result_without_reversing_real_charge(pool: Pg
             .await
             .unwrap();
     assert!(stored.is_none());
+}
+
+#[test]
+fn stream_options_accepts_usage_only_for_streaming() {
+    for option in [
+        json!({"include_usage":true}),
+        json!({"include_usage":false}),
+        json!({}),
+        Value::Null,
+    ] {
+        let mut body = streaming_chat();
+        body["stream_options"] = option.clone();
+        let validated = brokerrouter::protocol::validate(body, "chat").unwrap();
+        assert_eq!(validated.body["stream_options"], option);
+    }
+    for option in [
+        json!({"include_usage":null}),
+        json!({"include_usage":"true"}),
+        json!({"include_usage":1}),
+        json!({"include_usage":true,"unknown":false}),
+        json!({"include_obfuscation":false}),
+        json!([]),
+        json!(false),
+    ] {
+        let mut body = streaming_chat();
+        body["stream_options"] = option;
+        assert!(matches!(
+            brokerrouter::protocol::validate(body, "chat"),
+            Err(Error::Invalid(_))
+        ));
+    }
+    let mut nonstream = chat();
+    nonstream["stream_options"] = json!({"include_usage":true});
+    assert!(matches!(
+        brokerrouter::protocol::validate(nonstream, "chat"),
+        Err(Error::Invalid(_))
+    ));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn sse_stream_options_preserves_usage_choice_on_live_and_replay(pool: PgPool) {
+    let upstream = Mock::start(Reply::Stream).await;
+    let (who, key, endpoint) = setup(&pool, "chat", &upstream.url).await;
+    sqlx::query("UPDATE endpoints SET supports_streaming=true,supports_tools=true WHERE id=$1")
+        .bind(endpoint.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let app = api::gateway_router(gateway(pool.clone(), 5));
+    for (ordinal, (option, include_usage)) in [
+        (json!({"include_usage":true}), true),
+        (json!({"include_usage":false}), false),
+        (json!({}), false),
+        (Value::Null, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut body = streaming_chat();
+        body["stream_options"] = option;
+        body["tools"] = json!([{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}]);
+        let idem = format!("stream-options-{ordinal}");
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(request(&key, &idem, body.clone(), "/v1/chat/completions"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.headers().contains_key("x-brokerrouter-request-id"));
+            let text = String::from_utf8(
+                http_body_util::BodyExt::collect(response.into_body())
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(text.contains("private answer"));
+            assert!(text.ends_with("data: [DONE]\n\n"));
+            let chunks: Vec<Value> = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter(|line| *line != "[DONE]")
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(
+                chunks
+                    .iter()
+                    .filter(|chunk| !chunk["usage"].is_null())
+                    .count(),
+                usize::from(include_usage)
+            );
+            assert_eq!(
+                chunks
+                    .iter()
+                    .filter(|chunk| chunk["choices"] == json!([]))
+                    .count(),
+                usize::from(include_usage)
+            );
+            assert!(chunks.iter().all(|chunk| chunk["model"] == "logical/model"));
+        }
+        assert_eq!(upstream.count(), ordinal + 1);
+        let settled: (String, i64, i64) = sqlx::query_as("SELECT status,final_micros,(SELECT count(*) FROM ledger_entries WHERE request_id=requests.id AND kind='finalize') FROM requests WHERE tenant_id=$1 AND idempotency_key=$2")
+            .bind(who.tenant_id).bind(&idem).fetch_one(&pool).await.unwrap();
+        assert_eq!(settled, ("succeeded".into(), 7, 1));
+    }
+    let sent = upstream.state.received.lock().unwrap();
+    assert!(
+        sent.iter()
+            .all(|call| call["body"]["stream_options"] == json!({"include_usage":true}))
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn invalid_stream_options_create_no_billable_facts(pool: PgPool) {
+    let upstream = Mock::start(Reply::Stream).await;
+    let (who, key, _) = setup(&pool, "chat", &upstream.url).await;
+    let app = api::gateway_router(gateway(pool.clone(), 5));
+    let mut requests = Vec::new();
+    for option in [
+        json!({"include_usage":"true"}),
+        json!({"include_usage":null}),
+        json!({"include_usage":true,"unknown":false}),
+        json!({"include_obfuscation":false}),
+        json!([]),
+        json!(false),
+    ] {
+        let mut body = streaming_chat();
+        body["stream_options"] = option;
+        requests.push(body);
+    }
+    let mut nonstream = chat();
+    nonstream["stream_options"] = json!({"include_usage":true});
+    requests.push(nonstream);
+    for (ordinal, body) in requests.into_iter().enumerate() {
+        let response = app
+            .clone()
+            .oneshot(request(
+                &key,
+                &format!("bad-stream-options-{ordinal}"),
+                body,
+                "/v1/chat/completions",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(response).await["error"]["code"],
+            "invalid_request"
+        );
+    }
+    assert_eq!(upstream.count(), 0);
+    for table in ["requests", "attempts", "ledger_entries"] {
+        let count: i64 =
+            sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE tenant_id=$1"))
+                .bind(who.tenant_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+    }
 }

@@ -417,4 +417,55 @@ CREATE POLICY brokerrouter_runtime_chunk_purpose ON asset_chunks AS RESTRICTIVE 
     WITH CHECK(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id AND a.id=asset_chunks.asset_id AND a.kind='runtime_output'));
 GRANT SELECT ON runtime_artifact_batches,runtime_artifacts TO brokerrouter_operator;
 
+-- Exact native artifact scan/review/delivery authority after 0032.
+-- No role inheritance or broadening of legacy media/input writers.
+GRANT SELECT ON runtime_artifacts,runtime_artifact_batches
+    TO brokerrouter_output_scan,brokerrouter_output_delivery,
+       brokerrouter_media_review,brokerrouter_approvals,brokerrouter_governance_control;
+GRANT SELECT(tenant_id,id,key_id,turn_id,model_id,tool_name,stage,state,
+             payload_hash,claim_hash,receipt_hash)
+    ON governance_operations TO brokerrouter_output_scan;
+GRANT SELECT ON runtime_artifact_deliveries,runtime_artifact_grants
+    TO brokerrouter_output_delivery,brokerrouter_media_review,
+       brokerrouter_approvals,brokerrouter_governance_control,brokerrouter_operator;
+GRANT INSERT ON runtime_artifact_deliveries TO brokerrouter_output_delivery;
+GRANT INSERT ON runtime_artifact_grants TO brokerrouter_approvals,brokerrouter_governance_control;
+GRANT SELECT ON approval_reviews,media_review_sessions,media_review_completions
+    TO brokerrouter_governance_control;
+-- No INSERT/UPDATE/DELETE grants for storage/scanner/runtime/bff/operator.
+-- Native grant rows are additionally protected by exact-source/review triggers.
+
+-- The existing read roles retain legacy output reads. Only scanner, independent
+-- binary delivery and isolated reviewer gain runtime candidate object metadata.
+-- Human decision purposes see facts, never encrypted chunk rows/S3 bytes.
+DROP POLICY IF EXISTS brokerrouter_scan_asset_read ON assets;
+CREATE POLICY brokerrouter_scan_asset_read ON assets FOR SELECT TO brokerrouter_output_scan
+    USING(kind IN('output','runtime_output'));
+DROP POLICY IF EXISTS brokerrouter_scan_chunk_read ON asset_chunks;
+CREATE POLICY brokerrouter_scan_chunk_read ON asset_chunks FOR SELECT TO brokerrouter_output_scan
+    USING(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id
+        AND a.id=asset_chunks.asset_id AND a.kind IN('output','runtime_output')));
+DROP POLICY IF EXISTS brokerrouter_delivery_output_read ON assets;
+CREATE POLICY brokerrouter_delivery_output_read ON assets FOR SELECT
+    TO brokerrouter_output_delivery,brokerrouter_governance_control
+    USING(kind IN('output','runtime_output'));
+DROP POLICY IF EXISTS brokerrouter_delivery_output_chunk_read ON asset_chunks;
+CREATE POLICY brokerrouter_delivery_output_chunk_read ON asset_chunks FOR SELECT TO brokerrouter_output_delivery
+    USING(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id
+        AND a.id=asset_chunks.asset_id AND a.kind IN('output','runtime_output')));
+DROP POLICY IF EXISTS brokerrouter_review_output_read ON assets;
+CREATE POLICY brokerrouter_review_output_read ON assets FOR SELECT
+    TO brokerrouter_media_review,brokerrouter_approvals USING(kind IN('output','runtime_output'));
+DROP POLICY IF EXISTS brokerrouter_review_chunk_read ON asset_chunks;
+CREATE POLICY brokerrouter_review_chunk_read ON asset_chunks FOR SELECT TO brokerrouter_media_review
+    USING(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id
+        AND a.id=asset_chunks.asset_id AND a.kind IN('output','runtime_output')));
+
+-- Required actual SET ROLE negatives: runtime/input/media-writer/BFF/approvals
+-- must not read runtime candidate chunks; runtime-assets cannot SELECT input,
+-- INSERT scans/deliveries/grants or UPDATE approved state. Scanner cannot mint
+-- grant/update source; delivery cannot mint grant/write asset; reviewer cannot
+-- mint grant/write source/decide; approved control/approvals cannot read chunks.
+-- Original input/media Assets restrictive policies are unchanged.
+
 COMMIT;

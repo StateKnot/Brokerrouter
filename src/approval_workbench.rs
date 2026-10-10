@@ -230,7 +230,16 @@ pub(crate) async fn validate_review(
     op: &Operation,
     decision: &human::Decision,
 ) -> Result<()> {
-    if op.stage == "media_output" && decision.decision == "continue_this_turn" {
+    let native_artifact = governance::runtime_artifact(op);
+    if native_artifact && decision.decision == "continue_this_turn" {
+        let identity = Identity {
+            tenant_id: who.tenant_id,
+            key_id: op.key_id,
+        };
+        crate::runtime_artifact_delivery::validate_operation(tx, &identity, op).await?;
+    }
+    if (op.stage == "media_output" || native_artifact) && decision.decision == "continue_this_turn"
+    {
         let completed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM media_review_completions c JOIN media_review_sessions s ON s.tenant_id=c.tenant_id AND s.id=c.review_id WHERE c.tenant_id=$1 AND c.review_id=$2 AND s.approval_id=$3 AND s.user_id=$4 AND s.payload_hash=$5 AND s.policy_hash=$6)")
             .bind(who.tenant_id).bind(id).bind(a.id).bind(who.id).bind(&op.payload_hash).bind(governance::digest(&a.policy_snapshot)?).fetch_one(&mut **tx).await?;
         if !completed {
@@ -253,7 +262,8 @@ pub(crate) async fn validate_review(
         return Err(Error::PolicyChanged);
     }
     if decision.decision == "continue_this_turn"
-        && (!can_continue || (op.stage != "media_output" && op.payload_ciphertext.is_none()))
+        && (!can_continue
+            || (op.stage != "media_output" && !native_artifact && op.payload_ciphertext.is_none()))
     {
         return Err(Error::ResultUnavailable);
     }
