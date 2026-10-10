@@ -392,5 +392,9 @@
   ],
   "hermes_attachments": "disabled",
   "tts": "disabled",
-  "github_checks": "blocked by account quota; local checks do not restore required checks or branch protection"
+  "github_checks": "blocked by account quota; local checks do not restore required checks or branch protection",
+  "quality_source_commit": "f3fec4810027e56ceef13b1c68e5c4cd9483e5c8",
+  "quality_source_commit_verified": true,
+  "compiled_source_commit": "f3fec4810027e56ceef13b1c68e5c4cd9483e5c8",
+  "compiled_source_commit_verified": true
 }
