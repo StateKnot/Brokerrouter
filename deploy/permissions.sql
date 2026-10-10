@@ -365,4 +365,8 @@ GRANT SELECT ON mcp_servers,mcp_discovery_snapshots,mcp_discovered_tools,mcp_key
     TO brokerrouter_mcp_worker;
 GRANT INSERT ON audit_events TO brokerrouter_mcp_catalog,brokerrouter_mcp_client,brokerrouter_mcp_server,brokerrouter_mcp_worker;
 GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_mcp_catalog,brokerrouter_mcp_client,brokerrouter_mcp_server,brokerrouter_mcp_worker;
+-- Runtime text is a known execution fact. Human control can approve its output
+-- operation but cannot read, replace or delete the separately held body.
+GRANT SELECT,INSERT ON runtime_tool_results TO brokerrouter_runtime;
+GRANT UPDATE(result_ciphertext) ON runtime_tool_results TO brokerrouter_runtime;
 COMMIT;

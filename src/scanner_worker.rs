@@ -56,6 +56,18 @@ pub struct Worker {
     token: String,
     _lock: File,
 }
+
+pub(crate) fn http_client() -> Result<Client> {
+    Ok(
+        crate::tls_roots::with_ca_file(Client::builder(), "BROKERROUTER_SCANNER_CA_FILE")?
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(45))
+            .build()?,
+    )
+}
+
 impl Worker {
     pub fn new(config: Config, token: String) -> Result<Self> {
         config.manifest.validate()?;
@@ -134,12 +146,7 @@ impl Worker {
             docker_config,
             manifest: config.manifest.clone(),
         };
-        let client = Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(45))
-            .build()?;
+        let client = http_client()?;
         let worker = Self {
             config,
             engine,

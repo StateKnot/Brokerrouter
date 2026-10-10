@@ -845,6 +845,192 @@ async fn scan_report(pool: &PgPool, v: &Value) -> Report {
     // Synthetic attestations exercise the gateway contract, not malware/format detection quality.
     serde_json::from_value(json!({"sha256":v["sha256"],"byte_length":v["byte_length"],"profile_version":v["profile_version"],"engine_revision":v["engine_revision"],"technical":"clean","content":"risk","media_type":"video/mp4","reason_codes":["fixture_risk"],"evidence_sha256":"a".repeat(64),"scanned_at":scanned_at})).unwrap()
 }
+
+async fn delivery_clock_fixture(
+    pool: &PgPool,
+    subject: &str,
+) -> (Fixture, Uuid, brokerrouter::output_delivery::Delivery, Uuid) {
+    // These synthetic scan receipts isolate the final authorization clock. Real
+    // byte/engine certification remains in the dedicated detector tests.
+    // This race needs authenticated bytes, not multi-megabyte crypto work while
+    // the full integration suite is competing for CPU/database connections.
+    let f = setup_data(pool, Bytes::from_static(b"private authority clock fixture")).await;
+    common::provision(pool, &f.who, subject).await;
+    let turn = common::turn(pool, &f.who, subject, 0).await;
+    let job = generate(&f, pool, Some(turn)).await;
+    f.o.tick().await.unwrap();
+    let (profile, actor, _) = scanner(pool, &f, 1).await;
+    let scans = Scans::new(f.o.assets.clone());
+    let assignment = scans.claim(&actor, Uuid::new_v4()).await.unwrap().unwrap();
+    scans
+        .report(
+            &actor,
+            attempt_id(&assignment),
+            scan_report(pool, &assignment).await,
+        )
+        .await
+        .unwrap();
+    common::guardrail(
+        pool,
+        f.who.tenant_id,
+        "content",
+        1,
+        "media_output",
+        json!({"kind":"asset_scan","profile_id":profile.id}),
+    )
+    .await;
+    let delivery = brokerrouter::output_delivery::Delivery::new(f.o.assets.clone());
+    let approval = common::approval_id(&delivery.check(&f.who, job).await.unwrap());
+    (f, job, delivery, approval)
+}
+
+async fn delay_delivery_audit(pool: &PgPool, action: &str, deadline_table: &str) {
+    // Static fixture inputs only. A nontransactional sequence proves the audit
+    // was reached, even when the correct terminal check rolls its INSERT back.
+    assert!(matches!(
+        action,
+        "output.chunk_served" | "output.review_chunk_served"
+    ));
+    assert!(matches!(deadline_table, "guardrail_grants" | "approvals"));
+    sqlx::raw_sql(&format!(
+        "CREATE SEQUENCE fixture_delivery_audit_count;
+         CREATE FUNCTION fixture_delay_delivery_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+         DECLARE deadline timestamptz;
+         BEGIN
+           IF NEW.action='{action}' THEN
+             PERFORM nextval('fixture_delivery_audit_count');
+             SELECT max(expires_at) INTO deadline FROM {deadline_table} WHERE tenant_id=NEW.tenant_id;
+             PERFORM pg_sleep(GREATEST(0,extract(epoch FROM deadline-clock_timestamp()))+0.05);
+           END IF;
+           RETURN NEW;
+         END;
+         $$;
+         CREATE TRIGGER fixture_delay_delivery_audit BEFORE INSERT ON audit_events
+           FOR EACH ROW EXECUTE FUNCTION fixture_delay_delivery_audit();"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn output_delivery_grant_expiry_during_audit_never_returns_private_bytes(pool: PgPool) {
+    let (f, job, delivery, approval) = delivery_clock_fixture(&pool, "delivery-clock").await;
+    common::decide(
+        &pool,
+        "delivery-clock",
+        approval,
+        common::approve(&["content"]),
+    )
+    .await
+    .unwrap();
+    delay_delivery_audit(&pool, "output.chunk_served", "guardrail_grants").await;
+    // Only the migration-owner clock fixture can shorten this immutable grant.
+    // The turn/asset/scan remain live, so the regression tests the used grant.
+    sqlx::raw_sql(
+        "ALTER TABLE guardrail_grants DISABLE TRIGGER grant_immutable;
+        UPDATE guardrail_grants SET expires_at=clock_timestamp()+interval '2 seconds';
+        ALTER TABLE guardrail_grants ENABLE TRIGGER grant_immutable;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let result = delivery.chunk(&f.who, job, 0).await;
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT is_called FROM fixture_delivery_audit_count")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT last_value FROM fixture_delivery_audit_count")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    eprintln!(
+        "grant_clock_probe: returned_private_bytes={}",
+        result.is_ok()
+    );
+    assert!(matches!(result, Err(Error::PolicyChanged)));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM audit_events WHERE action='output.chunk_served'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0
+    );
+    assert_eq!(f.r.posts.load(Ordering::SeqCst), 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn output_delivery_pending_review_expiry_during_audit_never_returns_private_bytes(
+    pool: PgPool,
+) {
+    let (f, job, delivery, approval) = delivery_clock_fixture(&pool, "review-clock").await;
+    let human = common::proof(&pool, "review-clock", "/review", &json!({})).await;
+    delay_delivery_audit(&pool, "output.review_chunk_served", "approvals").await;
+    // Pending approval deadlines are shortened only in this isolated owner fixture.
+    sqlx::query(
+        "UPDATE approvals SET expires_at=clock_timestamp()+interval '2 seconds' WHERE id=$1",
+    )
+    .bind(approval)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let result = delivery.review_chunk(&human, approval, 0).await;
+    eprintln!(
+        "review_clock_probe: release_outcome={}",
+        match &result {
+            Ok(_) => "ready",
+            Err(Error::NotFound) => "not_found",
+            Err(Error::ResultUnavailable) => "result_unavailable",
+            Err(Error::HumanUnauthorized) => "human_unauthorized",
+            Err(Error::PolicyChanged) => "policy_changed",
+            Err(_) => "other_error",
+        }
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT is_called FROM fixture_delivery_audit_count")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT last_value FROM fixture_delivery_audit_count")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    eprintln!(
+        "review_clock_probe: returned_private_bytes={}",
+        result.is_ok()
+    );
+    assert!(matches!(result, Err(Error::ResultUnavailable)));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM audit_events WHERE action='output.review_chunk_served'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0
+    );
+    assert_eq!(f.r.posts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM approvals WHERE id=$1")
+            .bind(approval)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "pending"
+    );
+    assert!(delivery.manifest(&f.who, job).await.is_err());
+}
 fn attempt_id(v: &Value) -> Uuid {
     serde_json::from_value(v["attempt_id"].clone()).unwrap()
 }

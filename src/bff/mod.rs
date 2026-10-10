@@ -582,8 +582,8 @@ fn https_origin(value: &str) -> Result<()> {
     }
     Ok(())
 }
-fn http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+pub(crate) fn http_client() -> Result<reqwest::Client> {
+    crate::tls_roots::with_ca_file(reqwest::Client::builder(), "BROKERROUTER_BFF_CA_FILE")?
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())

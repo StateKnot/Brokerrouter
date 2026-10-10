@@ -201,7 +201,9 @@ impl Edge {
                 )
                 .bind(who.tenant_id).bind(output_operation_id).bind(who.key_id).bind(row.turn_id)
                 .fetch_optional(&mut *tx).await?.ok_or(Error::ResultUnavailable)?;
-                let gate = governance::gate(&mut tx, who, &turn, &operation, &payload).await?;
+                let (gate, grant_deadline) =
+                    governance::gate_with_grant_deadline(&mut tx, who, &turn, &operation, &payload)
+                        .await?;
                 match gate {
                     governance::Gate::Ready => {}
                     governance::Gate::Approval(approval) => {
@@ -214,6 +216,7 @@ impl Edge {
                     }
                 }
                 if row.state == "completed" {
+                    governance::require_live_grants(&mut tx, grant_deadline).await?;
                     tx.commit().await?;
                     return Ok(result.into());
                 }
@@ -223,6 +226,7 @@ impl Edge {
                 if updated.rows_affected() != 1 {
                     return Err(Error::Conflict);
                 }
+                governance::require_live_grants(&mut tx, grant_deadline).await?;
                 tx.commit().await?;
                 Ok(result.into())
             }

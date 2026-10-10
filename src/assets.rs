@@ -75,6 +75,21 @@ impl object_store::client::HttpConnector for StorageTransport {
     }
 }
 
+pub(crate) fn storage_http_client() -> Result<reqwest::Client> {
+    crate::tls_roots::with_ca_file(reqwest::Client::builder(), "BROKERROUTER_ASSET_S3_CA_FILE")?
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .timeout(IO_TIMEOUT)
+        .connect_timeout(Duration::from_secs(5))
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
+        .build()
+        .map_err(|_| Error::Configuration)
+}
+
 impl Assets {
     pub fn new(
         pool: PgPool,
@@ -117,18 +132,7 @@ impl Assets {
         }
         // The destination is deployment configuration, never supplied by a tenant.
         // Do not inherit HTTP proxies, follow redirects, or discover ambient credentials.
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .timeout(IO_TIMEOUT)
-            .connect_timeout(Duration::from_secs(5))
-            .no_gzip()
-            .no_brotli()
-            .no_deflate()
-            .no_zstd()
-            .build()
-            .map_err(|_| Error::Configuration)?;
+        let client = storage_http_client()?;
         let mut builder = object_store::aws::AmazonS3Builder::new()
             .with_endpoint(endpoint)
             .with_bucket_name(bucket)

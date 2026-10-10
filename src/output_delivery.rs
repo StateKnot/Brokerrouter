@@ -171,7 +171,8 @@ impl Delivery {
             .bind(who.tenant_id).bind(e.scan_id).bind(job).bind(who.key_id).bind(format!("media-output:{}",e.scan_id)).execute(&mut *tx).await?;
         let op = operation(&mut tx, who, &e).await?;
         bind(&op, &e)?;
-        let gate = governance::gate(&mut tx, who, &turn, &op, &payload).await?;
+        let (gate, grant_deadline) =
+            governance::gate_with_grant_deadline(&mut tx, who, &turn, &op, &payload).await?;
         let result = match gate {
             Gate::Ready => json!({"state":"ready","operation_id":op.id,"output":payload}),
             Gate::Approval(a) => {
@@ -179,20 +180,24 @@ impl Delivery {
             }
             Gate::Checking(_) => return Err(Error::Configuration),
         };
+        require_live_output(&mut tx, who, &e, None).await?;
+        governance::require_live_grants(&mut tx, grant_deadline).await?;
         tx.commit().await?;
         Ok(result)
     }
     pub async fn manifest(&self, who: &Identity, job: Uuid) -> Result<Value> {
         let mut tx = self.assets.pool.begin().await?;
         governance::tenant_lock(&mut tx, who.tenant_id).await?;
-        let e = released(&mut tx, who, job).await?;
+        let (e, grant_deadline) = released(&mut tx, who, job).await?;
+        require_live_output(&mut tx, who, &e, None).await?;
+        governance::require_live_grants(&mut tx, grant_deadline).await?;
         tx.commit().await?;
         Ok(json!({"state":"ready","output":e.view()}))
     }
     pub async fn chunk(&self, who: &Identity, job: Uuid, n: i32) -> Result<Bytes> {
         let mut tx = self.assets.pool.begin().await?;
         governance::tenant_lock(&mut tx, who.tenant_id).await?;
-        let e = released(&mut tx, who, job).await?;
+        let (e, _) = released(&mut tx, who, job).await?;
         if n < 0 || n >= e.chunk_count {
             return Err(Error::NotFound);
         }
@@ -200,17 +205,21 @@ impl Delivery {
         let bytes = self.assets.quarantined_chunk(who, e.asset_id, n).await?;
         let mut tx = self.assets.pool.begin().await?;
         governance::tenant_lock(&mut tx, who.tenant_id).await?;
-        let now = released(&mut tx, who, job).await?;
+        let (now, grant_deadline) = released(&mut tx, who, job).await?;
         if now.scan_id != e.scan_id {
             return Err(Error::PolicyChanged);
         }
         audit(&mut tx, who, &e, n, None).await?;
+        require_live_output(&mut tx, who, &now, None).await?;
+        governance::require_live_grants(&mut tx, grant_deadline).await?;
         tx.commit().await?;
         Ok(bytes)
     }
     pub async fn review_manifest(&self, human: &Human, approval: Uuid) -> Result<Value> {
         let mut tx = self.assets.pool.begin().await?;
-        let (_, e) = review(&mut tx, human, approval).await?;
+        let (who, e, deadline) = review_until(&mut tx, human, approval).await?;
+        require_live_output(&mut tx, &who, &e, Some(deadline)).await?;
+        crate::approval_workbench::fresh(&mut tx, human).await?;
         tx.commit().await?;
         Ok(
             json!({"state":"review_only","approval_id":approval,"output":e.view(),"notice":"Content risk is unreviewed. Use an isolated viewer. Reading does not approve or release this output."}),
@@ -225,35 +234,55 @@ impl Delivery {
         tx.commit().await?;
         let bytes = self.assets.quarantined_chunk(&who, e.asset_id, n).await?;
         let mut tx = self.assets.pool.begin().await?;
-        let (_, now) = review(&mut tx, human, approval).await?;
+        let (_, now, deadline) = review_until(&mut tx, human, approval).await?;
         if now.scan_id != e.scan_id {
             return Err(Error::PolicyChanged);
         }
         audit(&mut tx, &who, &e, n, Some(human.id)).await?;
+        require_live_output(&mut tx, &who, &now, Some(deadline)).await?;
+        crate::approval_workbench::fresh(&mut tx, human).await?;
         tx.commit().await?;
         Ok(bytes)
     }
 }
-async fn released(tx: &mut Tx<'_>, who: &Identity, job: Uuid) -> Result<Evidence> {
+async fn released(
+    tx: &mut Tx<'_>,
+    who: &Identity,
+    job: Uuid,
+) -> Result<(Evidence, Option<DateTime<Utc>>)> {
     let (e, _) = current(tx, who, job).await?;
     let op = operation(tx, who, &e).await?;
     bind(&op, &e)?;
+    let mut grant_deadline: Option<DateTime<Utc>> = None;
     for r in policies(tx, who, &e).await? {
-        let grant:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM guardrail_grants WHERE tenant_id=$1 AND turn_id=$2 AND guardrail_id=$3 AND version=$4 AND expires_at>clock_timestamp())")
-            .bind(who.tenant_id).bind(e.turn_id).bind(&r.id).bind(r.version).fetch_one(&mut **tx).await?;
-        if !grant && (r.rule["kind"] == "always" || outcome(&r.rule, &e.view())?.0 != "passed") {
-            return Err(Error::InProgress);
+        if r.rule["kind"] == "always" || outcome(&r.rule, &e.view())?.0 != "passed" {
+            let expiry: Option<DateTime<Utc>> = sqlx::query_scalar("SELECT expires_at FROM guardrail_grants WHERE tenant_id=$1 AND turn_id=$2 AND guardrail_id=$3 AND version=$4 AND expires_at>clock_timestamp()")
+                .bind(who.tenant_id).bind(e.turn_id).bind(&r.id).bind(r.version).fetch_optional(&mut **tx).await?;
+            let expiry = expiry.ok_or(Error::InProgress)?;
+            grant_deadline = Some(grant_deadline.map_or(expiry, |old| old.min(expiry)));
         }
     }
-    Ok(e)
+    require_live_output(tx, who, &e, None).await?;
+    governance::require_live_grants(tx, grant_deadline).await?;
+    Ok((e, grant_deadline))
 }
 pub(crate) async fn review(
     tx: &mut Tx<'_>,
     human: &Human,
     id: Uuid,
 ) -> Result<(Identity, Evidence)> {
+    let (who, e, deadline) = review_until(tx, human, id).await?;
+    require_live_output(tx, &who, &e, Some(deadline)).await?;
+    crate::approval_workbench::fresh(tx, human).await?;
+    Ok((who, e))
+}
+async fn review_until(
+    tx: &mut Tx<'_>,
+    human: &Human,
+    id: Uuid,
+) -> Result<(Identity, Evidence, DateTime<Utc>)> {
     human::authorize(tx, human).await?;
-    let (key,job,op,policy):(Uuid,Uuid,Uuid,Value)=sqlx::query_as("SELECT o.key_id,d.job_id,o.id,a.policy_snapshot FROM approvals a JOIN governance_operations o ON o.tenant_id=a.tenant_id AND o.id=a.operation_id JOIN governance_turns t ON t.tenant_id=a.tenant_id AND t.id=a.turn_id JOIN media_output_deliveries d ON d.tenant_id=o.tenant_id AND d.operation_id=o.id WHERE a.tenant_id=$1 AND a.id=$2 AND t.user_id=$3 AND a.state='pending' AND a.expires_at>clock_timestamp() AND o.stage='media_output' AND o.state='waiting_approval'")
+    let (key,job,op,policy,deadline):(Uuid,Uuid,Uuid,Value,DateTime<Utc>)=sqlx::query_as("SELECT o.key_id,d.job_id,o.id,a.policy_snapshot,a.expires_at FROM approvals a JOIN governance_operations o ON o.tenant_id=a.tenant_id AND o.id=a.operation_id JOIN governance_turns t ON t.tenant_id=a.tenant_id AND t.id=a.turn_id JOIN media_output_deliveries d ON d.tenant_id=o.tenant_id AND d.operation_id=o.id WHERE a.tenant_id=$1 AND a.id=$2 AND t.user_id=$3 AND a.state='pending' AND a.expires_at>clock_timestamp() AND o.stage='media_output' AND o.state='waiting_approval'")
         .bind(human.tenant_id).bind(id).bind(human.id).fetch_optional(&mut **tx).await?.ok_or(Error::NotFound)?;
     let who = Identity {
         tenant_id: human.tenant_id,
@@ -268,7 +297,23 @@ pub(crate) async fn review(
     {
         return Err(Error::PolicyChanged);
     }
-    Ok((who, e))
+    Ok((who, e, deadline))
+}
+async fn require_live_output(
+    tx: &mut Tx<'_>,
+    who: &Identity,
+    evidence: &Evidence,
+    additional_deadline: Option<DateTime<Utc>>,
+) -> Result<()> {
+    // Keep the immutable evidence view/hash intact. Recheck natural expiries at
+    // the release boundary after policies, storage I/O and the required audit.
+    let live: bool = sqlx::query_scalar("SELECT clock_timestamp()<LEAST($3,$4) AND EXISTS(SELECT 1 FROM tenants t JOIN virtual_keys k ON k.tenant_id=t.id WHERE t.id=$1 AND k.id=$2 AND t.active AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>clock_timestamp()))")
+        .bind(who.tenant_id).bind(who.key_id).bind(evidence.expires_at)
+        .bind(additional_deadline).fetch_one(&mut **tx).await?;
+    if !live {
+        return Err(Error::ResultUnavailable);
+    }
+    Ok(())
 }
 async fn audit(
     tx: &mut Tx<'_>,

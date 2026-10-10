@@ -282,6 +282,20 @@ pub(crate) async fn gate(
     op: &Operation,
     payload: &Value,
 ) -> Result<Gate> {
+    Ok(gate_with_grant_deadline(tx, who, turn, op, payload)
+        .await?
+        .0)
+}
+
+/// Capture only grants actually used by this decision. Publication and claim
+/// callers must recheck this deadline after their remaining transactional work.
+pub(crate) async fn gate_with_grant_deadline(
+    tx: &mut Tx<'_>,
+    who: &Identity,
+    turn: &Turn,
+    op: &Operation,
+    payload: &Value,
+) -> Result<(Gate, Option<DateTime<Utc>>)> {
     if matches!(op.state.as_str(), "rejected" | "feedback") {
         return Err(Error::ActionRejected);
     }
@@ -304,6 +318,7 @@ pub(crate) async fn gate(
     let mut needed = Vec::new();
     let mut evaluated = Vec::new();
     let mut pending = Vec::new();
+    let mut grant_deadline: Option<DateTime<Utc>> = None;
     if rules
         .iter()
         .filter(|r| r.rule["kind"] == "model_judge")
@@ -314,8 +329,11 @@ pub(crate) async fn gate(
     }
     for r in rules {
         let started = std::time::Instant::now();
-        let grant: Option<Uuid>=sqlx::query_scalar("SELECT approval_id FROM guardrail_grants WHERE tenant_id=$1 AND turn_id=$2 AND guardrail_id=$3 AND version=$4 AND expires_at>clock_timestamp()")
+        let grant: Option<(Uuid,DateTime<Utc>)>=sqlx::query_as("SELECT approval_id,expires_at FROM guardrail_grants WHERE tenant_id=$1 AND turn_id=$2 AND guardrail_id=$3 AND version=$4 AND expires_at>clock_timestamp()")
             .bind(who.tenant_id).bind(turn.id).bind(&r.id).bind(r.version).fetch_optional(&mut **tx).await?;
+        if let Some((_, expiry)) = grant {
+            grant_deadline = Some(grant_deadline.map_or(expiry, |old| old.min(expiry)));
+        }
         let (outcome, reason) = if grant.is_some() {
             (
                 "skipped_by_user_approval".to_owned(),
@@ -356,13 +374,13 @@ pub(crate) async fn gate(
             }
             needed.push(item);
         }
-        evaluated
-            .push(json!({"id":r.id,"version":r.version,"outcome":outcome,"approval_id":grant}));
+        evaluated.push(json!({"id":r.id,"version":r.version,"outcome":outcome,
+            "approval_id":grant.map(|(id,_)|id)}));
     }
     if !pending.is_empty() {
         sqlx::query("UPDATE governance_operations SET state='checking' WHERE tenant_id=$1 AND id=$2 AND state IN ('ready','checking','waiting_approval')")
             .bind(who.tenant_id).bind(op.id).execute(&mut **tx).await?;
-        return Ok(Gate::Checking(pending));
+        return Ok((Gate::Checking(pending), grant_deadline));
     }
     if needed.is_empty() {
         if !evaluated.is_empty() {
@@ -383,7 +401,10 @@ pub(crate) async fn gate(
             .execute(&mut **tx)
             .await?;
         }
-        return Ok(Gate::Ready);
+        // Row locks cannot stop wall-clock expiry during observation/event writes.
+        // Every shared gate caller receives Ready only while its used grants live.
+        require_live_grants(tx, grant_deadline).await?;
+        return Ok((Gate::Ready, grant_deadline));
     }
     let hash = digest(&json!({"policy":snapshot,"needed":needed}))?;
     let expires = if op.stage == "post" {
@@ -419,7 +440,23 @@ pub(crate) async fn gate(
         event(tx,turn,"approval.required",json!({"approval_id":approval.id,"operation_id":op.id,"guardrails":approval.guardrails,"evaluations":evaluated})).await?;
     }
     sqlx::query("UPDATE governance_operations SET state='waiting_approval' WHERE tenant_id=$1 AND id=$2 AND state IN ('ready','checking','waiting_approval')").bind(who.tenant_id).bind(op.id).execute(&mut **tx).await?;
-    Ok(Gate::Approval(approval_view(&approval)))
+    Ok((Gate::Approval(approval_view(&approval)), grant_deadline))
+}
+
+pub(crate) async fn require_live_grants(
+    tx: &mut Tx<'_>,
+    deadline: Option<DateTime<Utc>>,
+) -> Result<()> {
+    if let Some(deadline) = deadline {
+        let live: bool = sqlx::query_scalar("SELECT clock_timestamp()<$1")
+            .bind(deadline)
+            .fetch_one(&mut **tx)
+            .await?;
+        if !live {
+            return Err(Error::PolicyChanged);
+        }
+    }
+    Ok(())
 }
 pub(crate) fn approval_view(a: &Approval) -> Value {
     json!({"id":a.id,"operation_id":a.operation_id,"turn_id":a.turn_id,"state":a.state,"guardrails":a.guardrails,"summary":a.summary,"expires_at":a.expires_at,"scope":"current_turn_only","resume_requires_recheck":true,"scope_notice":"继续本轮后，该轮后续动作也会跳过所选护栏；不扩大工具权限，不适用于新轮次。","options":["continue_this_turn","reject","feedback"]})
@@ -663,7 +700,9 @@ pub async fn claim(
         )?,
     )
     .map_err(|_| Error::ResultUnavailable)?;
-    match gate(&mut tx, who, &turn, &op, &payload).await? {
+    let (decision, grant_deadline) =
+        gate_with_grant_deadline(&mut tx, who, &turn, &op, &payload).await?;
+    match decision {
         Gate::Approval(a) => {
             tx.commit().await?;
             return Err(Error::ApprovalRequired(a));
@@ -682,6 +721,7 @@ pub async fn claim(
         json!({"operation_id":id,"execution_deadline":deadline}),
     )
     .await?;
+    require_live_grants(&mut tx, grant_deadline).await?;
     tx.commit().await?;
     op.state = "executing".into();
     op.execution_deadline = Some(deadline);
@@ -768,6 +808,7 @@ pub(crate) async fn receipt_in_tx(
 }
 pub async fn maintain(pool: &PgPool) -> Result<()> {
     crate::judge::maintain(pool).await?;
+    crate::runtime_results::maintain(pool).await?;
     sqlx::query("WITH batch AS (SELECT tenant_id,id FROM governance_operations WHERE state='executing' AND execution_deadline<=clock_timestamp() ORDER BY execution_deadline LIMIT 100 FOR UPDATE SKIP LOCKED) UPDATE governance_operations o SET state='execution_unknown' FROM batch b WHERE o.tenant_id=b.tenant_id AND o.id=b.id").execute(pool).await?;
     sqlx::query("WITH batch AS (SELECT o.tenant_id,o.id FROM governance_operations o JOIN governance_turns t ON o.tenant_id=t.tenant_id AND o.turn_id=t.id WHERE (t.state<>'active' OR t.expires_at<=clock_timestamp()) AND (o.payload_ciphertext IS NOT NULL OR o.receipt_ciphertext IS NOT NULL) ORDER BY t.expires_at,o.id LIMIT 100 FOR UPDATE OF o SKIP LOCKED) UPDATE governance_operations o SET payload_ciphertext=NULL,receipt_ciphertext=NULL FROM batch b WHERE o.tenant_id=b.tenant_id AND o.id=b.id").execute(pool).await?;
     sqlx::query("WITH batch AS (SELECT r.id FROM requests r JOIN governance_turns t ON r.tenant_id=t.tenant_id AND r.governance_turn_id=t.id WHERE (t.state<>'active' OR t.expires_at<=clock_timestamp()) AND r.result_ciphertext IS NOT NULL ORDER BY t.expires_at,r.id LIMIT 100 FOR UPDATE OF r SKIP LOCKED) UPDATE requests r SET result_ciphertext=NULL FROM batch b WHERE r.id=b.id").execute(pool).await?;

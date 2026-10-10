@@ -734,6 +734,104 @@ async fn completed_result_is_withheld_after_tool_grant_revocation(pool: PgPool) 
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn grant_expiry_during_mcp_completion_update_keeps_the_result_private(pool: PgPool) {
+    let fixture = fixture(&pool, "mcp-final-grant-clock", false).await;
+    common::guardrail(
+        &pool,
+        fixture.who.tenant_id,
+        "short-mcp-output-grant",
+        1,
+        "tool_output",
+        json!({"kind":"always"}),
+    )
+    .await;
+    let call_id = Uuid::new_v4();
+    let args = json!({"id":"exactly-once-private-result"});
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args.clone()
+            )
+            .await,
+        Err(Error::InProgress)
+    ));
+    assert!(fixture.worker.tick().await.unwrap());
+    let waiting = fixture
+        .edge
+        .call(
+            &fixture.who,
+            fixture.turn,
+            call_id,
+            fixture.tool.clone(),
+            args.clone(),
+        )
+        .await;
+    let approval = match waiting {
+        Err(Error::ApprovalRequired(value)) => common::approval_id(&json!({"approval":value})),
+        _ => panic!("output approval was not required"),
+    };
+    sqlx::raw_sql(
+        "CREATE SEQUENCE fixture_mcp_completion_count;
+        CREATE FUNCTION fixture_delay_mcp_completion() RETURNS trigger LANGUAGE plpgsql AS $$
+        DECLARE deadline timestamptz;
+        BEGIN
+            IF NEW.state='completed' AND OLD.state='output_pending' THEN
+                PERFORM nextval('fixture_mcp_completion_count');
+                SELECT max(expires_at) INTO deadline FROM guardrail_grants
+                    WHERE tenant_id=NEW.tenant_id AND turn_id=NEW.turn_id;
+                PERFORM pg_sleep(GREATEST(0,extract(epoch FROM deadline-clock_timestamp()))+0.05);
+            END IF;
+            RETURN NEW;
+        END;
+        $$;
+        CREATE TRIGGER fixture_delay_mcp_completion BEFORE UPDATE ON mcp_tool_calls
+            FOR EACH ROW EXECUTE FUNCTION fixture_delay_mcp_completion();",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE approvals SET expires_at=clock_timestamp()+interval '2 seconds' WHERE tenant_id=$1 AND id=$2")
+        .bind(fixture.who.tenant_id).bind(approval).execute(&pool).await.unwrap();
+    common::decide(
+        &pool,
+        "alice",
+        approval,
+        common::approve(&["short-mcp-output-grant"]),
+    )
+    .await
+    .unwrap();
+    let released = fixture
+        .edge
+        .call(
+            &fixture.who,
+            fixture.turn,
+            call_id,
+            fixture.tool.clone(),
+            args,
+        )
+        .await;
+    assert!(
+        matches!(released, Err(Error::PolicyChanged)),
+        "MCP published after its grant expired"
+    );
+    let attempted_completion: (i64, bool) =
+        sqlx::query_as("SELECT last_value,is_called FROM fixture_mcp_completion_count")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(attempted_completion, (1, true));
+    let facts: (String, bool, i64) = sqlx::query_as("SELECT state,completed_at IS NULL,(SELECT count(*) FROM mcp_tool_calls) FROM mcp_tool_calls WHERE tenant_id=$1 AND id=$2")
+        .bind(fixture.who.tenant_id).bind(call_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(facts, ("output_pending".into(), true, 1));
+    assert_eq!(call_count(&fixture.marker), 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn expired_turn_fails_pending_mcp_judge_without_dispatch(pool: PgPool) {
     let fixture = fixture(&pool, "mcp-pending-expiry", false).await;
     common::guardrail(
