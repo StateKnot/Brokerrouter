@@ -50,6 +50,40 @@
     "Actual zero-fee local HTTP/SSE model; no paid production supplier certification.",
     "This subset does not complete R1 or deploy all control-plane services."
   ],
+  "deployment_snapshot_current_repository_comparison": {
+    "all_130_match_current_repository": false,
+    "drift_files": [
+      {
+        "path": "deploy/production/generate-secrets.sh",
+        "frozen_sha256": "2978697811da54618934edc2b48d69e0b1ed35fa65901c5595cc9bd42db8a41a",
+        "current_repository_sha256": "725c14920cf85d408f9c120e030f8516c500f0049f06c87a0275580d8ff11453"
+      },
+      {
+        "path": "deploy/production/test-control-plane-release.py",
+        "frozen_sha256": "2135e52ceb850e09e03354a7c33ff01b2285105b620e03068b155f98a064f1ca",
+        "current_repository_sha256": "2cc9ae83e39632fa9dd3f0154a058e0cfe829ab7026202975e5211e5e6a04003"
+      },
+      {
+        "path": "deploy/production/verify-control-plane.py",
+        "frozen_sha256": "1b296a5a479a1120a87857e3904fb7f1979b7b07c989fa3be46ee270a735fe5e",
+        "current_repository_sha256": "d60a1470d4aaea96ece5780d89173f13dca4ae3ab13a3390ad49a06c8831fed2"
+      }
+    ],
+    "comparison_current_head": "f96610dc9968d64a8abe8de47126d164ad3c71a5",
+    "snapshot_preserved": true,
+    "compiled_103_inputs_are_current_and_unchanged": true
+  },
+  "actual_bootstrap_inputs": {
+    "fixture_generates_ca_and_leaf_itself_with_explicit_strict_x509_extensions": true,
+    "historical_generate_secrets_sh_executed": false,
+    "purpose_helper": "deploy/production/purpose-logins.py",
+    "purpose_generator": "deploy/production/create-purpose-secrets.sh",
+    "purpose_admin_preparation": "deploy/production/prepare-purpose-admin.py",
+    "canonical_sql_permissions_and_migrations_executed": true,
+    "current_strict_pki_release_checks_executed_by_native_fixture": false,
+    "drifted_test_control_plane_release_py_executed": false,
+    "drifted_verify_control_plane_py_executed": false
+  },
   "deployment_source_sha256": {
     ".dockerignore": "d193e71ba04d1765e52b3dd5d53669e7eb539144ecc92e1e6635a6ddef619f7e",
     "Cargo.lock": "faf0d3a9a8cefb0850687c116a5868819f757f8e9f400cd7f140bff57b7e0ff8",
@@ -182,19 +216,5 @@
     "src/traces.rs": "9ecca6f10506502f92b184cc98a6bee2238bfd6ba08a136d42b7c2c8d4d21897",
     "src/transport.rs": "0067d01d8c6b29ef0fa46b19767984b0b6072ca8fdf7862553cc2d9fbc5b81e0"
   },
-  "deployment_snapshot_differences": {
-    "deploy/production/generate-secrets.sh": {
-      "verified_deployment_sha256": "2978697811da54618934edc2b48d69e0b1ed35fa65901c5595cc9bd42db8a41a",
-      "current_repository_sha256": "725c14920cf85d408f9c120e030f8516c500f0049f06c87a0275580d8ff11453"
-    },
-    "deploy/production/test-control-plane-release.py": {
-      "verified_deployment_sha256": "2135e52ceb850e09e03354a7c33ff01b2285105b620e03068b155f98a064f1ca",
-      "current_repository_sha256": "2cc9ae83e39632fa9dd3f0154a058e0cfe829ab7026202975e5211e5e6a04003"
-    },
-    "deploy/production/verify-control-plane.py": {
-      "verified_deployment_sha256": "1b296a5a479a1120a87857e3904fb7f1979b7b07c989fa3be46ee270a735fe5e",
-      "current_repository_sha256": "d60a1470d4aaea96ece5780d89173f13dca4ae3ab13a3390ad49a06c8831fed2"
-    }
-  },
-  "deployment_snapshot_note": "127 deployment inputs match current repository; three production PKI scripts are the preserved earlier snapshot. Native fixture generates its own strict CA; this native run does not certify deploying the new production PKI scripts."
+  "compiled_source_commit": "f96610dc9968d64a8abe8de47126d164ad3c71a5"
 }

@@ -354,5 +354,7 @@
     "R1 completion"
   ],
   "hermes_attachments": "disabled",
-  "github_checks": "not run due account quota; branch protection remains a release condition"
+  "github_checks": "not run due account quota; branch protection remains a release condition",
+  "compiled_source_commit": "f96610dc9968d64a8abe8de47126d164ad3c71a5",
+  "compiled_source_commit_verified": true
 }
