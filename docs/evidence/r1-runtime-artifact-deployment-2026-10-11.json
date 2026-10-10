@@ -1,0 +1,148 @@
+{
+  "date": "2026-10-11",
+  "scope": "R1 runtime artifact private intake package A and isolated deployment; binary format/review/native publication B+C remain incomplete",
+  "source_files": {
+    "deploy/production/purpose-logins.py": "3812d1eaa736b51db191e7fe5126b46fc06eb10bf3a825c0c389d01a14eecef7",
+    "deploy/production/control-plane-config.py": "6cc09f9fd45557932c0c34faba768f1f5bc263b70a3ceffd6153e382c43e2c03",
+    "deploy/production/control-plane-entrypoint.sh": "a00d7517e46adc575b5834b16ce0431d17c745475b47b3c7e729bbe23943d127",
+    "deploy/production/test-purpose-logins.py": "788f7e07fccdd1cf4996487353bee4f4155e1bd112b2ab4df57a334fff161eb8",
+    "deploy/production/test-control-plane-config.py": "ee12ff9f441e1a3e3e20eff47d3869059870d6ccbece4ae085266e38c5f19f8b",
+    "deploy/production/test-runtime-artifact-deployment.py": "e5aee7313478f60d98be8506956f538c5e593a064fe5947dfb9809b3e1efe8a0",
+    "deploy/production/upgrade-runtime-artifact-secrets.sh": "71b02a74c243740d69e560ec55ee547e3bea64b222f916bb89c76122b9985321",
+    "compose.runtime-artifacts.yaml": "1ef90abc8e302c952fd87c003bde8021cbfa2a7538958cd8ae8f205bd92af53c",
+    "deploy/production/purpose-logins.md": "0f9c82db702a82d72f2e3bb010be4681de90e2dc4548936b938890ae3f11ad31"
+  },
+  "evidence_root": "/private/tmp/brokerrouter-acceptance-20261010/evidence",
+  "test_groups": [
+    {
+      "name": "artifact_pg_http_purpose",
+      "log": "runtime-artifact-core-http-purpose.log",
+      "sha256": "806fd296881231ac22cbc8bba5e8092d157fd1f2e373eabd9d1d7be67488b46a",
+      "result": {
+        "passed": 11,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "name": "existing_assets_outputs_regression",
+      "log": "runtime-artifact-shared-assets-outputs-green.log",
+      "sha256": "37f9d50e46eaf4cc36ae0a83664ca14aba51fdf196387d5106fb95aa5b1f8128",
+      "result": {
+        "assets": {
+          "passed": 10,
+          "failed": 0,
+          "ignored": 1
+        },
+        "outputs": {
+          "passed": 44,
+          "failed": 0,
+          "ignored": 3
+        },
+        "ignored_executed_in_this_group": false
+      }
+    },
+    {
+      "name": "upgrade_sigkill_compose_config",
+      "log": "runtime-artifact-purpose-profile-final.log",
+      "sha256": "cb6cb96e9c43684f138a98c75f7bcf86e6417f104505a22320f00ef38546bfa4",
+      "result": {
+        "passed": 8,
+        "failed": 0,
+        "seconds": 5.042
+      }
+    },
+    {
+      "name": "actual_tls_purpose_matrix_and_legacy_upgrade",
+      "log": "runtime-artifact-purpose-tls-upgrade.log",
+      "sha256": "6072e0afb4af95a384f8f71b1262f89c5f8f88146ef7cec550d5fa08c6b5b2f0",
+      "result": {
+        "passed": 2,
+        "failed": 0,
+        "seconds": 25.32
+      }
+    },
+    {
+      "name": "actual_provisioner_image_and_legacy_upgrade",
+      "log": "runtime-artifact-ops-image-final.log",
+      "sha256": "f4ac2b90636205ba356fc65319cc089dba3ef595206920c02295fa7301f12904",
+      "result": {
+        "passed": 3,
+        "failed": 0,
+        "seconds": 47.365,
+        "overlap": "host TLS legacy upgrade overlaps prior TLS group; do not sum as independent cases"
+      }
+    },
+    {
+      "name": "actual_linux_shell_loaders",
+      "log": "runtime-artifact-loaders-final.log",
+      "sha256": "ba49e9932c216bf178928a9a03d65dd07df22a247a08335cd3527ff880342b75",
+      "result": {
+        "passed": 1,
+        "failed": 0,
+        "seconds": 6.554,
+        "scope": "original 14 plus runtime-assets positive and negative whitelist/byte/TLS DSN checks"
+      }
+    },
+    {
+      "name": "original_default_compose",
+      "log": "runtime-artifact-default-compose.log",
+      "sha256": "f18cc5b130112a8d1282e061d1bc286066626944f868fd5bd0b496b8c9272bbd",
+      "result": {
+        "passed": true
+      }
+    },
+    {
+      "name": "provisioner_image_build",
+      "log": "runtime-artifact-provisioner-build.log",
+      "sha256": "0d657e64041b7c0e72dca3521ec125eeb4b718e82c97d5001f7967ddd2892da3",
+      "result": {
+        "passed": true
+      }
+    }
+  ],
+  "provisioner_image": {
+    "tag": "brokerrouter-provisioner:runtime-artifacts-20261011",
+    "actual_docker_image_id": "sha256:e37fe4c7134e32f6ca6a74b7627e0ddea8a447534035c74b1d0fe0518cbd785d",
+    "repo_digest": "brokerrouter-provisioner@sha256:e37fe4c7134e32f6ca6a74b7627e0ddea8a447534035c74b1d0fe0518cbd785d",
+    "build_config_digest": "sha256:58d30aefacb7d745da2e79d481552c733722a13da0dcfbafcd3c1be43f5eb98f",
+    "build_manifest_digest": "sha256:cea338ab9cce265f406a65dc09eb2255ba5efc8cad0035071696b892b1184127",
+    "actual_container_helper_sha256": "3812d1eaa736b51db191e7fe5126b46fc06eb10bf3a825c0c389d01a14eecef7",
+    "is_gateway_runtime_image": false
+  },
+  "deployment_contract": {
+    "fresh_manifest_version": 2,
+    "fresh_purposes": 20,
+    "existing_legacy_manifest_version": 1,
+    "default_existing_purposes": 19,
+    "upgrade_explicit": true,
+    "original_secret_files_preserved": 57,
+    "original_manifest_preserved": true,
+    "default_components_preserved": 14,
+    "default_database_connection_budget": "48/80",
+    "optional_extra_database_connections": 2,
+    "optional_networks": [
+      "backend",
+      "egress"
+    ],
+    "host_ports": [],
+    "binary_download_opened": false,
+    "scanner_or_approval_authority_opened": false
+  },
+  "disk": {
+    "df_before_final_test_available_gib": 329,
+    "target_copied": false,
+    "dependency_cache_copied": false,
+    "test_tmpfs_containers_cleaned": true,
+    "production_secret_directory_used": false
+  },
+  "not_certified": [
+    "technical MP4 format/antivirus/decode scanning for runtime artifacts",
+    "isolated complete-byte human review and current per-artifact grants",
+    "runtime artifact download/publication",
+    "producer/broker mounts inaccessible to Agent and parallel tools",
+    "typed native producer capture and attachment resolver",
+    "complete actual provider/OIDC/channel binary pipeline",
+    "R2/R4 images/3D/additional provider formats"
+  ]
+}

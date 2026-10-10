@@ -191,6 +191,20 @@ pub(crate) async fn observe(
     }
 }
 
+/// Read-only current-version evidence used while reviewing a coupled final.
+/// Missing, running, failed and risky evaluations confer no release permission.
+pub(crate) async fn passed(
+    tx: &mut Tx<'_>,
+    who: &Identity,
+    op: &Operation,
+    rule: &Guardrail,
+) -> Result<bool> {
+    Rule::parse(&rule.rule).map_err(|_| Error::Configuration)?;
+    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM guardrail_evaluations WHERE tenant_id=$1 AND operation_id=$2 AND guardrail_id=$3 AND version=$4 AND state='passed')")
+        .bind(who.tenant_id).bind(op.id).bind(&rule.id).bind(rule.version)
+        .fetch_one(&mut **tx).await.map_err(Into::into)
+}
+
 // Caller holds tenant/account locks. This private authority is not a virtual-key
 // claim: it is derived from an immutable server-selected evaluation row.
 pub(crate) async fn authority_locked(tx: &mut Tx<'_>, who: &Identity, id: Uuid) -> Result<Rule> {

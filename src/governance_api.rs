@@ -3,13 +3,14 @@ use crate::{
     cipher::ResultCipher,
     error::{Error, Result},
     gateway::Gateway,
-    governance, human, mcp_skill_approvals, mcp_skill_resources,
+    governance, human, mcp_skill_approvals, mcp_skill_resources, runtime_publications,
+    runtime_results,
 };
 use axum::{
     Json, Router,
     body::Bytes,
     extract::{OriginalUri, Path, Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
 use serde_json::Value;
@@ -20,6 +21,19 @@ use uuid::Uuid;
 pub fn runtime_routes(gateway: Gateway) -> Router {
     Router::new()
         .route("/v1/governance/checks", post(check))
+        .route("/v1/governance/tool-results", post(record_tool_result))
+        .route(
+            "/v1/governance/final-publications",
+            post(record_final_publication),
+        )
+        .route(
+            "/v1/governance/final-publications/{id}/release",
+            post(release_final_publication),
+        )
+        .route(
+            "/v1/governance/tool-results/{id}/release",
+            post(release_tool_result),
+        )
         .route("/v1/approvals/{id}", get(approval))
         .route("/v1/governance/operations/{id}", get(operation))
         .route("/v1/governance/operations/{id}/claim", post(claim))
@@ -87,6 +101,18 @@ async fn check(
     headers: HeaderMap,
     Json(check): Json<governance::Check>,
 ) -> Result<Json<Value>> {
+    if check
+        .operation_key
+        .starts_with(runtime_results::OUTPUT_PREFIX)
+        || check
+            .operation_key
+            .starts_with(runtime_publications::OUTPUT_PREFIX)
+        || check
+            .operation_key
+            .starts_with(crate::runtime_artifact_delivery::OUTPUT_PREFIX)
+    {
+        return Err(Error::Invalid("reserved runtime output operation key"));
+    }
     if !matches!(
         check.stage.as_str(),
         "tool_input" | "tool_output" | "artifact"
@@ -102,6 +128,80 @@ async fn check(
     let task = g
         .tasks
         .spawn(async move { worker.check(&who, check).await });
+    Ok(Json(task.await.map_err(|_| Error::Configuration)??))
+}
+async fn record_tool_result(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Json(body): Json<runtime_results::Record>,
+) -> Result<Json<Value>> {
+    let who = api::identity(&g.pool, &headers).await?;
+    let worker = g.clone();
+    let task = g.tasks.spawn(async move {
+        runtime_results::record(&worker.pool, &worker.cipher, &who, body).await
+    });
+    Ok(Json(task.await.map_err(|_| Error::Configuration)??))
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseToolResult {}
+async fn release_tool_result(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(_): Json<ReleaseToolResult>,
+) -> Result<Json<Value>> {
+    let who = api::identity(&g.pool, &headers).await?;
+    let worker = g.clone();
+    // A lost response must not cancel a billable semantic check or its settlement.
+    let task = g
+        .tasks
+        .spawn(async move { runtime_results::release(&worker, &who, id).await });
+    Ok(Json(task.await.map_err(|_| Error::Configuration)??))
+}
+async fn generic_operation(g: &Gateway, who: &crate::store::Identity, id: Uuid) -> Result<()> {
+    let key: String = sqlx::query_scalar(
+        "SELECT operation_key FROM governance_operations WHERE tenant_id=$1 AND key_id=$2 AND id=$3",
+    )
+    .bind(who.tenant_id)
+    .bind(who.key_id)
+    .bind(id)
+    .fetch_optional(&g.pool)
+    .await?
+    .ok_or(Error::NotFound)?;
+    if key.starts_with(runtime_results::OUTPUT_PREFIX)
+        || key.starts_with(runtime_publications::OUTPUT_PREFIX)
+        || key.starts_with(crate::runtime_artifact_delivery::OUTPUT_PREFIX)
+    {
+        return Err(Error::Invalid(
+            "runtime outputs are released without claims or receipts",
+        ));
+    }
+    Ok(())
+}
+async fn record_final_publication(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Json(body): Json<runtime_publications::Record>,
+) -> Result<Json<Value>> {
+    let who = api::identity(&g.pool, &headers).await?;
+    let worker = g.clone();
+    let task = g.tasks.spawn(async move {
+        runtime_publications::record(&worker.pool, &worker.cipher, &who, body).await
+    });
+    Ok(Json(task.await.map_err(|_| Error::Configuration)??))
+}
+async fn release_final_publication(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(_): Json<ReleaseToolResult>,
+) -> Result<Json<Value>> {
+    let who = api::identity(&g.pool, &headers).await?;
+    let worker = g.clone();
+    let task = g
+        .tasks
+        .spawn(async move { runtime_publications::release(&worker, &who, id).await });
     Ok(Json(task.await.map_err(|_| Error::Configuration)??))
 }
 async fn operation(
@@ -121,6 +221,7 @@ async fn claim(
     Json(body): Json<governance::Claim>,
 ) -> Result<Json<Value>> {
     let who = api::identity(&g.pool, &headers).await?;
+    generic_operation(&g, &who, id).await?;
     Ok(Json(
         governance::claim(&g.pool, &g.cipher, &who, id, body).await?,
     ))
@@ -132,6 +233,7 @@ async fn receipt(
     Json(body): Json<governance::Receipt>,
 ) -> Result<Json<Value>> {
     let who = api::identity(&g.pool, &headers).await?;
+    generic_operation(&g, &who, id).await?;
     Ok(Json(
         governance::receipt(&g.pool, &g.cipher, &who, id, body).await?,
     ))
@@ -198,6 +300,8 @@ pub struct Control {
 }
 pub fn control_router(control: Control) -> Router {
     Router::new()
+        .route("/health/live", get(|| async { StatusCode::NO_CONTENT }))
+        .route("/health/ready", get(control_ready))
         .route("/v1/governance/turns", post(create_turn))
         .route("/v1/governance/turns/{id}/close", post(close_turn))
         .route("/v1/approvals/{id}/resolve", post(resolve))
@@ -210,6 +314,15 @@ pub fn control_router(control: Control) -> Router {
             api::http_capacity,
         ))
         .layer(axum::middleware::from_fn(api::request_id))
+}
+async fn control_ready(State(c): State<Control>) -> Result<StatusCode> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        crate::check_schema(&c.pool),
+    )
+    .await
+    .map_err(|_| Error::Database(sqlx::Error::PoolTimedOut))??;
+    Ok(StatusCode::NO_CONTENT)
 }
 async fn auth(c: &Control, headers: &HeaderMap, path: &str, body: &Bytes) -> Result<human::Human> {
     let token = headers

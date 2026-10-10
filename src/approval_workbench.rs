@@ -175,7 +175,25 @@ pub async fn review(pool: &PgPool, cipher: &ResultCipher, who: &Human, q: Review
                 {
                     return Err(Error::ResultUnavailable);
                 }
-                can_continue = reviewable(&op.stage, &value);
+                can_continue = if op
+                    .operation_key
+                    .starts_with(crate::runtime_publications::OUTPUT_PREFIX)
+                {
+                    crate::runtime_publications::review_payload(
+                        &mut tx, cipher, &identity, &op, &turn, &value,
+                    )
+                    .await?;
+                    true
+                } else if op
+                    .operation_key
+                    .starts_with(crate::runtime_results::OUTPUT_PREFIX)
+                {
+                    crate::runtime_results::review_payload(&mut tx, &identity, &op, &turn, &value)
+                        .await?;
+                    true
+                } else {
+                    reviewable(&op.stage, &value)
+                };
                 if can_continue {
                     payload = Value::String(
                         String::from_utf8(plain).map_err(|_| Error::ResultUnavailable)?,
@@ -200,6 +218,29 @@ pub async fn review(pool: &PgPool, cipher: &ResultCipher, who: &Human, q: Review
     sqlx::query("INSERT INTO audit_events(tenant_id,action,object_id,details) VALUES($1,'approval.reviewed',$2,$3)")
         .bind(who.tenant_id).bind(a.id.to_string()).bind(json!({"user_id":who.id,"review_id":id,"operation_id":op.id,"operation_sha256":governance::hex(&op.payload_hash),"content_delivered":can_continue,"expires_at":expires_at})).execute(&mut *tx).await?;
     fresh(&mut tx, who).await?;
+    // Locks preserve identities, not wall-clock authority. Review can only
+    // deliver plaintext while every original source and used grant is current
+    // after the final audit. These checks never register or drive paid work.
+    if can_continue {
+        if op
+            .operation_key
+            .starts_with(crate::runtime_publications::OUTPUT_PREFIX)
+        {
+            crate::runtime_publications::validate_approval(&mut tx, cipher, &identity, &op).await?;
+        } else if op
+            .operation_key
+            .starts_with(crate::runtime_results::OUTPUT_PREFIX)
+        {
+            crate::runtime_results::validate_approval(&mut tx, cipher, &identity, &op).await?;
+        }
+        let live: bool = sqlx::query_scalar("SELECT clock_timestamp()<$1")
+            .bind(expires_at)
+            .fetch_one(&mut *tx)
+            .await?;
+        if !live {
+            return Err(Error::ActionRejected);
+        }
+    }
     tx.commit().await?;
     Ok(
         json!({"approval":governance::approval_view(&a),"review_id":id,"review_expires_at":expires_at,"stage":op.stage,"model_id":op.model_id,"tool_name":op.tool_name,"operation_state":op.state,"payload_text":payload,"operation_sha256":governance::hex(&op.payload_hash),"can_continue":can_continue,"unavailable_reason":unavailable}),
@@ -219,7 +260,16 @@ pub(crate) async fn validate_review(
     op: &Operation,
     decision: &human::Decision,
 ) -> Result<()> {
-    if op.stage == "media_output" && decision.decision == "continue_this_turn" {
+    let native_artifact = governance::runtime_artifact(op);
+    if native_artifact && decision.decision == "continue_this_turn" {
+        let identity = Identity {
+            tenant_id: who.tenant_id,
+            key_id: op.key_id,
+        };
+        crate::runtime_artifact_delivery::validate_operation(tx, &identity, op).await?;
+    }
+    if (op.stage == "media_output" || native_artifact) && decision.decision == "continue_this_turn"
+    {
         let completed:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM media_review_completions c JOIN media_review_sessions s ON s.tenant_id=c.tenant_id AND s.id=c.review_id WHERE c.tenant_id=$1 AND c.review_id=$2 AND s.approval_id=$3 AND s.user_id=$4 AND s.payload_hash=$5 AND s.policy_hash=$6)")
             .bind(who.tenant_id).bind(id).bind(a.id).bind(who.id).bind(&op.payload_hash).bind(governance::digest(&a.policy_snapshot)?).fetch_one(&mut **tx).await?;
         if !completed {
@@ -242,7 +292,8 @@ pub(crate) async fn validate_review(
         return Err(Error::PolicyChanged);
     }
     if decision.decision == "continue_this_turn"
-        && (!can_continue || (op.stage != "media_output" && op.payload_ciphertext.is_none()))
+        && (!can_continue
+            || (op.stage != "media_output" && !native_artifact && op.payload_ciphertext.is_none()))
     {
         return Err(Error::ResultUnavailable);
     }

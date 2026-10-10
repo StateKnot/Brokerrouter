@@ -47,6 +47,11 @@ struct Chunk {
     sha256: Vec<u8>,
     state: String,
 }
+#[derive(Clone)]
+enum WriteOwner {
+    Media(Uuid),
+    Runtime { batch: Uuid, claim: Vec<u8> },
+}
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateAsset {
@@ -73,6 +78,21 @@ impl object_store::client::HttpConnector for StorageTransport {
     ) -> object_store::Result<object_store::client::HttpClient> {
         Ok(object_store::client::HttpClient::new(self.0.clone()))
     }
+}
+
+pub(crate) fn storage_http_client() -> Result<reqwest::Client> {
+    crate::tls_roots::with_ca_file(reqwest::Client::builder(), "BROKERROUTER_ASSET_S3_CA_FILE")?
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .timeout(IO_TIMEOUT)
+        .connect_timeout(Duration::from_secs(5))
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
+        .build()
+        .map_err(|_| Error::Configuration)
 }
 
 impl Assets {
@@ -117,18 +137,7 @@ impl Assets {
         }
         // The destination is deployment configuration, never supplied by a tenant.
         // Do not inherit HTTP proxies, follow redirects, or discover ambient credentials.
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .timeout(IO_TIMEOUT)
-            .connect_timeout(Duration::from_secs(5))
-            .no_gzip()
-            .no_brotli()
-            .no_deflate()
-            .no_zstd()
-            .build()
-            .map_err(|_| Error::Configuration)?;
+        let client = storage_http_client()?;
         let mut builder = object_store::aws::AmazonS3Builder::new()
             .with_endpoint(endpoint)
             .with_bucket_name(bucket)
@@ -165,6 +174,7 @@ impl Assets {
     pub async fn create(&self, who: &Identity, idem: &str, body: CreateAsset) -> Result<Value> {
         if !governance::valid_text(idem, 200)
             || idem.starts_with("_br_output:")
+            || idem.starts_with(crate::runtime_artifacts::ASSET_PREFIX)
             || !(1..=MAX_ASSET_BYTES).contains(&body.byte_length)
             || !(60..=2592000).contains(&body.ttl_seconds)
             || !valid_media_type(&body.media_type)
@@ -244,8 +254,26 @@ impl Assets {
         bytes: Bytes,
         owner: Uuid,
     ) -> Result<Value> {
-        self.put_chunk_inner(who, id, ordinal, bytes, Some(owner))
+        self.put_chunk_inner(who, id, ordinal, bytes, Some(WriteOwner::Media(owner)))
             .await
+    }
+    pub(crate) async fn put_runtime_chunk(
+        &self,
+        who: &Identity,
+        id: Uuid,
+        ordinal: i32,
+        bytes: Bytes,
+        batch: Uuid,
+        claim: Vec<u8>,
+    ) -> Result<Value> {
+        self.put_chunk_inner(
+            who,
+            id,
+            ordinal,
+            bytes,
+            Some(WriteOwner::Runtime { batch, claim }),
+        )
+        .await
     }
     async fn put_chunk_inner(
         &self,
@@ -253,7 +281,7 @@ impl Assets {
         id: Uuid,
         ordinal: i32,
         bytes: Bytes,
-        owner: Option<Uuid>,
+        owner: Option<WriteOwner>,
     ) -> Result<Value> {
         if bytes.is_empty() || bytes.len() > CHUNK_BYTES {
             return Err(Error::Invalid("invalid asset chunk size"));
@@ -262,7 +290,7 @@ impl Assets {
         let mut tx = self.pool.begin().await?;
         authorize(&mut tx, who).await?;
         let a = asset(&mut tx, who, id).await?;
-        write_authority(&mut tx, who, &a, owner).await?;
+        write_authority(&mut tx, who, &a, owner.as_ref()).await?;
         writable(&a)?;
         if ordinal < 0
             || ordinal >= a.chunk_count
@@ -308,9 +336,12 @@ impl Assets {
         let mut tx = self.pool.begin().await?;
         authorize(&mut tx, who).await?;
         let current = asset(&mut tx, who, id).await?;
-        write_authority(&mut tx, who, &current, owner).await?;
+        write_authority(&mut tx, who, &current, owner.as_ref()).await?;
         writable(&current)?;
         sqlx::query("UPDATE asset_chunks SET state='stored' WHERE tenant_id=$1 AND asset_id=$2 AND ordinal=$3").bind(who.tenant_id).bind(id).bind(ordinal).execute(&mut *tx).await?;
+        if matches!(owner, Some(WriteOwner::Runtime { .. })) {
+            write_authority(&mut tx, who, &current, owner.as_ref()).await?;
+        }
         tx.commit().await?;
         Ok(
             json!({"asset_id":id,"ordinal":ordinal,"state":"stored","sha256":governance::hex(&hash)}),
@@ -356,18 +387,39 @@ impl Assets {
         id: Uuid,
         owner: Uuid,
     ) -> Result<Value> {
-        self.complete_inner(who, id, Some(owner)).await
+        self.complete_inner(who, id, Some(WriteOwner::Media(owner)))
+            .await
     }
-    async fn complete_inner(&self, who: &Identity, id: Uuid, owner: Option<Uuid>) -> Result<Value> {
+    pub(crate) async fn complete_runtime(
+        &self,
+        who: &Identity,
+        id: Uuid,
+        batch: Uuid,
+        claim: Vec<u8>,
+    ) -> Result<Value> {
+        self.complete_inner(who, id, Some(WriteOwner::Runtime { batch, claim }))
+            .await
+    }
+    async fn complete_inner(
+        &self,
+        who: &Identity,
+        id: Uuid,
+        owner: Option<WriteOwner>,
+    ) -> Result<Value> {
         let mut tx = self.pool.begin().await?;
         authorize(&mut tx, who).await?;
         let a = asset(&mut tx, who, id).await?;
-        write_authority(&mut tx, who, &a, owner).await?;
-        if a.state == "available" && a.expires_at > Utc::now() {
+        write_authority(&mut tx, who, &a, owner.as_ref()).await?;
+        let runtime = matches!(owner, Some(WriteOwner::Runtime { .. }));
+        if !runtime && a.state == "available" && a.expires_at > Utc::now() {
             tx.commit().await?;
             return Ok(view(&a));
         }
-        writable(&a)?;
+        if runtime && a.state == "available" {
+            readable(&a)?;
+        } else {
+            writable(&a)?;
+        }
         let chunks: Vec<Chunk> = sqlx::query_as(
             "SELECT * FROM asset_chunks WHERE tenant_id=$1 AND asset_id=$2 ORDER BY ordinal",
         )
@@ -400,7 +452,7 @@ impl Assets {
         let mut tx = self.pool.begin().await?;
         authorize(&mut tx, who).await?;
         let a = asset(&mut tx, who, id).await?;
-        write_authority(&mut tx, who, &a, owner).await?;
+        write_authority(&mut tx, who, &a, owner.as_ref()).await?;
         if a.state == "available" && a.expires_at > Utc::now() {
             tx.commit().await?;
             return Ok(view(&a));
@@ -419,6 +471,9 @@ impl Assets {
             json!({"bytes":a.byte_length,"content_safety":"not_evaluated"}),
         )
         .await?;
+        if runtime {
+            write_authority(&mut tx, who, &a, owner.as_ref()).await?;
+        }
         tx.commit().await?;
         Ok(view(&a))
     }
@@ -455,6 +510,19 @@ impl Assets {
         ordinal: i32,
     ) -> Result<Bytes> {
         let c:Chunk=sqlx::query_as("SELECT c.* FROM asset_chunks c JOIN assets a ON a.tenant_id=c.tenant_id AND a.id=c.asset_id WHERE a.tenant_id=$1 AND a.key_id=$2 AND a.id=$3 AND a.kind='output' AND a.state='available' AND a.expires_at>clock_timestamp() AND c.ordinal=$4").bind(who.tenant_id).bind(who.key_id).bind(id).bind(ordinal).fetch_optional(&self.pool).await?.ok_or(Error::NotFound)?;
+        self.read_chunk(&c).await
+    }
+    // Private binary source reader; its caller must enforce its scanner,
+    // isolated-review or current-delivery authority before and after I/O.
+    pub(crate) async fn quarantined_runtime_chunk(
+        &self,
+        who: &Identity,
+        id: Uuid,
+        ordinal: i32,
+    ) -> Result<Bytes> {
+        let c: Chunk = sqlx::query_as("SELECT c.* FROM asset_chunks c JOIN assets a ON a.tenant_id=c.tenant_id AND a.id=c.asset_id JOIN runtime_artifacts r ON r.tenant_id=a.tenant_id AND r.asset_id=a.id JOIN runtime_artifact_batches b ON b.tenant_id=r.tenant_id AND b.id=r.batch_id WHERE a.tenant_id=$1 AND a.key_id=$2 AND a.id=$3 AND a.kind='runtime_output' AND a.state='available' AND a.expires_at>clock_timestamp() AND r.key_id=a.key_id AND r.sha256=a.sha256 AND r.byte_length=a.byte_length AND a.source_operation_id=b.input_operation_id AND b.state='quarantined' AND b.expires_at>clock_timestamp() AND c.ordinal=$4")
+            .bind(who.tenant_id).bind(who.key_id).bind(id).bind(ordinal)
+            .fetch_optional(&self.pool).await?.ok_or(Error::NotFound)?;
         self.read_chunk(&c).await
     }
     pub async fn delete(&self, who: &Identity, id: Uuid) -> Result<Value> {
@@ -528,15 +596,25 @@ async fn write_authority(
     tx: &mut Tx<'_>,
     who: &Identity,
     a: &Asset,
-    owner: Option<Uuid>,
+    owner: Option<&WriteOwner>,
 ) -> Result<()> {
     match owner {
         None => input_only(a),
-        Some(token) if a.kind == "output" => {
-            crate::outputs::write_authority(tx, who, a.id, token).await
+        Some(WriteOwner::Media(token)) if a.kind == "output" => {
+            crate::outputs::write_authority(tx, who, a.id, *token).await
+        }
+        Some(WriteOwner::Runtime { batch, claim }) if a.kind == "runtime_output" => {
+            crate::runtime_artifacts::write_authority(tx, who, a.id, *batch, claim).await
         }
         Some(_) => Err(Error::NotFound),
     }
+}
+pub(crate) async fn tombstone_runtime(tx: &mut Tx<'_>, who: &Identity, id: Uuid) -> Result<()> {
+    let a = asset(tx, who, id).await?;
+    if a.kind != "runtime_output" {
+        return Err(Error::NotFound);
+    }
+    tombstone(tx, &a).await
 }
 pub(crate) async fn tombstone_output(tx: &mut Tx<'_>, who: &Identity, id: Uuid) -> Result<()> {
     let a = asset(tx, who, id).await?;

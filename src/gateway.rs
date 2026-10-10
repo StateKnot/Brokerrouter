@@ -744,7 +744,7 @@ impl Gateway {
                 let value = self
                     .result_inner(&who, row.id, row.guardrail_evaluation_id, true)
                     .await?;
-                let events = replay_stream(&value)?;
+                let events = replay_stream(&value, request.include_stream_usage())?;
                 let (sender, receiver) = mpsc::channel(STREAM_QUEUE_FRAMES);
                 let session = StreamSession::new(row.id, receiver, delivery_permit, lifetime);
                 let delivery = StreamDelivery {
@@ -1011,6 +1011,11 @@ impl Gateway {
             aggregate
                 .push(&mut chunk, &execution.request.model)
                 .map_err(|_| "invalid_or_incomplete_stream")?;
+            if !execution.request.include_stream_usage()
+                && chunk["choices"].as_array().is_some_and(Vec::is_empty)
+            {
+                continue;
+            }
             let encoded =
                 serde_json::to_string(&chunk).map_err(|_| "invalid_or_incomplete_stream")?;
             delivery.send_live(sse_data(&encoded)).await;
@@ -1430,7 +1435,7 @@ fn validate_stream_usage(usage: &Value) -> Result<()> {
     Ok(())
 }
 
-fn replay_stream(completion: &Value) -> Result<Vec<bytes::Bytes>> {
+fn replay_stream(completion: &Value, include_usage: bool) -> Result<Vec<bytes::Bytes>> {
     let choices = completion["choices"]
         .as_array()
         .filter(|choices| choices.len() == 1)
@@ -1465,14 +1470,15 @@ fn replay_stream(completion: &Value) -> Result<Vec<bytes::Bytes>> {
     content["choices"] =
         json!([{"index":0,"delta":delta,"finish_reason":choice["finish_reason"],"logprobs":null}]);
     content["usage"] = Value::Null;
-    let mut usage = base;
-    usage["choices"] = json!([]);
-    usage["usage"] = completion["usage"].clone();
-    Ok(vec![
-        sse_data(&content.to_string()),
-        sse_data(&usage.to_string()),
-        sse_data("[DONE]"),
-    ])
+    let mut events = vec![sse_data(&content.to_string())];
+    if include_usage {
+        let mut usage = base;
+        usage["choices"] = json!([]);
+        usage["usage"] = completion["usage"].clone();
+        events.push(sse_data(&usage.to_string()));
+    }
+    events.push(sse_data("[DONE]"));
+    Ok(events)
 }
 
 #[cfg(test)]

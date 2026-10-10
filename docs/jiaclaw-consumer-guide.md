@@ -107,6 +107,8 @@ curl --no-buffer --fail-with-body http://127.0.0.1:8080/v1/chat/completions \
 
 `stream:true` 只路由到显式 `supports_streaming=true` 的端点。网关固定向上游请求最终 usage，逐事件校验并把供应商模型名改回逻辑模型名。总流量上限 4 MiB、最多 100000 个事件；缺少 role、finish reason、usage 或 `[DONE]`，非法 JSON、断流和越界均进入 `submission_unknown`。
 
+流式请求支持 `stream_options` 为 `null` 或仅含布尔 `include_usage` 的对象。`include_usage:true` 在实时响应和成功重放中返回一个 `choices:[]` 的最终 usage 事件；`false` 或空对象不向客户端发送该事件。省略该字段或传 `null` 保留网关原有的返回 usage 行为。无论客户端是否请求 usage，网关都向上游请求并验证 usage，再持久结算；隐藏客户端 usage 不会免除账本校验。非流式请求携带该字段、错误类型或未支持的选项均在出网与预留前返回 400。usage 事件形状参照 [OpenAI Chat Completions 契约](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)。
+
 网关不会因下游断开而取消已经提交的供应商调用：后台继续读取、验证、加密保存并按实际 usage 结算人民币。只有结果与账本在同一事务持久化成功后才向在线客户端发送 `[DONE]`。相同幂等键重放成功流时读取加密结果并合成标准 SSE，不再次调用供应商。流开始后的错误以 SSE `error` 数据结束且不发送 `[DONE]`；消费者应使用 `x-brokerrouter-request-id` 查询状态。
 
 流式 token 不能在发送后追回，所以匹配 `post` 输出护栏的请求返回 `streaming_requires_unbuffered_output`，要求改用非流式，让完整输出先经过护栏和真人审批。`pre` 护栏仍可在任何上游数据发送前暂停。

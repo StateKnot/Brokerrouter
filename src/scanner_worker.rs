@@ -40,7 +40,13 @@ struct Active {
 struct Assignment {
     attempt_id: Uuid,
     scan_id: Uuid,
-    job_id: Uuid,
+    job_id: Option<Uuid>,
+    source: Option<String>,
+    runtime_asset_id: Option<Uuid>,
+    input_operation_id: Option<Uuid>,
+    batch_id: Option<Uuid>,
+    ordinal: Option<i32>,
+    producer_revision: Option<String>,
     asset_id: Uuid,
     sha256: String,
     byte_length: u64,
@@ -49,6 +55,44 @@ struct Assignment {
     engine_revision: String,
     state: String,
 }
+impl Assignment {
+    fn valid_source(&self) -> bool {
+        if self.job_id.is_some() {
+            self.source.is_none()
+                && self.runtime_asset_id.is_none()
+                && self.input_operation_id.is_none()
+                && self.batch_id.is_none()
+                && self.ordinal.is_none()
+                && self.producer_revision.is_none()
+        } else {
+            self.source.as_deref() == Some("runtime_artifact")
+                && self.runtime_asset_id == Some(self.asset_id)
+                && self.input_operation_id.is_some()
+                && self.batch_id.is_some()
+                && self.ordinal.is_some_and(|n| (0..8).contains(&n))
+                && self
+                    .producer_revision
+                    .as_deref()
+                    .is_some_and(scanner_engine::hash_text)
+        }
+    }
+    fn evidence(&self, manifest: &Manifest, steps: Value) -> Value {
+        // Exact legacy evidence shape/hash remains unchanged. Native assignments
+        // retain real source facts instead of inventing a media-job identity.
+        let mut v = json!({"contract":scanner_engine::CONTRACT,"manifest":manifest,"engine_revision":self.engine_revision,"attempt_id":self.attempt_id,"scan_id":self.scan_id,"asset_id":self.asset_id,"sha256":self.sha256,"byte_length":self.byte_length,"steps":steps,"content":"unknown","semantic_detector":"not_run"});
+        if let Some(job) = self.job_id {
+            v["job_id"] = json!(job);
+        } else {
+            v["source"] = json!("runtime_artifact");
+            v["runtime_asset_id"] = json!(self.runtime_asset_id);
+            v["input_operation_id"] = json!(self.input_operation_id);
+            v["batch_id"] = json!(self.batch_id);
+            v["ordinal"] = json!(self.ordinal);
+            v["producer_revision"] = json!(self.producer_revision);
+        }
+        v
+    }
+}
 pub struct Worker {
     config: Config,
     engine: Engine,
@@ -56,6 +100,18 @@ pub struct Worker {
     token: String,
     _lock: File,
 }
+
+pub(crate) fn http_client() -> Result<Client> {
+    Ok(
+        crate::tls_roots::with_ca_file(Client::builder(), "BROKERROUTER_SCANNER_CA_FILE")?
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(45))
+            .build()?,
+    )
+}
+
 impl Worker {
     pub fn new(config: Config, token: String) -> Result<Self> {
         config.manifest.validate()?;
@@ -134,12 +190,7 @@ impl Worker {
             docker_config,
             manifest: config.manifest.clone(),
         };
-        let client = Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(45))
-            .build()?;
+        let client = http_client()?;
         let worker = Self {
             config,
             engine,
@@ -213,7 +264,8 @@ impl Worker {
         }
         let a: Assignment = serde_json::from_value(v).context("invalid scan assignment")?;
         ensure!(
-            a.engine_revision == self.config.manifest.revision()?
+            a.valid_source()
+                && a.engine_revision == self.config.manifest.revision()?
                 && scanner_engine::hash_text(&a.sha256)
                 && (1..=scanner_engine::MAX_BYTES).contains(&a.byte_length)
                 && a.chunk_count == a.byte_length.div_ceil(CHUNK)
@@ -263,7 +315,7 @@ impl Worker {
                 }
             }
             let finding = scanner_engine::finding(&steps)?;
-            let evidence = json!({"contract":scanner_engine::CONTRACT,"manifest":self.config.manifest,"engine_revision":a.engine_revision,"attempt_id":a.attempt_id,"scan_id":a.scan_id,"job_id":a.job_id,"asset_id":a.asset_id,"sha256":a.sha256,"byte_length":a.byte_length,"steps":finding.evidence,"content":"unknown","semantic_detector":"not_run"});
+            let evidence = a.evidence(&self.config.manifest, finding.evidence);
             let evidence_bytes = serde_json::to_vec(&evidence)?;
             let hash = scanner_engine::hex_hash(&evidence_bytes);
             persist_bytes(
@@ -512,5 +564,60 @@ pub async fn run(config: Config, token: String, once: bool) -> Result<()> {
             }
         }
         tokio::select! { _ = shutdown.cancelled() => return Ok(()), _ = tokio::time::sleep(Duration::from_secs(15)) => {} }
+    }
+}
+
+#[cfg(test)]
+mod source_contract_tests {
+    use super::*;
+    fn assignment() -> Assignment {
+        serde_json::from_value(json!({"attempt_id":Uuid::new_v4(),"scan_id":Uuid::new_v4(),
+            "job_id":Uuid::new_v4(),"asset_id":Uuid::new_v4(),"sha256":"11".repeat(32),
+            "byte_length":17,"chunk_count":1,"profile_version":1,"engine_revision":"22".repeat(32),
+            "state":"scanning"}))
+        .unwrap()
+    }
+    fn manifest() -> Manifest {
+        Manifest {
+            contract: scanner_engine::CONTRACT.into(),
+            image: format!("sha256:{}", "33".repeat(32)),
+            worker_sha256: "44".repeat(32),
+            issued_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+        }
+    }
+    #[test]
+    fn legacy_evidence_remains_exact_and_native_has_no_fake_job() {
+        let mut a = assignment();
+        assert!(a.valid_source());
+        let m = manifest();
+        let steps = json!([{"step":"contract_fixture"}]);
+        let old = json!({"contract":scanner_engine::CONTRACT,"manifest":m,"engine_revision":a.engine_revision,
+            "attempt_id":a.attempt_id,"scan_id":a.scan_id,"job_id":a.job_id,"asset_id":a.asset_id,
+            "sha256":a.sha256,"byte_length":a.byte_length,"steps":steps,"content":"unknown","semantic_detector":"not_run"});
+        assert_eq!(
+            serde_json::to_vec(&a.evidence(&m, steps.clone())).unwrap(),
+            serde_json::to_vec(&old).unwrap()
+        );
+        a.job_id = None;
+        a.source = Some("runtime_artifact".into());
+        a.runtime_asset_id = Some(a.asset_id);
+        a.input_operation_id = Some(Uuid::new_v4());
+        a.batch_id = Some(Uuid::new_v4());
+        a.ordinal = Some(0);
+        a.producer_revision = Some("55".repeat(32));
+        assert!(a.valid_source());
+        let evidence = a.evidence(&m, steps);
+        assert!(evidence.get("job_id").is_none());
+        assert_eq!(
+            evidence["input_operation_id"],
+            a.input_operation_id.unwrap().to_string()
+        );
+        assert_eq!(evidence["producer_revision"], "55".repeat(32));
+        a.job_id = Some(Uuid::new_v4());
+        assert!(!a.valid_source());
+        a.job_id = None;
+        a.runtime_asset_id = Some(Uuid::new_v4());
+        assert!(!a.valid_source());
     }
 }

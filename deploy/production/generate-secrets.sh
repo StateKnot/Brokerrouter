@@ -32,21 +32,32 @@ printf '%s' "$operator_password" >"$secret_dir/postgres-operator-password"
 
 openssl req -x509 -newkey rsa:3072 -sha256 -days 825 -nodes \
     -subj '/CN=Brokerrouter PostgreSQL Internal CA' \
+    -addext 'basicConstraints=critical,CA:TRUE' \
+    -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+    -addext 'subjectKeyIdentifier=hash' \
+    -addext 'authorityKeyIdentifier=keyid:always' \
     -keyout "$secret_dir/pg-ca.key" \
     -out "$secret_dir/pg-ca.crt"
 openssl req -newkey rsa:3072 -sha256 -nodes \
     -subj '/CN=postgres' \
-    -addext 'subjectAltName=DNS:postgres' \
     -keyout "$secret_dir/pg-server.key" \
     -out "$secret_dir/pg-server.csr"
+cat >"$secret_dir/pg-server.ext" <<EOF
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid,issuer
+subjectAltName=DNS:postgres
+EOF
 openssl x509 -req -sha256 -days 397 \
     -in "$secret_dir/pg-server.csr" \
     -CA "$secret_dir/pg-ca.crt" \
     -CAkey "$secret_dir/pg-ca.key" \
     -CAcreateserial \
-    -copy_extensions copy \
+    -extfile "$secret_dir/pg-server.ext" \
     -out "$secret_dir/pg-server.crt"
-rm -f "$secret_dir/pg-server.csr" "$secret_dir/pg-ca.srl" "$secret_dir/pg-ca.key"
+rm -f "$secret_dir/pg-server.csr" "$secret_dir/pg-server.ext" "$secret_dir/pg-ca.srl" "$secret_dir/pg-ca.key"
 
 cat >"$secret_dir/migration.env" <<EOF
 DATABASE_URL='postgres://brokerrouter_migration:${migration_password}@postgres:5432/brokerrouter?sslmode=verify-full&sslrootcert=/run/secrets/pg_ca'

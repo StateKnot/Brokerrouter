@@ -6,6 +6,10 @@ import type { Review } from "./approval-contracts";
 import type { Denied } from "./Management";
 import { timestamp } from "./contracts";
 import { time } from "./format";
+import {
+  runtimeArtifactOutput,
+  sameRuntimeArtifact,
+} from "./runtime-artifact-contracts";
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
 export const mediaManifest = z
   .object({
@@ -13,15 +17,18 @@ export const mediaManifest = z
     session_id: z.uuid(),
     approval_id: z.uuid(),
     expires_at: timestamp,
-    output: z.object({
-      contract: z.literal("current-turn-output-v1"),
-      sha256: hash,
-      byte_length: z.number().int().min(1).max(67108864),
-      chunk_count: z.number().int().min(1).max(16),
-      chunk_bytes: z.literal(4194304),
-      expires_at: timestamp,
-      scope: z.literal("current_turn_only"),
-    }),
+    output: z.union([
+      z.object({
+        contract: z.literal("current-turn-output-v1"),
+        sha256: hash,
+        byte_length: z.number().int().min(1).max(67108864),
+        chunk_count: z.number().int().min(1).max(16),
+        chunk_bytes: z.literal(4194304),
+        expires_at: timestamp,
+        scope: z.literal("current_turn_only"),
+      }),
+      runtimeArtifactOutput,
+    ]),
   })
   .refine(
     (v) =>
@@ -47,7 +54,7 @@ export function previewUrl(
   }
 }
 type Props = {
-  approvalId: string;
+  review: Review;
   previewOrigin: string | null;
   disabled: boolean;
   completed: boolean;
@@ -55,13 +62,14 @@ type Props = {
   denied: Denied;
 };
 export default function MediaReview({
-  approvalId,
+  review,
   previewOrigin,
   disabled,
   completed,
   onComplete,
   denied,
 }: Props) {
+  const approvalId = review.approval.id;
   const [manifest, setManifest] = useState<Manifest | null>(null),
     [status, setStatus] = useState(""),
     [error, setError] = useState<unknown>(null),
@@ -123,6 +131,14 @@ export default function MediaReview({
       if (
         m.approval_id !== approvalId ||
         m.session_id !== attempt.current ||
+        (review.approval.scope === "current_artifact_in_original_turn"
+          ? review.stage !== "artifact" ||
+            !sameRuntimeArtifact(m.output, review.approval.summary.output) ||
+            m.output.contract !== "runtime-artifact-mp4-v1" ||
+            m.output.model_id !== review.model_id ||
+            m.output.tool_name !== review.tool_name
+          : review.stage !== "media_output" ||
+            m.output.contract !== "current-turn-output-v1") ||
         Date.parse(m.expires_at) <= Date.now() ||
         Date.parse(m.expires_at) > Date.now() + 300_000
       )
@@ -239,10 +255,19 @@ export default function MediaReview({
       if (c.signal.aborted) return;
       if (
         r.approval.id !== approvalId ||
+        r.approval.operation_id !== review.approval.operation_id ||
+        r.approval.turn_id !== review.approval.turn_id ||
+        r.approval.scope !== review.approval.scope ||
         r.review_id !== manifest.session_id ||
+        r.operation_sha256 !== review.operation_sha256 ||
+        !r.can_continue ||
         r.media?.sha256 !== manifest.output.sha256 ||
         r.media.byte_length !== manifest.output.byte_length ||
-        r.stage !== "media_output"
+        r.stage !== review.stage ||
+        (manifest.output.contract === "runtime-artifact-mp4-v1"
+          ? !("source" in r.media) ||
+            !sameRuntimeArtifact(r.media.output, manifest.output)
+          : "source" in r.media)
       )
         throw new ApiError(502, "invalid_response");
       onComplete(r);
@@ -283,6 +308,13 @@ export default function MediaReview({
             {manifest.output.byte_length} 字节 · 审阅截至{" "}
             {time(manifest.expires_at, "Asia/Shanghai")}
           </p>
+          {manifest.output.contract === "runtime-artifact-mp4-v1" && (
+            <p>
+              产物 <code>{manifest.output.asset_id}</code> · 原工具调用{" "}
+              <code>{manifest.output.input_operation_id}</code> · 扫描证据{" "}
+              <code>{manifest.output.scan_id}</code>
+            </p>
+          )}
           <iframe
             ref={frame}
             src={url!}

@@ -365,4 +365,137 @@ GRANT SELECT ON mcp_servers,mcp_discovery_snapshots,mcp_discovered_tools,mcp_key
     TO brokerrouter_mcp_worker;
 GRANT INSERT ON audit_events TO brokerrouter_mcp_catalog,brokerrouter_mcp_client,brokerrouter_mcp_server,brokerrouter_mcp_worker;
 GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_mcp_catalog,brokerrouter_mcp_client,brokerrouter_mcp_server,brokerrouter_mcp_worker;
+-- Runtime text is a known execution fact. Human control can approve its output
+-- operation but cannot read, replace or delete the separately held body.
+GRANT SELECT,INSERT ON runtime_tool_results TO brokerrouter_runtime;
+GRANT UPDATE(result_ciphertext) ON runtime_tool_results TO brokerrouter_runtime;
+GRANT SELECT,INSERT ON runtime_final_publications TO brokerrouter_runtime;
+GRANT UPDATE(result_ciphertext) ON runtime_final_publications TO brokerrouter_runtime;
+GRANT SELECT ON runtime_final_publication_review_facts
+    TO brokerrouter_runtime,brokerrouter_approvals,brokerrouter_governance_control;
+-- Append to deploy/permissions.sql after 0030. Separate storage purpose; never
+-- inherit runtime/input/media/scanner/delivery/human roles.
+DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='brokerrouter_runtime_assets') THEN
+    CREATE ROLE brokerrouter_runtime_assets NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+END IF; END $$;
+REVOKE brokerrouter_runtime,brokerrouter_assets,brokerrouter_media_outputs,
+    brokerrouter_output_scan,brokerrouter_output_delivery,brokerrouter_media_review,
+    brokerrouter_approvals,brokerrouter_governance_control FROM brokerrouter_runtime_assets;
+GRANT USAGE ON SCHEMA public TO brokerrouter_runtime_assets;
+GRANT SELECT ON _sqlx_migrations,governance_users,runtime_bindings,governance_turns,
+    governance_operations,models,key_models,runtime_artifact_batches,runtime_artifacts,
+    assets,asset_chunks TO brokerrouter_runtime_assets;
+GRANT SELECT(id,active,asset_used_bytes,asset_quota_bytes) ON tenants TO brokerrouter_runtime_assets;
+GRANT SELECT(tenant_id,id,key_hash,revoked_at,expires_at,asset_used_bytes,asset_quota_bytes)
+    ON virtual_keys TO brokerrouter_runtime_assets;
+GRANT UPDATE(governance_lock,asset_used_bytes) ON tenants TO brokerrouter_runtime_assets;
+GRANT UPDATE(asset_used_bytes) ON virtual_keys TO brokerrouter_runtime_assets;
+GRANT INSERT ON runtime_artifact_batches,runtime_artifacts,assets,asset_chunks,
+    governance_events,audit_events TO brokerrouter_runtime_assets;
+GRANT UPDATE(state,reserved_bytes,manifest_hash,receipt_hash,evidence_ref)
+    ON runtime_artifact_batches TO brokerrouter_runtime_assets;
+GRANT UPDATE(state,receipt_hash,receipt_ciphertext,payload_ciphertext)
+    ON governance_operations TO brokerrouter_runtime_assets;
+GRANT UPDATE(event_clock) ON governance_turns TO brokerrouter_runtime_assets;
+GRANT UPDATE(state,completed_at,deleted_at,gc_after,gc_checked_at,gc_cursor,sha256)
+    ON assets TO brokerrouter_runtime_assets;
+GRANT UPDATE(state) ON asset_chunks TO brokerrouter_runtime_assets;
+GRANT USAGE ON SEQUENCE audit_events_id_seq TO brokerrouter_runtime_assets;
+DROP POLICY IF EXISTS brokerrouter_runtime_asset_storage ON assets;
+CREATE POLICY brokerrouter_runtime_asset_storage ON assets TO brokerrouter_runtime_assets
+    USING(kind='runtime_output') WITH CHECK(kind='runtime_output');
+DROP POLICY IF EXISTS brokerrouter_runtime_asset_purpose ON assets;
+CREATE POLICY brokerrouter_runtime_asset_purpose ON assets AS RESTRICTIVE TO brokerrouter_runtime_assets
+    USING(kind='runtime_output') WITH CHECK(kind='runtime_output');
+DROP POLICY IF EXISTS brokerrouter_runtime_chunk_storage ON asset_chunks;
+CREATE POLICY brokerrouter_runtime_chunk_storage ON asset_chunks TO brokerrouter_runtime_assets
+    USING(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id AND a.id=asset_chunks.asset_id AND a.kind='runtime_output'))
+    WITH CHECK(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id AND a.id=asset_chunks.asset_id AND a.kind='runtime_output'));
+DROP POLICY IF EXISTS brokerrouter_runtime_chunk_purpose ON asset_chunks;
+CREATE POLICY brokerrouter_runtime_chunk_purpose ON asset_chunks AS RESTRICTIVE TO brokerrouter_runtime_assets
+    USING(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id AND a.id=asset_chunks.asset_id AND a.kind='runtime_output'))
+    WITH CHECK(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id AND a.id=asset_chunks.asset_id AND a.kind='runtime_output'));
+GRANT SELECT ON runtime_artifact_batches,runtime_artifacts TO brokerrouter_operator;
+
+-- Exact native artifact scan/review/delivery authority after 0032.
+-- No role inheritance or broadening of legacy media/input writers.
+GRANT SELECT ON runtime_artifacts,runtime_artifact_batches
+    TO brokerrouter_output_scan,brokerrouter_output_delivery,
+       brokerrouter_media_review,brokerrouter_approvals,brokerrouter_governance_control;
+GRANT SELECT(tenant_id,id,key_id,turn_id,model_id,tool_name,stage,state,
+             payload_hash,claim_hash,receipt_hash)
+    ON governance_operations TO brokerrouter_output_scan;
+GRANT SELECT ON runtime_artifact_deliveries,runtime_artifact_grants
+    TO brokerrouter_output_delivery,brokerrouter_media_review,
+       brokerrouter_approvals,brokerrouter_governance_control,brokerrouter_operator;
+GRANT INSERT ON runtime_artifact_deliveries TO brokerrouter_output_delivery;
+GRANT INSERT ON runtime_artifact_grants TO brokerrouter_approvals,brokerrouter_governance_control;
+GRANT SELECT ON approval_reviews,media_review_sessions,media_review_completions
+    TO brokerrouter_governance_control;
+-- No INSERT/UPDATE/DELETE grants for storage/scanner/runtime/bff/operator.
+-- Native grant rows are additionally protected by exact-source/review triggers.
+
+-- The existing read roles retain legacy output reads. Only scanner, independent
+-- binary delivery and isolated reviewer gain runtime candidate object metadata.
+-- Human decision purposes see facts, never encrypted chunk rows/S3 bytes.
+DROP POLICY IF EXISTS brokerrouter_scan_asset_read ON assets;
+CREATE POLICY brokerrouter_scan_asset_read ON assets FOR SELECT TO brokerrouter_output_scan
+    USING(kind IN('output','runtime_output'));
+DROP POLICY IF EXISTS brokerrouter_scan_chunk_read ON asset_chunks;
+CREATE POLICY brokerrouter_scan_chunk_read ON asset_chunks FOR SELECT TO brokerrouter_output_scan
+    USING(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id
+        AND a.id=asset_chunks.asset_id AND a.kind IN('output','runtime_output')));
+DROP POLICY IF EXISTS brokerrouter_delivery_output_read ON assets;
+CREATE POLICY brokerrouter_delivery_output_read ON assets FOR SELECT
+    TO brokerrouter_output_delivery,brokerrouter_governance_control
+    USING(kind IN('output','runtime_output'));
+DROP POLICY IF EXISTS brokerrouter_delivery_output_chunk_read ON asset_chunks;
+CREATE POLICY brokerrouter_delivery_output_chunk_read ON asset_chunks FOR SELECT TO brokerrouter_output_delivery
+    USING(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id
+        AND a.id=asset_chunks.asset_id AND a.kind IN('output','runtime_output')));
+DROP POLICY IF EXISTS brokerrouter_review_output_read ON assets;
+CREATE POLICY brokerrouter_review_output_read ON assets FOR SELECT
+    TO brokerrouter_media_review,brokerrouter_approvals USING(kind IN('output','runtime_output'));
+DROP POLICY IF EXISTS brokerrouter_review_chunk_read ON asset_chunks;
+CREATE POLICY brokerrouter_review_chunk_read ON asset_chunks FOR SELECT TO brokerrouter_media_review
+    USING(EXISTS(SELECT 1 FROM assets a WHERE a.tenant_id=asset_chunks.tenant_id
+        AND a.id=asset_chunks.asset_id AND a.kind IN('output','runtime_output')));
+
+-- Required actual SET ROLE negatives: runtime/input/media-writer/BFF/approvals
+-- must not read runtime candidate chunks; runtime-assets cannot SELECT input,
+-- INSERT scans/deliveries/grants or UPDATE approved state. Scanner cannot mint
+-- grant/update source; delivery cannot mint grant/write asset; reviewer cannot
+-- mint grant/write source/decide; approved control/approvals cannot read chunks.
+-- Original input/media Assets restrictive policies are unchanged.
+
+
+-- Coupled native text/artifact publication after 0033. Runtime can observe
+-- immutable source facts and evaluate exact file policies, never read chunk
+-- rows, write producer bytes or create human grants.
+GRANT SELECT ON runtime_artifact_source_facts,runtime_tool_result_review_facts,
+    runtime_output_set_freezes TO brokerrouter_runtime,brokerrouter_operator,
+    brokerrouter_approvals,brokerrouter_governance_control;
+GRANT SELECT ON runtime_output_set_freezes TO brokerrouter_runtime_assets;
+GRANT SELECT ON runtime_artifacts,runtime_artifact_batches,output_scans,
+    output_scan_profiles,runtime_artifact_deliveries,runtime_artifact_grants
+    TO brokerrouter_runtime;
+GRANT INSERT ON runtime_artifact_deliveries TO brokerrouter_runtime;
+GRANT SELECT(tenant_id,operation_id,guardrail_id,version,state)
+    ON guardrail_evaluations TO brokerrouter_approvals;
+
+GRANT SELECT ON runtime_artifact_asset_facts TO brokerrouter_runtime,brokerrouter_operator,
+    brokerrouter_output_delivery,brokerrouter_media_review,brokerrouter_approvals,
+    brokerrouter_governance_control;
+GRANT UPDATE(governance_lock) ON tenants TO brokerrouter_runtime;
+GRANT EXECUTE ON FUNCTION runtime_artifact_set_digest(jsonb),
+    runtime_artifact_operation_files(uuid,uuid,uuid),runtime_artifact_turn_files(uuid,uuid,uuid)
+    TO brokerrouter_runtime,brokerrouter_operator,brokerrouter_approvals,brokerrouter_governance_control;
+GRANT SELECT(governance_lock) ON tenants TO brokerrouter_runtime_assets;
+GRANT SELECT(tenant_id,key_id,turn_id,input_operation_id) ON runtime_output_set_freezes
+    TO brokerrouter_mcp_server,brokerrouter_mcp_worker;
+-- Preserve legacy input/media metadata, while native capture facts are read
+-- only through the narrow projection above. Runtime gets no chunk authority.
+DROP POLICY IF EXISTS brokerrouter_runtime_native_metadata ON assets;
+CREATE POLICY brokerrouter_runtime_native_metadata ON assets AS RESTRICTIVE
+    FOR SELECT TO brokerrouter_runtime USING(kind IN ('input','output'));
 COMMIT;

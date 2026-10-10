@@ -93,6 +93,7 @@ pub fn validate(mut body: Value, operation: &'static str) -> Result<ValidatedReq
             "top_p",
             "stop",
             "stream",
+            "stream_options",
             "n",
             "tools",
             "tool_choice",
@@ -109,6 +110,20 @@ pub fn validate(mut body: Value, operation: &'static str) -> Result<ValidatedReq
         })
         .transpose()?
         .unwrap_or(false);
+    if let Some(options) = body.get("stream_options") {
+        if !stream {
+            return Err(Error::Invalid("stream_options requires stream:true"));
+        }
+        if !options.is_null() {
+            fields(options, &["include_usage"])?;
+            if options
+                .get("include_usage")
+                .is_some_and(|value| !value.is_boolean())
+            {
+                return Err(Error::Invalid("include_usage must be a boolean"));
+            }
+        }
+    }
     integer(body.get("n"), 1, 1, 1)?;
     let max_output = integer(body.get("max_tokens"), 1024, 1, 1_000_000)?;
     for (name, min, max) in [("temperature", 0.0, 2.0), ("top_p", 0.0, 1.0)] {
@@ -272,6 +287,14 @@ fn normalize_tool_call_extensions(body: &mut Value) {
 }
 
 impl ValidatedRequest {
+    pub(crate) fn include_stream_usage(&self) -> bool {
+        // Preserve the gateway's original default when no options are supplied.
+        self.body
+            .get("stream_options")
+            .filter(|options| !options.is_null())
+            .is_none_or(|options| options["include_usage"] == true)
+    }
+
     fn basic_matches(&self, e: &Endpoint) -> bool {
         e.operation == self.operation
             && e.max_output_tokens >= self.max_output

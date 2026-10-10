@@ -1,0 +1,523 @@
+# Overlay: docker compose -f compose.production.yaml -f compose.control-plane.yaml ...
+# No IdP, S3 credentials, Agent signing keys or scanner Docker socket are invented here.
+x-control-app: &control-app
+  image: brokerrouter:${BROKERROUTER_IMAGE_TAG:?set BROKERROUTER_IMAGE_TAG}
+  restart: unless-stopped
+  entrypoint: [/usr/local/bin/control-plane-entrypoint]
+  volumes:
+    - ./deploy/production/control-plane-entrypoint.sh:/usr/local/bin/control-plane-entrypoint:ro
+  environment: &control-environment
+    BROKERROUTER_DATABASE_MAX_CONNECTIONS: "2"
+    RUST_LOG: brokerrouter=info
+  networks: [backend]
+  depends_on:
+    postgres:
+      condition: service_healthy
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  cap_add: [SETGID, SETUID]
+  read_only: true
+  tmpfs: ["/tmp:size=16m,mode=1777"]
+  init: true
+  pids_limit: 128
+  mem_limit: 256m
+  cpus: 0.5
+  stop_grace_period: 1m
+  logging:
+    driver: json-file
+    options: {max-size: 10m, max-file: "3"}
+
+x-edge: &edge
+  image: nginx@sha256:dc5069ad14f19660b141b21236140b91656bf89bbc3e2417c70ae650cd66104c
+  restart: unless-stopped
+  entrypoint: [nginx, -g, "daemon off;"]
+  networks: [backend]
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  # Nginx's root TLS master creates/chowns bounded /tmp buffers, then UID101 serves.
+  cap_add: [CHOWN, SETGID, SETUID]
+  read_only: true
+  tmpfs: ["/tmp:size=16m,mode=1777"]
+  pids_limit: 64
+  mem_limit: 128m
+  cpus: 0.5
+  stop_grace_period: 30s
+  logging:
+    driver: json-file
+    options: {max-size: 10m, max-file: "3"}
+
+services:
+  purpose-provisioner:
+    image: ${BROKERROUTER_PROVISIONER_IMAGE:?set immutable purpose provisioner image reference}
+    profiles: [ops]
+    restart: "no"
+    user: "${BROKERROUTER_DEPLOY_UID:?set Secret owner uid}:${BROKERROUTER_DEPLOY_GID:?set Secret owner gid}"
+    networks: [backend]
+    secrets:
+      - pg_ca
+      - purpose_admin_service
+      - purpose_admin_passfile
+    volumes:
+      - ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/purpose-logins:/run/purpose-secrets/purpose-logins:ro
+      - ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/.purpose-logins.lock:/run/purpose-secrets/.purpose-logins.lock:rw
+    tmpfs:
+      - /run/purpose-secrets:size=1m,mode=0700,uid=${BROKERROUTER_DEPLOY_UID:?set Secret owner uid},gid=${BROKERROUTER_DEPLOY_GID:?set Secret owner gid}
+      - /tmp:size=8m,mode=1777
+    depends_on:
+      postgres: {condition: service_healthy}
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    read_only: true
+    pids_limit: 32
+    mem_limit: 128m
+    cpus: 0.5
+  postgres:
+    command: [postgres, -c, config_file=/etc/postgresql/postgresql.conf, -c, max_connections=80]
+    mem_limit: 1g
+  gateway:
+    environment:
+      BROKERROUTER_DATABASE_MAX_CONNECTIONS: "20"
+  control:
+    <<: *control-app
+    command: [serve-control, --bind, "0.0.0.0:8081"]
+    environment:
+      <<: *control-environment
+      BROKERROUTER_COMPONENT: control
+    secrets:
+      - pg_ca
+      - source: purpose_control
+        target: purpose_env
+      - source: config_control
+        target: component_config
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --show-error, "http://127.0.0.1:8081/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+  assets:
+    <<: *control-app
+    command: [serve-assets, --bind, "0.0.0.0:8082"]
+    environment:
+      <<: *control-environment
+      BROKERROUTER_COMPONENT: assets
+      BROKERROUTER_ASSET_S3_CA_FILE: /run/secrets/asset_s3_ca
+    secrets:
+      - pg_ca
+      - source: purpose_assets
+        target: purpose_env
+      - source: config_assets
+        target: component_config
+      - asset_s3_ca
+    networks:
+      backend: {}
+      egress: {gw_priority: 1}
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --show-error, "http://127.0.0.1:8082/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+  media-api:
+    <<: *control-app
+    command: [serve-media, --bind, "0.0.0.0:8083"]
+    environment:
+      <<: *control-environment
+      BROKERROUTER_COMPONENT: media-api
+    secrets:
+      - pg_ca
+      - source: purpose_media_api
+        target: purpose_env
+      - source: config_media_api
+        target: component_config
+    networks:
+      backend: {}
+      egress: {gw_priority: 1}
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --show-error, "http://127.0.0.1:8083/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+  output-scan:
+    <<: *control-app
+    command: [serve-output-scans, --bind, "0.0.0.0:8084"]
+    environment:
+      <<: *control-environment
+      BROKERROUTER_COMPONENT: output-scan
+      BROKERROUTER_ASSET_S3_CA_FILE: /run/secrets/asset_s3_ca
+    secrets:
+      - pg_ca
+      - source: purpose_output_scan
+        target: purpose_env
+      - source: config_output_scan
+        target: component_config
+      - asset_s3_ca
+    networks:
+      backend: {}
+      egress: {gw_priority: 1}
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --show-error, "http://127.0.0.1:8084/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+  output-delivery:
+    <<: *control-app
+    command: [serve-output-delivery, --bind, "0.0.0.0:8085"]
+    environment:
+      <<: *control-environment
+      BROKERROUTER_COMPONENT: output-delivery
+      BROKERROUTER_ASSET_S3_CA_FILE: /run/secrets/asset_s3_ca
+    secrets:
+      - pg_ca
+      - source: purpose_output_delivery
+        target: purpose_env
+      - source: config_output_delivery
+        target: component_config
+      - asset_s3_ca
+    networks:
+      backend: {}
+      egress: {gw_priority: 1}
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --show-error, "http://127.0.0.1:8085/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+  console:
+    <<: *control-app
+    command: [serve-console, --bind, "0.0.0.0:8086"]
+    environment:
+      <<: *control-environment
+      BROKERROUTER_COMPONENT: console
+    secrets:
+      - pg_ca
+      - source: purpose_console
+        target: purpose_env
+      - source: config_console
+        target: component_config
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --show-error, "http://127.0.0.1:8086/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+  bff:
+    <<: *control-app
+    command: [serve-bff, --bind, "0.0.0.0:8087"]
+    environment:
+      <<: *control-environment
+      BROKERROUTER_COMPONENT: bff
+      BROKERROUTER_BFF_CA_FILE: /run/secrets/bff_ca
+    secrets:
+      - pg_ca
+      - source: purpose_bff
+        target: purpose_env
+      - source: config_bff
+        target: component_config
+      - bff_ca
+    networks:
+      backend: {}
+      egress: {gw_priority: 1}
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --show-error, "http://127.0.0.1:8087/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+  catalog:
+    <<: *control-app
+    command: [serve-catalog, --bind, "0.0.0.0:8088"]
+    environment:
+      <<: *control-environment
+      BROKERROUTER_COMPONENT: catalog
+    secrets:
+      - pg_ca
+      - source: purpose_catalog
+        target: purpose_env
+      - source: config_catalog
+        target: component_config
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --show-error, "http://127.0.0.1:8088/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+  settings:
+    <<: *control-app
+    command: [serve-settings, --bind, "0.0.0.0:8089"]
+    environment:
+      <<: *control-environment
+      BROKERROUTER_COMPONENT: settings
+    secrets:
+      - pg_ca
+      - source: purpose_settings
+        target: purpose_env
+      - source: config_settings
+        target: component_config
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --show-error, "http://127.0.0.1:8089/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+  approvals:
+    <<: *control-app
+    command: [serve-approvals, --bind, "0.0.0.0:8090"]
+    environment:
+      <<: *control-environment
+      BROKERROUTER_COMPONENT: approvals
+    secrets:
+      - pg_ca
+      - source: purpose_approvals
+        target: purpose_env
+      - source: config_approvals
+        target: component_config
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --show-error, "http://127.0.0.1:8090/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+  media-review:
+    <<: *control-app
+    command: [serve-media-review, --bind, "0.0.0.0:8091"]
+    environment:
+      <<: *control-environment
+      BROKERROUTER_COMPONENT: media-review
+      BROKERROUTER_ASSET_S3_CA_FILE: /run/secrets/asset_s3_ca
+    secrets:
+      - pg_ca
+      - source: purpose_media_review
+        target: purpose_env
+      - source: config_media_review
+        target: component_config
+      - asset_s3_ca
+    networks:
+      backend: {}
+      egress: {gw_priority: 1}
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --show-error, "http://127.0.0.1:8091/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+  media-worker:
+    <<: *control-app
+    command: [media-worker, --concurrency, "4"]
+    environment:
+      <<: *control-environment
+      BROKERROUTER_COMPONENT: media-worker
+      BROKERROUTER_ENV_FILE: ""
+      BROKERROUTER_MAX_CONCURRENCY: "4"
+      BROKERROUTER_REQUEST_TIMEOUT_SECONDS: "120"
+    secrets:
+      - pg_ca
+      - source: purpose_media_worker
+        target: purpose_env
+      - source: config_media_worker
+        target: component_config
+    networks:
+      backend: {}
+      egress: {gw_priority: 1}
+    mem_limit: 512m
+    cpus: 1.0
+    stop_grace_period: 15m
+  output-worker:
+    <<: *control-app
+    command: [output-worker, --concurrency, "2"]
+    environment:
+      <<: *control-environment
+      BROKERROUTER_COMPONENT: output-worker
+      BROKERROUTER_ENV_FILE: ""
+      BROKERROUTER_MAX_CONCURRENCY: "4"
+      BROKERROUTER_REQUEST_TIMEOUT_SECONDS: "120"
+      BROKERROUTER_ASSET_S3_CA_FILE: /run/secrets/asset_s3_ca
+    secrets:
+      - pg_ca
+      - source: purpose_output_worker
+        target: purpose_env
+      - source: config_output_worker
+        target: component_config
+      - asset_s3_ca
+    networks:
+      backend: {}
+      egress: {gw_priority: 1}
+    mem_limit: 512m
+    cpus: 1.0
+    stop_grace_period: 11m
+  mcp-judge: !override
+    <<: *control-app
+    command: [mcp-judge-worker, --concurrency, "4"]
+    profiles: !reset []
+    environment:
+      <<: *control-environment
+      BROKERROUTER_COMPONENT: mcp-judge
+      BROKERROUTER_ENV_FILE: ""
+      BROKERROUTER_MAX_CONCURRENCY: "4"
+      BROKERROUTER_REQUEST_TIMEOUT_SECONDS: "120"
+    secrets: !override
+      - pg_ca
+      - source: purpose_mcp_judge
+        target: purpose_env
+      - source: config_mcp_judge
+        target: component_config
+    networks:
+      backend: {}
+      egress: {gw_priority: 1}
+    mem_limit: 512m
+    cpus: 1.0
+    stop_grace_period: 3m
+  control-tls:
+    <<: *edge
+    volumes:
+      - ./deploy/production/control-plane-nginx.conf:/etc/nginx/nginx.conf:ro
+    secrets:
+      - source: control_plane_certificate
+        target: tls_fullchain
+      - source: control_plane_private_key
+        target: tls_private_key
+    ports:
+      - "127.0.0.1:${BROKERROUTER_CONTROL_TLS_PORT:-18443}:8443"
+    networks:
+      backend:
+        aliases:
+          - control.brokerrouter.internal
+          - assets.brokerrouter.internal
+          - media-api.brokerrouter.internal
+          - output-scan.brokerrouter.internal
+          - output-delivery.brokerrouter.internal
+          - console.brokerrouter.internal
+          - catalog.brokerrouter.internal
+          - settings.brokerrouter.internal
+          - approvals.brokerrouter.internal
+          - media-review.brokerrouter.internal
+      control_ingress: {gw_priority: 1}
+    depends_on:
+      control: {condition: service_healthy}
+      assets: {condition: service_healthy}
+      media-api: {condition: service_healthy}
+      output-scan: {condition: service_healthy}
+      output-delivery: {condition: service_healthy}
+      console: {condition: service_healthy}
+      catalog: {condition: service_healthy}
+      settings: {condition: service_healthy}
+      approvals: {condition: service_healthy}
+      media-review: {condition: service_healthy}
+  console-edge:
+    <<: *edge
+    image: ${BROKERROUTER_CONSOLE_IMAGE:?set immutable console image reference}
+    networks:
+      backend: {}
+      console_ingress: {gw_priority: 1}
+    volumes:
+      - ${BROKERROUTER_CONTROL_CONFIG_DIR:?set rendered control config directory}/console-nginx.conf:/etc/nginx/nginx.conf:ro
+    secrets:
+      - source: console_certificate
+        target: tls_fullchain
+      - source: console_private_key
+        target: tls_private_key
+    ports:
+      - "127.0.0.1:${BROKERROUTER_CONSOLE_TLS_PORT:-19443}:8443"
+    depends_on:
+      bff: {condition: service_healthy}
+  preview-edge:
+    <<: *edge
+    image: ${BROKERROUTER_PREVIEW_IMAGE:?set immutable preview image reference}
+    networks:
+      preview: {}
+      preview_ingress: {gw_priority: 1}
+    volumes:
+      - ${BROKERROUTER_CONTROL_CONFIG_DIR:?set rendered control config directory}/preview-nginx.conf:/etc/nginx/nginx.conf:ro
+    secrets:
+      - source: preview_certificate
+        target: tls_fullchain
+      - source: preview_private_key
+        target: tls_private_key
+    ports:
+      - "127.0.0.1:${BROKERROUTER_PREVIEW_TLS_PORT:-20443}:8443"
+
+networks:
+  preview: {internal: true}
+  control_ingress: {}
+  console_ingress: {}
+  preview_ingress: {}
+
+secrets:
+  purpose_admin_service:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/purpose-admin.service
+  purpose_admin_passfile:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/purpose-admin.passfile
+  purpose_control:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/purpose-logins/control.env
+  config_control:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/component-config/control.env
+  purpose_assets:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/purpose-logins/assets.env
+  config_assets:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/component-config/assets.env
+  purpose_output_scan:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/purpose-logins/output-scan.env
+  config_output_scan:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/component-config/output-scan.env
+  purpose_output_worker:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/purpose-logins/output-worker.env
+  config_output_worker:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/component-config/output-worker.env
+  purpose_output_delivery:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/purpose-logins/output-delivery.env
+  config_output_delivery:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/component-config/output-delivery.env
+  purpose_media_api:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/purpose-logins/media-api.env
+  config_media_api:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/component-config/media-api.env
+  purpose_media_worker:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/purpose-logins/media-worker.env
+  config_media_worker:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/component-config/media-worker.env
+  purpose_mcp_judge:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/purpose-logins/mcp-judge.env
+  config_mcp_judge:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/component-config/mcp-judge.env
+  purpose_bff:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/purpose-logins/bff.env
+  config_bff:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/component-config/bff.env
+  purpose_console:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/purpose-logins/console.env
+  config_console:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/component-config/console.env
+  purpose_catalog:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/purpose-logins/catalog.env
+  config_catalog:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/component-config/catalog.env
+  purpose_settings:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/purpose-logins/settings.env
+  config_settings:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/component-config/settings.env
+  purpose_approvals:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/purpose-logins/approvals.env
+  config_approvals:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/component-config/approvals.env
+  purpose_media_review:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/purpose-logins/media-review.env
+  config_media_review:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/component-config/media-review.env
+  bff_ca:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/bff-ca.crt
+  asset_s3_ca:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/asset-s3-ca.crt
+  control_plane_certificate:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/control-plane-fullchain.pem
+  control_plane_private_key:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/control-plane-privkey.pem
+  console_certificate:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/console-fullchain.pem
+  console_private_key:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/console-privkey.pem
+  preview_certificate:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/preview-fullchain.pem
+  preview_private_key:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/preview-privkey.pem

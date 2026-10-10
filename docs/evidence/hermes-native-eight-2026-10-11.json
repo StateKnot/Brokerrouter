@@ -1,0 +1,68 @@
+{
+  "date": "2026-10-11",
+  "tests": 169,
+  "skips": 0,
+  "seconds": 14.639,
+  "host_files": {
+    "agent/tool_executor.py": {
+      "original": "1610a0893588cbc067aaf84b3d019a683cd83ba0fdb92d69baf4f7b9e6d121b9",
+      "patched": "4037d2bacf6d2abb2344e8090cb2257e35a0d0816b7da14a8a020d885730a9e8"
+    },
+    "gateway/run_turn.py": {
+      "original": "dd203228bdfb7f69f1442adf4e24cc7e3196fb348b096ab6e7c2cb2bd2af5214",
+      "patched": "071bb0fcd415528f7a21fdd7f3ffbc11b593e72c07e8606288e8f7cd38e7fa7f"
+    },
+    "gateway/run_turn_runner.py": {
+      "original": "9bfa045616264e944b417ce3bfe0e302168c7b6d0218ceeb253b2dad2629e4ba",
+      "patched": "1aac0ad4dcb229f4b0dc9827a4a9cf3647378340d6977f381ab91b80ea44efcf"
+    },
+    "model_tools.py": {
+      "original": "875512e422e3e0d1502f7f7e127d47288bf1f1b350b4442ad5fc210e526b3f67",
+      "patched": "c9c19a50760e1a1ec7e5884397900ea1a8bfbaf2e5c90bb839f222029276ad06"
+    },
+    "tools/registry.py": {
+      "original": "ca02644ea36dfa08ab7e12893d283a3b12549a5ffd33ea72c29c632a94e7b201",
+      "patched": "38c5da3fc20d0ac8c66133216d73a0ae22b46791852c8c4f95482bc0400e5bac"
+    },
+    "gateway/platforms/base.py": {
+      "original": "14f2bcd915e97ecb2d14cae290e1dc07d36c3247ac9b7599f38c3175670ec52a",
+      "patched": "3ee05ff93efcd2d80a95c46f6730714c2a95bb5421032758396854c827ab77b5"
+    },
+    "gateway/run_voice.py": {
+      "original": "236853144929c0165f766c9c44927c8acb0c2e575776b68b8a5f6dd0f9e8651f",
+      "patched": "401f2a830b4fc00a43e84c29ff0f629475d13573ee51c197d2e4936047f96163"
+    },
+    "gateway/delivery_ledger.py": {
+      "original": "b2656cd6429fb848f8df405fd7bb5e50f2ea6cb0620141c59ccccc3f7c314ab7",
+      "patched": "d5bafbd4fc6e1598f31d5b4e3e93c27c22e0f9d48c19446fa941e4abb463df63"
+    }
+  },
+  "adapter_files": {
+    "__init__.py": "d5d04f2f1a6ac48a81ee6447dd215b1d0357560f9234ebb240695fa6c682af9c",
+    "artifacts.py": "b7fb900b665fb25e528c1080058f1aa6deab7a047e7f725c796530f38060ac13",
+    "client.py": "d17b82fea1850ea0a5a350824fa11e13f73bae8b3cb5f711cb0f843afcc49508",
+    "config.py": "00654ac25b53629f45b058c650b592f9048176322ede937fe79bffd3cf6b952e",
+    "gate.py": "7abbe2ff5ff7a018853425b01990a9f9e043859b62f50c4610e05c6c8a8acd6c",
+    "integrity.py": "2e6a5b56d7d45e2930b915da0cbf22d4282f21c2449e90c1e3c3d4dcad32b643",
+    "native.py": "937f03c8395991b598a688a16bf896ee8e9e6741eb5241b3262f45919ad89543",
+    "publication.py": "bad5387ac57557d0e0bfbddda9ea68a4b9aab0f1d436ff894e3e4d7de3137a7f",
+    "store.py": "1d51056885ba49e4c809b6497b8804950be680c7f3897e5e1ba92974b0a5bbce"
+  },
+  "test_files": {
+    "test_adapter.py": "4dd7820f0f5d75e31525322767436b9d426ac4fea87fd1763a86a3cebd411b74",
+    "test_artifact_spool.py": "34d752cb3d8212895ce93c24abe79a505580e00bb9c3217f9946f0dd469a73a6",
+    "test_host_contract.py": "f485984a30518f600667ab7a34b8fbb7ba379ea6d75450b716f66bd5de821101",
+    "test_installer.py": "62e2769400e26b0a4bf76b1f5c9eba2d943a0f9f9209ea5b19fc8f67db3f8809",
+    "test_native_gate.py": "fa051ade7b4ecc83955e2ba2b7a1f5f840af6ab2e2bf167fa653cb830ee5d4e8",
+    "test_native_host.py": "d54ac5dd5722187bbc848abd37190111d4f93dcd18e8bf619fcdbed6ae99a7ff",
+    "test_native_media.py": "884f49109527fc1a2902b7e3fffe395f736d53b883a80577cb637e831bdbebb0",
+    "test_native_publication.py": "c3bfc5e3282c0febe79b96dc3cd4e2e6023b41023ff3afaefdff3a88ca74df8e",
+    "test_native_source.py": "99cd32949d7c454f193ee732cd5a89c6ceef5d5e7dceee2a6e9d88c9222bc9d3",
+    "test_output_gate.py": "e527a3ceaf86b4c9576005c8f5e6fa7e9b505a6a27dbe4fa727b4418c26ce633",
+    "test_results.py": "0b2e73054ec25f2727366b23fa46b5a14f77c71d84f924c62b7c6912a141ef24",
+    "test_transport_tls.py": "824550e09d9d4eb86064749eb344e1248b162e4ed3934d952c9c6ce4b829241b"
+  },
+  "limit": "Local sender once/unknown facts only; final assistant plaintext has not yet been bound/released by dedicated server post governance. Full publication acceptance remains blocked until 0031.",
+  "test_log_sha256": "c5b2b70f5422b8f891a1cf5513dfd97f0546dac73a61c3d16dad37a27f8660a2",
+  "test_log": "hermes-native-eight-final.log"
+}

@@ -1,0 +1,103 @@
+{
+  "schema": 1,
+  "date": "2026-10-11",
+  "hermes_revision": "67764dc0863349a384c16425e73ee8571f3a94b7",
+  "image_digest": "agentos-mcp-runtime-contract@sha256:943ff581ef4016d9385cbf91b85be7dc5f7176e02091f359fd097432aedfa30f",
+  "native_test_count": 188,
+  "native_tests_skipped": 0,
+  "duration_seconds": 45.378,
+  "exit_code": 0,
+  "log": "/private/tmp/brokerrouter-acceptance-20261010/evidence/hermes-native-ten-final-188.log",
+  "log_sha256": "331090468f2db2ea208a1a6dbb9a5ca8f70a700ff127d9729c8dbce653cea575",
+  "all_host_imports_log": "/private/tmp/brokerrouter-acceptance-20261010/evidence/hermes-native-ten-imports.log",
+  "all_host_imports_log_sha256": "95a0373189c94d152a87fbc299c8cfd8af27a6ea0c80c724fa416b07a05c7761",
+  "archive": "/private/tmp/brokerrouter-acceptance-20261010/hermes-native-full/archive-ten-model-188",
+  "host_files": {
+    "agent/agent_runtime_helpers.py": {
+      "original_sha256": "328f3f8ee5e6956ae530007ec0c22457e3bb681b6125c918cd43ea7124b1767e",
+      "patched_sha256": "18d611d086aac9991c787d7fd751dbeccd814c4bff8f9d7e7c83d8728481c485"
+    },
+    "agent/tool_executor.py": {
+      "original_sha256": "1610a0893588cbc067aaf84b3d019a683cd83ba0fdb92d69baf4f7b9e6d121b9",
+      "patched_sha256": "4037d2bacf6d2abb2344e8090cb2257e35a0d0816b7da14a8a020d885730a9e8"
+    },
+    "agent/turn_api_call.py": {
+      "original_sha256": "5dead01b498131df2ee987e431ded73ca21313ef1a52633e9aa802efc2aa00b5",
+      "patched_sha256": "61993076054bf2b1a6dac58f51c3d02c655d4bf389da9d8c69b01708fe436ca0"
+    },
+    "gateway/delivery_ledger.py": {
+      "original_sha256": "b2656cd6429fb848f8df405fd7bb5e50f2ea6cb0620141c59ccccc3f7c314ab7",
+      "patched_sha256": "d5bafbd4fc6e1598f31d5b4e3e93c27c22e0f9d48c19446fa941e4abb463df63"
+    },
+    "gateway/platforms/base.py": {
+      "original_sha256": "14f2bcd915e97ecb2d14cae290e1dc07d36c3247ac9b7599f38c3175670ec52a",
+      "patched_sha256": "3ee05ff93efcd2d80a95c46f6730714c2a95bb5421032758396854c827ab77b5"
+    },
+    "gateway/run_turn.py": {
+      "original_sha256": "dd203228bdfb7f69f1442adf4e24cc7e3196fb348b096ab6e7c2cb2bd2af5214",
+      "patched_sha256": "071bb0fcd415528f7a21fdd7f3ffbc11b593e72c07e8606288e8f7cd38e7fa7f"
+    },
+    "gateway/run_turn_runner.py": {
+      "original_sha256": "9bfa045616264e944b417ce3bfe0e302168c7b6d0218ceeb253b2dad2629e4ba",
+      "patched_sha256": "83e82be9a8b6666c84793ba538d6981797c019b869ab2844ab1589df7914ba86"
+    },
+    "gateway/run_voice.py": {
+      "original_sha256": "236853144929c0165f766c9c44927c8acb0c2e575776b68b8a5f6dd0f9e8651f",
+      "patched_sha256": "401f2a830b4fc00a43e84c29ff0f629475d13573ee51c197d2e4936047f96163"
+    },
+    "model_tools.py": {
+      "original_sha256": "875512e422e3e0d1502f7f7e127d47288bf1f1b350b4442ad5fc210e526b3f67",
+      "patched_sha256": "c9c19a50760e1a1ec7e5884397900ea1a8bfbaf2e5c90bb839f222029276ad06"
+    },
+    "tools/registry.py": {
+      "original_sha256": "ca02644ea36dfa08ab7e12893d283a3b12549a5ffd33ea72c29c632a94e7b201",
+      "patched_sha256": "38c5da3fc20d0ac8c66133216d73a0ae22b46791852c8c4f95482bc0400e5bac"
+    }
+  },
+  "adapter_files": {
+    "brokerrouter_hermes/__init__.py": "d5d04f2f1a6ac48a81ee6447dd215b1d0357560f9234ebb240695fa6c682af9c",
+    "brokerrouter_hermes/artifacts.py": "b7fb900b665fb25e528c1080058f1aa6deab7a047e7f725c796530f38060ac13",
+    "brokerrouter_hermes/client.py": "d17b82fea1850ea0a5a350824fa11e13f73bae8b3cb5f711cb0f843afcc49508",
+    "brokerrouter_hermes/config.py": "00654ac25b53629f45b058c650b592f9048176322ede937fe79bffd3cf6b952e",
+    "brokerrouter_hermes/gate.py": "7abbe2ff5ff7a018853425b01990a9f9e043859b62f50c4610e05c6c8a8acd6c",
+    "brokerrouter_hermes/integrity.py": "67e8f7ccee13a7c8591720681b7e45f017f71ab2e968b7a4268989eb5b56c0d2",
+    "brokerrouter_hermes/model_transport.py": "70897cae199bd1baf776cfb5377ea7b66c45577945d1d0819a47e171b5b4e53c",
+    "brokerrouter_hermes/native.py": "937f03c8395991b598a688a16bf896ee8e9e6741eb5241b3262f45919ad89543",
+    "brokerrouter_hermes/publication.py": "bad5387ac57557d0e0bfbddda9ea68a4b9aab0f1d436ff894e3e4d7de3137a7f",
+    "brokerrouter_hermes/store.py": "1d51056885ba49e4c809b6497b8804950be680c7f3897e5e1ba92974b0a5bbce"
+  },
+  "installer_sha256": "caa89f2ee0ff304b43b767cbd2fe92343e48771e09b604f8f4b7b55ee41ea407",
+  "manifest_sha256": "527a7742b3278e1b140dc775533073809d708a6643ff872854f7cdcf98650a2c",
+  "python_tests": {
+    "test_adapter.py": "4dd7820f0f5d75e31525322767436b9d426ac4fea87fd1763a86a3cebd411b74",
+    "test_artifact_spool.py": "34d752cb3d8212895ce93c24abe79a505580e00bb9c3217f9946f0dd469a73a6",
+    "test_host_contract.py": "f485984a30518f600667ab7a34b8fbb7ba379ea6d75450b716f66bd5de821101",
+    "test_installer.py": "82f4f0ac7aba5477b316f92b9afab53697d1ee37cd83683785c74db593e57ee8",
+    "test_model_transport.py": "4c81007ccab41f45226366cca27e687dee699da7ef70d31cff937548cc2b86bc",
+    "test_native_gate.py": "fa051ade7b4ecc83955e2ba2b7a1f5f840af6ab2e2bf167fa653cb830ee5d4e8",
+    "test_native_host.py": "d54ac5dd5722187bbc848abd37190111d4f93dcd18e8bf619fcdbed6ae99a7ff",
+    "test_native_media.py": "884f49109527fc1a2902b7e3fffe395f736d53b883a80577cb637e831bdbebb0",
+    "test_native_publication.py": "c3bfc5e3282c0febe79b96dc3cd4e2e6023b41023ff3afaefdff3a88ca74df8e",
+    "test_native_source.py": "99cd32949d7c454f193ee732cd5a89c6ceef5d5e7dceee2a6e9d88c9222bc9d3",
+    "test_output_gate.py": "e527a3ceaf86b4c9576005c8f5e6fa7e9b505a6a27dbe4fa727b4418c26ce633",
+    "test_results.py": "0b2e73054ec25f2727366b23fa46b5a14f77c71d84f924c62b7c6912a141ef24",
+    "test_transport_tls.py": "824550e09d9d4eb86064749eb344e1248b162e4ed3934d952c9c6ce4b829241b"
+  },
+  "red_logs": {
+    "hermes-model-wire-red.log": "13ff43c78a23a3f97786e782ebb2520e5e31e1f85d50be561d1849777749592a",
+    "hermes-model-origin-drift-red.log": "c90d735fbcd28ffb1ec609f11e13d89f7251e7fd5021269e667716686b12eb3e",
+    "hermes-model-stream-red.log": "6bd5163efaaf9d19028d5b953c122f073ede4db6ae276aae27b73f92466a33e1",
+    "hermes-model-finish-reasons-red.log": "ce02f8760caea13d352ef13ea96419c01f117911f2427ada5101b5725fb4a29f"
+  },
+  "certified_model_sources": [
+    "stop",
+    "tool_calls"
+  ],
+  "limits": [
+    "Primary OpenAI Chat Completions gateway wire only; auxiliary SDK/providers remain unsupported.",
+    "Actual x-brokerrouter-request-id facts are not final-text publication authority; dedicated 0031 record/current release is the next package.",
+    "Only native send ledger once/unknown facts are certified here; unknown platform effects are not retried.",
+    "Required binary/voice attachments stay disabled; direct trusted tool/plugin external effects are not a Python sandbox.",
+    "Complete fixed-host tests use local zero-fee TLS authority; this report does not claim a fresh deployed 0031 backend approval/workbench chain."
+  ]
+}

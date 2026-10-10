@@ -17,10 +17,10 @@ SPEC.loader.exec_module(installer)
 
 class InstallerTest(unittest.TestCase):
     def test_anchor_is_exact_and_refuses_drift(self):
-        source = ("prefix\n" + installer.OLD + "suffix\n").encode()
+        source = "\n".join(old for old, _ in installer.TOOL_EXECUTOR_REPLACEMENTS).encode()
         patched = installer.patched_bytes(source)
         self.assertNotEqual(source, patched)
-        self.assertIn(b"Strong Brokerrouter boundary", patched)
+        self.assertIn(b"brokerrouter_gate.run_execution(", patched)
         with self.assertRaises(RuntimeError):
             installer.patched_bytes(source.replace(b"_turns_since_memory", b"changed"))
 
@@ -40,8 +40,50 @@ class InstallerTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             installer.patched_run_turn_runner_bytes(runner.replace(b"tools_holder", b"changed"))
 
+    def test_inner_result_hook_and_error_log_anchors_are_exact(self):
+        for replacements, patcher in (
+            (installer.MODEL_TOOLS_REPLACEMENTS, installer.patched_model_tools_bytes),
+            (installer.REGISTRY_REPLACEMENTS, installer.patched_registry_bytes),
+        ):
+            with self.subTest(patcher=patcher.__name__):
+                source = "\n".join(old for old, _ in replacements).encode()
+                patched = patcher(source)
+                self.assertIn(b"output_is_quarantined()", patched)
+                with self.assertRaises(RuntimeError):
+                    patcher(source.replace(b"except Exception as e:", b"except Exception as different:"))
+
+    def test_binary_capability_and_voice_anchors_are_exact(self):
+        for replacements, patcher in (
+            (installer.PLATFORM_BASE_REPLACEMENTS, installer.patched_platform_base_bytes),
+            (installer.RUN_VOICE_REPLACEMENTS, installer.patched_run_voice_bytes),
+        ):
+            with self.subTest(patcher=patcher.__name__):
+                source = "\n".join(old for old, _ in replacements).encode()
+                self.assertNotEqual(patcher(source), source)
+                with self.assertRaises(RuntimeError):
+                    patcher(source + source)
+
+    def test_native_final_ledger_anchors_are_exact(self):
+        source = "\n".join(old for old, _ in installer.DELIVERY_LEDGER_REPLACEMENTS).encode()
+        patched = installer.patched_delivery_ledger_bytes(source)
+        self.assertIn(b"hold_required_recovery", patched)
+        self.assertIn(b"obligation_id NOT LIKE 'br-final-v1:%'", patched)
+        with self.assertRaises(RuntimeError):
+            installer.patched_delivery_ledger_bytes(source.replace(b"otherwise never claim", b"drifted"))
+
+    def test_primary_model_factory_anchor_is_exact_and_refuses_drift(self):
+        source = "\n".join(old for old, _ in installer.AGENT_RUNTIME_HELPERS_REPLACEMENTS).encode()
+        patched = installer.patched_agent_runtime_helpers_bytes(source)
+        self.assertIn(b"create_governed_model_client", patched)
+        with self.assertRaises(RuntimeError):
+            installer.patched_agent_runtime_helpers_bytes(source.replace(b"dict(client_kwargs)", b"dict(changed)"))
+        dispatch = "\n".join(old for old, _ in installer.TURN_API_CALL_REPLACEMENTS).encode()
+        self.assertIn(b"complete_model_response", installer.patched_turn_api_call_bytes(dispatch))
+        with self.assertRaises(RuntimeError):
+            installer.patched_turn_api_call_bytes(dispatch + dispatch)
+
     def test_apply_resumes_an_exact_partial_installation(self):
-        tool = ("prefix\n" + installer.OLD + "suffix\n").encode()
+        tool = "\n".join(old for old, _ in installer.TOOL_EXECUTOR_REPLACEMENTS).encode()
         turn = "\n".join(old for old, _ in installer.RUN_TURN_REPLACEMENTS).encode()
         runner = "\n".join(
             old for old, _ in installer.RUN_TURN_RUNNER_REPLACEMENTS

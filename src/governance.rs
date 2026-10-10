@@ -57,6 +57,7 @@ pub(crate) struct Operation {
     pub id: Uuid,
     pub turn_id: Uuid,
     pub key_id: Uuid,
+    pub operation_key: String,
     pub stage: String,
     pub model_id: Option<String>,
     pub tool_name: Option<String>,
@@ -275,6 +276,13 @@ pub(crate) enum Gate {
     Checking(Vec<Uuid>),
 }
 
+pub(crate) fn runtime_artifact(op: &Operation) -> bool {
+    op.stage == "artifact"
+        && op
+            .operation_key
+            .starts_with(crate::runtime_artifact_delivery::OUTPUT_PREFIX)
+}
+
 pub(crate) async fn gate(
     tx: &mut Tx<'_>,
     who: &Identity,
@@ -282,11 +290,91 @@ pub(crate) async fn gate(
     op: &Operation,
     payload: &Value,
 ) -> Result<Gate> {
+    Ok(gate_with_grant_deadline(tx, who, turn, op, payload)
+        .await?
+        .0)
+}
+
+/// Body-free result facts have already authenticated this tool output. Human
+/// review can only observe existing permission; it cannot start paid detection,
+/// create an approval or update an operation through this read-only path.
+pub(crate) async fn require_ready_readonly(
+    tx: &mut Tx<'_>,
+    who: &Identity,
+    turn: &Turn,
+    op: &Operation,
+    payload: &Value,
+) -> Result<Option<DateTime<Utc>>> {
+    if matches!(op.state.as_str(), "rejected" | "feedback") {
+        return Err(Error::ActionRejected);
+    }
+    if op.stage != "tool_output"
+        || !op
+            .operation_key
+            .starts_with(crate::runtime_results::OUTPUT_PREFIX)
+    {
+        return Err(Error::Invalid("original runtime tool output required"));
+    }
+    let rules = selected(
+        tx,
+        who,
+        &op.stage,
+        op.model_id.as_deref(),
+        op.tool_name.as_deref(),
+    )
+    .await?;
+    if rules
+        .iter()
+        .filter(|rule| rule.rule["kind"] == "model_judge")
+        .count()
+        > 8
+    {
+        return Err(Error::Configuration);
+    }
+    let mut text = String::new();
+    strings(payload, &mut text);
+    let mut deadline: Option<DateTime<Utc>> = None;
+    for rule in rules {
+        let grant: Option<DateTime<Utc>> = sqlx::query_scalar("SELECT expires_at FROM guardrail_grants WHERE tenant_id=$1 AND turn_id=$2 AND guardrail_id=$3 AND version=$4 AND expires_at>clock_timestamp()")
+            .bind(who.tenant_id).bind(turn.id).bind(&rule.id).bind(rule.version)
+            .fetch_optional(&mut **tx).await?;
+        if let Some(d) = grant {
+            deadline = Some(deadline.map_or(d, |old| old.min(d)));
+            continue;
+        }
+        let passed = match rule.rule["kind"].as_str() {
+            Some("model_judge") => crate::judge::passed(tx, who, op, &rule).await?,
+            Some("always" | "contains_any") => !risk(&rule.rule, &text)?,
+            _ => return Err(Error::Configuration),
+        };
+        if !passed {
+            return Err(Error::InProgress);
+        }
+    }
+    require_live_grants(tx, deadline).await?;
+    Ok(deadline)
+}
+
+/// Capture only grants actually used by this decision. Publication and claim
+/// callers must recheck this deadline after their remaining transactional work.
+pub(crate) async fn gate_with_grant_deadline(
+    tx: &mut Tx<'_>,
+    who: &Identity,
+    turn: &Turn,
+    op: &Operation,
+    payload: &Value,
+) -> Result<(Gate, Option<DateTime<Utc>>)> {
     if matches!(op.state.as_str(), "rejected" | "feedback") {
         return Err(Error::ActionRejected);
     }
     if op.stage == "media_output"
         && crate::output_delivery::validate_operation(tx, who, op).await? != *payload
+    {
+        return Err(Error::PolicyChanged);
+    }
+    let native_artifact = runtime_artifact(op);
+    if native_artifact
+        && crate::runtime_artifact_delivery::validate_operation(tx, who, op).await? != *payload
     {
         return Err(Error::PolicyChanged);
     }
@@ -299,11 +387,13 @@ pub(crate) async fn gate(
     )
     .await?;
     let snapshot = serde_json::to_value(&rules).map_err(|_| Error::Configuration)?;
+    let full_policy_hash = digest(&snapshot)?;
     let mut text = String::new();
     strings(payload, &mut text);
     let mut needed = Vec::new();
     let mut evaluated = Vec::new();
     let mut pending = Vec::new();
+    let mut grant_deadline: Option<DateTime<Utc>> = None;
     if rules
         .iter()
         .filter(|r| r.rule["kind"] == "model_judge")
@@ -314,15 +404,32 @@ pub(crate) async fn gate(
     }
     for r in rules {
         let started = std::time::Instant::now();
-        let grant: Option<Uuid>=sqlx::query_scalar("SELECT approval_id FROM guardrail_grants WHERE tenant_id=$1 AND turn_id=$2 AND guardrail_id=$3 AND version=$4 AND expires_at>clock_timestamp()")
-            .bind(who.tenant_id).bind(turn.id).bind(&r.id).bind(r.version).fetch_optional(&mut **tx).await?;
+        let grant: Option<(Uuid, DateTime<Utc>)> = if native_artifact {
+            crate::runtime_artifact_delivery::lookup_grant(tx, who, op, &r, &full_policy_hash)
+                .await?
+        } else {
+            sqlx::query_as("SELECT approval_id,expires_at FROM guardrail_grants WHERE tenant_id=$1 AND turn_id=$2 AND guardrail_id=$3 AND version=$4 AND expires_at>clock_timestamp()")
+                .bind(who.tenant_id).bind(turn.id).bind(&r.id).bind(r.version).fetch_optional(&mut **tx).await?
+        };
+        if let Some((_, expiry)) = grant {
+            grant_deadline = Some(grant_deadline.map_or(expiry, |old| old.min(expiry)));
+        }
         let (outcome, reason) = if grant.is_some() {
             (
                 "skipped_by_user_approval".to_owned(),
-                "approved_current_turn".to_owned(),
+                if native_artifact {
+                    "approved_current_artifact".to_owned()
+                } else {
+                    "approved_current_turn".to_owned()
+                },
             )
-        } else if r.rule["kind"] == "asset_scan" && op.stage == "media_output" {
+        } else if r.rule["kind"] == "asset_scan" && (op.stage == "media_output" || native_artifact)
+        {
             crate::output_delivery::outcome(&r.rule, payload)?
+        } else if r.rule["kind"] == "asset_scan" {
+            return Err(Error::Invalid(
+                "asset_scan requires server-owned binary output",
+            ));
         } else if r.rule["kind"] == "model_judge" {
             match crate::judge::observe(tx, who, op, &r).await? {
                 crate::judge::Observation::Pending(id) => {
@@ -356,13 +463,13 @@ pub(crate) async fn gate(
             }
             needed.push(item);
         }
-        evaluated
-            .push(json!({"id":r.id,"version":r.version,"outcome":outcome,"approval_id":grant}));
+        evaluated.push(json!({"id":r.id,"version":r.version,"outcome":outcome,
+            "approval_id":grant.map(|(id,_)|id)}));
     }
     if !pending.is_empty() {
         sqlx::query("UPDATE governance_operations SET state='checking' WHERE tenant_id=$1 AND id=$2 AND state IN ('ready','checking','waiting_approval')")
             .bind(who.tenant_id).bind(op.id).execute(&mut **tx).await?;
-        return Ok(Gate::Checking(pending));
+        return Ok((Gate::Checking(pending), grant_deadline));
     }
     if needed.is_empty() {
         if !evaluated.is_empty() {
@@ -383,14 +490,41 @@ pub(crate) async fn gate(
             .execute(&mut **tx)
             .await?;
         }
-        return Ok(Gate::Ready);
+        // Row locks cannot stop wall-clock expiry during observation/event writes.
+        // Every shared gate caller receives Ready only while its used grants live.
+        require_live_grants(tx, grant_deadline).await?;
+        return Ok((Gate::Ready, grant_deadline));
     }
     let hash = digest(&json!({"policy":snapshot,"needed":needed}))?;
-    let expires = if op.stage == "post" {
+    let expires = if op.stage == "post"
+        && sqlx::query_scalar::<_, String>(
+            "SELECT operation_key FROM governance_operations WHERE tenant_id=$1 AND id=$2",
+        )
+        .bind(who.tenant_id)
+        .bind(op.id)
+        .fetch_one(&mut **tx)
+        .await?
+        .starts_with(crate::runtime_publications::OUTPUT_PREFIX)
+    {
+        let expiry: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT p.expires_at FROM runtime_final_publications p JOIN governance_operations o ON o.tenant_id=p.tenant_id AND o.key_id=p.key_id AND o.turn_id=p.turn_id AND o.model_id=p.model_id AND o.operation_key=$4||p.id::text WHERE p.tenant_id=$1 AND p.key_id=$2 AND o.id=$3 AND p.result_ciphertext IS NOT NULL AND p.expires_at>clock_timestamp()",
+        ).bind(who.tenant_id).bind(who.key_id).bind(op.id)
+            .bind(crate::runtime_publications::OUTPUT_PREFIX).fetch_optional(&mut **tx).await?;
+        turn.expires_at.min(expiry.ok_or(Error::ResultUnavailable)?)
+    } else if op.stage == "tool_output"
+        && op
+            .operation_key
+            .starts_with(crate::runtime_results::OUTPUT_PREFIX)
+    {
+        let expiry: Option<DateTime<Utc>> = sqlx::query_scalar("SELECT r.expires_at FROM runtime_tool_result_review_facts r WHERE r.tenant_id=$1 AND r.key_id=$2 AND $3=$4||r.id::text AND r.available")
+            .bind(who.tenant_id).bind(who.key_id).bind(&op.operation_key)
+            .bind(crate::runtime_results::OUTPUT_PREFIX).fetch_optional(&mut **tx).await?;
+        turn.expires_at.min(expiry.ok_or(Error::ResultUnavailable)?)
+    } else if op.stage == "post" {
         let expiry:Option<DateTime<Utc>>=sqlx::query_scalar("SELECT result_expires_at FROM requests WHERE tenant_id=$1 AND governance_turn_id=$2 AND id::text=(SELECT operation_key FROM governance_operations WHERE tenant_id=$1 AND id=$3) AND result_ciphertext IS NOT NULL AND result_expires_at>clock_timestamp()")
             .bind(who.tenant_id).bind(turn.id).bind(op.id).fetch_optional(&mut **tx).await?.flatten();
         turn.expires_at.min(expiry.ok_or(Error::ResultUnavailable)?)
-    } else if op.stage == "media_output" {
+    } else if op.stage == "media_output" || native_artifact {
         let expiry: DateTime<Utc> = serde_json::from_value(payload["expires_at"].clone())
             .map_err(|_| Error::Configuration)?;
         turn.expires_at.min(expiry)
@@ -399,11 +533,11 @@ pub(crate) async fn gate(
     };
     let id = Uuid::new_v4();
     let mut summary = json!({"model_id":op.model_id,"tool_name":op.tool_name,"stage":op.stage,"payload_hash":hex(&op.payload_hash),"session_id":turn.session_id,"run_id":turn.run_id,"generation":turn.generation});
-    if op.stage == "media_output" {
+    if op.stage == "media_output" || native_artifact {
         summary["output"] = payload.clone();
     }
     let inserted=sqlx::query("INSERT INTO approvals(tenant_id,id,operation_id,turn_id,policy_hash,policy_snapshot,guardrails,expires_at,summary) VALUES($1,$2,$3,$4,$5,$6,$7,CASE WHEN $10 THEN $8 ELSE LEAST($8,clock_timestamp()+interval '15 minutes') END,$9) ON CONFLICT(tenant_id,operation_id,policy_hash) DO NOTHING")
-        .bind(who.tenant_id).bind(id).bind(op.id).bind(turn.id).bind(&hash).bind(snapshot).bind(json!(needed)).bind(expires).bind(summary).bind(op.stage=="media_output").execute(&mut **tx).await?;
+        .bind(who.tenant_id).bind(id).bind(op.id).bind(turn.id).bind(&hash).bind(snapshot).bind(json!(needed)).bind(expires).bind(summary).bind(op.stage=="media_output" || native_artifact).execute(&mut **tx).await?;
     let approval: Approval = sqlx::query_as(
         "SELECT * FROM approvals WHERE tenant_id=$1 AND operation_id=$2 AND policy_hash=$3",
     )
@@ -419,10 +553,35 @@ pub(crate) async fn gate(
         event(tx,turn,"approval.required",json!({"approval_id":approval.id,"operation_id":op.id,"guardrails":approval.guardrails,"evaluations":evaluated})).await?;
     }
     sqlx::query("UPDATE governance_operations SET state='waiting_approval' WHERE tenant_id=$1 AND id=$2 AND state IN ('ready','checking','waiting_approval')").bind(who.tenant_id).bind(op.id).execute(&mut **tx).await?;
-    Ok(Gate::Approval(approval_view(&approval)))
+    Ok((Gate::Approval(approval_view(&approval)), grant_deadline))
+}
+
+pub(crate) async fn require_live_grants(
+    tx: &mut Tx<'_>,
+    deadline: Option<DateTime<Utc>>,
+) -> Result<()> {
+    if let Some(deadline) = deadline {
+        let live: bool = sqlx::query_scalar("SELECT clock_timestamp()<$1")
+            .bind(deadline)
+            .fetch_one(&mut **tx)
+            .await?;
+        if !live {
+            return Err(Error::PolicyChanged);
+        }
+    }
+    Ok(())
 }
 pub(crate) fn approval_view(a: &Approval) -> Value {
-    json!({"id":a.id,"operation_id":a.operation_id,"turn_id":a.turn_id,"state":a.state,"guardrails":a.guardrails,"summary":a.summary,"expires_at":a.expires_at,"scope":"current_turn_only","resume_requires_recheck":true,"scope_notice":"继续本轮后，该轮后续动作也会跳过所选护栏；不扩大工具权限，不适用于新轮次。","options":["continue_this_turn","reject","feedback"]})
+    let mut view = json!({"id":a.id,"operation_id":a.operation_id,"turn_id":a.turn_id,"state":a.state,"guardrails":a.guardrails,"summary":a.summary,"expires_at":a.expires_at,"scope":"current_turn_only","resume_requires_recheck":true,"scope_notice":"继续本轮后，该轮后续动作也会跳过所选护栏；不扩大工具权限，不适用于新轮次。","options":["continue_this_turn","reject","feedback"]});
+    if a.summary["stage"] == "artifact"
+        && a.summary["output"]["contract"] == "runtime-artifact-mp4-v1"
+    {
+        view["scope"] = json!("current_artifact_in_original_turn");
+        view["scope_notice"] = json!(
+            "本次批准仅适用于原轮次中这份产物的确切字节、当前扫描证据与当前策略；其他产物、扫描或策略版本需重新核对。"
+        );
+    }
+    view
 }
 pub async fn check(
     pool: &PgPool,
@@ -471,6 +630,9 @@ pub async fn check(
         let result = operation_view(&op);
         tx.commit().await?;
         return Ok(result);
+    }
+    if op.stage == "tool_input" {
+        require_unfrozen_output_set(&mut tx, who, turn.id).await?;
     }
     let waiting = gate(&mut tx, who, &turn, &op, &check.payload).await?;
     tx.commit().await?;
@@ -653,6 +815,9 @@ pub async fn claim(
     ) {
         return Err(Error::InProgress);
     }
+    if op.stage == "tool_input" {
+        require_unfrozen_output_set(&mut tx, who, turn.id).await?;
+    }
     let payload: Value = serde_json::from_slice(
         &cipher.decrypt(
             who.tenant_id,
@@ -663,7 +828,9 @@ pub async fn claim(
         )?,
     )
     .map_err(|_| Error::ResultUnavailable)?;
-    match gate(&mut tx, who, &turn, &op, &payload).await? {
+    let (decision, grant_deadline) =
+        gate_with_grant_deadline(&mut tx, who, &turn, &op, &payload).await?;
+    match decision {
         Gate::Approval(a) => {
             tx.commit().await?;
             return Err(Error::ApprovalRequired(a));
@@ -682,6 +849,7 @@ pub async fn claim(
         json!({"operation_id":id,"execution_deadline":deadline}),
     )
     .await?;
+    require_live_grants(&mut tx, grant_deadline).await?;
     tx.commit().await?;
     op.state = "executing".into();
     op.execution_deadline = Some(deadline);
@@ -768,6 +936,8 @@ pub(crate) async fn receipt_in_tx(
 }
 pub async fn maintain(pool: &PgPool) -> Result<()> {
     crate::judge::maintain(pool).await?;
+    crate::runtime_results::maintain(pool).await?;
+    crate::runtime_publications::maintain(pool).await?;
     sqlx::query("WITH batch AS (SELECT tenant_id,id FROM governance_operations WHERE state='executing' AND execution_deadline<=clock_timestamp() ORDER BY execution_deadline LIMIT 100 FOR UPDATE SKIP LOCKED) UPDATE governance_operations o SET state='execution_unknown' FROM batch b WHERE o.tenant_id=b.tenant_id AND o.id=b.id").execute(pool).await?;
     sqlx::query("WITH batch AS (SELECT o.tenant_id,o.id FROM governance_operations o JOIN governance_turns t ON o.tenant_id=t.tenant_id AND o.turn_id=t.id WHERE (t.state<>'active' OR t.expires_at<=clock_timestamp()) AND (o.payload_ciphertext IS NOT NULL OR o.receipt_ciphertext IS NOT NULL) ORDER BY t.expires_at,o.id LIMIT 100 FOR UPDATE OF o SKIP LOCKED) UPDATE governance_operations o SET payload_ciphertext=NULL,receipt_ciphertext=NULL FROM batch b WHERE o.tenant_id=b.tenant_id AND o.id=b.id").execute(pool).await?;
     sqlx::query("WITH batch AS (SELECT r.id FROM requests r JOIN governance_turns t ON r.tenant_id=t.tenant_id AND r.governance_turn_id=t.id WHERE (t.state<>'active' OR t.expires_at<=clock_timestamp()) AND r.result_ciphertext IS NOT NULL ORDER BY t.expires_at,r.id LIMIT 100 FOR UPDATE OF r SKIP LOCKED) UPDATE requests r SET result_ciphertext=NULL FROM batch b WHERE r.id=b.id").execute(pool).await?;
@@ -824,4 +994,14 @@ pub async fn close_runtime(pool: &PgPool, who: &Identity, id: Uuid, state: &str)
     }
     tx.commit().await?;
     Ok(json!({"id":id,"state":state}))
+}
+
+// Tenant lock serializes final freezing with new dispatch. No captured body is read.
+async fn require_unfrozen_output_set(tx: &mut Tx<'_>, who: &Identity, turn: Uuid) -> Result<()> {
+    let frozen: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM runtime_output_set_freezes WHERE tenant_id=$1 AND turn_id=$2 AND input_operation_id IS NULL)")
+        .bind(who.tenant_id).bind(turn).fetch_one(&mut **tx).await?;
+    if frozen {
+        return Err(Error::Conflict);
+    }
+    Ok(())
 }

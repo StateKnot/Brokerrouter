@@ -4,6 +4,7 @@ import json
 import os
 from contextlib import contextmanager
 import asyncio
+import hashlib
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -11,7 +12,7 @@ import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from brokerrouter_hermes.client import GatewayFailure, TransportFailure
 from brokerrouter_hermes.config import Config, ConfigurationError
@@ -47,6 +48,7 @@ class FakeTransport:
     def request(self, method, path, body=None):
         self.requests.append((method, path, body))
         if path == "/v1/governance/checks":
+            self.turn_id = body["turn_id"]
             if self.check_error is not None:
                 raise self.check_error
             if len(self.checks) > 1:
@@ -67,6 +69,26 @@ class FakeTransport:
             if self.receipt_error:
                 raise TransportFailure("lost receipt")
             return {"outcome": body["outcome"], "evidence_ref": body["evidence_ref"]}
+        if path == "/v1/governance/tool-results":
+            if self.receipt_error:
+                raise TransportFailure("lost result receipt")
+            self.result_id = str(uuid5(NAMESPACE_URL, body["input_operation_id"]))
+            self.result_text = body["text"]
+            self.result_metadata = {
+                "input_operation_id": body["input_operation_id"],
+                "turn_id": self.turn_id,
+                "text_sha256": hashlib.sha256(body["text"].encode("utf-8")).hexdigest(),
+                "bytes": len(body["text"].encode("utf-8")),
+                "expires_at": "2030-01-01T00:00:00Z",
+            }
+            return {"id": self.result_id, "state": "recorded", **self.result_metadata}
+        if path.endswith("/release"):
+            output_id = str(uuid5(NAMESPACE_URL, self.result_id))
+            return {
+                "id": output_id, "output_operation_id": output_id,
+                "result_id": self.result_id, "state": "ready",
+                "payload_hash": "a" * 64, "text": self.result_text, **self.result_metadata,
+            }
         raise AssertionError(path)
 
 
@@ -115,6 +137,7 @@ class AdapterTest(unittest.TestCase):
         return value
 
     def gate(self, transport):
+        transport.turn_id = self.context.turn_id
         return GovernanceGate(self.config, transport=transport, sleeper=lambda _: None)
 
     def test_waits_for_same_operation_then_dispatches_once(self):
@@ -275,7 +298,7 @@ class AdapterTest(unittest.TestCase):
             gate.run_tool(self.context, uncertain)
         self.assertEqual(called, [True])
 
-    def test_receipt_loss_holds_result_and_restart_only_repairs_receipt(self):
+    def test_receipt_loss_holds_result_and_restart_repairs_and_rechecks_output(self):
         transport = FakeTransport(
             [self.response("ready", payload_hash="d" * 64)], receipt_error=True
         )
@@ -289,9 +312,9 @@ class AdapterTest(unittest.TestCase):
 
         repaired = FakeTransport([self.response("ready", payload_hash="d" * 64)])
         recovered = self.gate(repaired)
-        with self.assertRaises(GovernanceHalt) as restarted:
-            recovered.run_tool(self.context, lambda: called.append(True))
-        self.assertEqual(restarted.exception.code, "result_unavailable_after_restart")
+        self.assertEqual(
+            recovered.run_tool(self.context, lambda: called.append(True)), "secret-result"
+        )
         self.assertEqual(called, [True])
         self.assertEqual(recovered.store.load(self.context.operation_key).state, "completed")
 
@@ -310,6 +333,7 @@ class AdapterTest(unittest.TestCase):
                     separators=(",", ":"),
                 ).encode()
             ).hexdigest(),
+            model_binding_hash=self.context.model_binding_hash,
         )
         gate.store.checked(
             checkpoint.operation_key, self.operation, "ready", "e" * 64
@@ -442,7 +466,7 @@ class StoreMigrationTest(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='brokerrouter_approval_notices'"
             ).fetchone()
             connection.close()
-            self.assertEqual(version, 2)
+            self.assertEqual(version, 3)
             self.assertEqual(marker, "kept")
             self.assertEqual(table[0], "brokerrouter_approval_notices")
 

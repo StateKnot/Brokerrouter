@@ -1,0 +1,148 @@
+{
+  "schema": 1,
+  "kind": "independent-local-identity-acceptance",
+  "date": "2026-10-11",
+  "status": "passed",
+  "exit_code": 0,
+  "integration_groups": 19,
+  "synthetic_identities": true,
+  "production_idp_accepted": false,
+  "full_control_plane_accepted": false,
+  "matching_release_schema": 29,
+  "source_files_sha256": {
+    "deploy/verification/identity/Browser.Dockerfile": "4dd3db22f9ad84da80c0079317d420d46f9403e555a5f1190f6e5a64a499c2b0",
+    "deploy/verification/identity/Keycloak.Dockerfile": "50516cc2286a306a889dc02a11fe249b3a605d65091eb86d627b197ea10dab63",
+    "deploy/verification/identity/README.md": "b42096f41bba5066b49a928d00b835811e2d255a99fa2b12b0c867faa7c2bc3c",
+    "deploy/verification/identity/acceptance.py": "fe36149ca474ab6c899216688733f60bb82a2d851fc997fb2b872a50bc97142b",
+    "deploy/verification/identity/browser.js": "fd048f6868a7af7c5fb592176866245aaf26845b4b53962f89bc8cea97fd26b8"
+  },
+  "source_bundle_sha256": "6eb8a31b1cc7f9c552787e5b9a9f48c641caf1368377d4aeb935628a34ec6dad",
+  "frozen_permissions_sha256": "663bd88bd64796d1e0563fc164eb66e11f265b477aeaed50d431ba0669b3919c",
+  "frozen_migration_files": 29,
+  "images": {
+    "core": {
+      "requested_reference": "sha256:897f5483b13a648b2a5053a4166e66c05ba5a070079ec0c3fd5ba148e0278000",
+      "id": "sha256:897f5483b13a648b2a5053a4166e66c05ba5a070079ec0c3fd5ba148e0278000",
+      "repo_digests": [
+        "brokerrouter@sha256:897f5483b13a648b2a5053a4166e66c05ba5a070079ec0c3fd5ba148e0278000"
+      ],
+      "architecture": "arm64",
+      "revision": "73aae4b8b060f381a79a19b67987677fdc38b08b"
+    },
+    "browser": {
+      "requested_reference": "sha256:595490e76f3a0db1125d1846f84253c506ac219140c0fb82f00e8cc5582854a6",
+      "id": "sha256:595490e76f3a0db1125d1846f84253c506ac219140c0fb82f00e8cc5582854a6",
+      "repo_digests": [
+        "brokerrouter-local-identity-browser@sha256:595490e76f3a0db1125d1846f84253c506ac219140c0fb82f00e8cc5582854a6"
+      ],
+      "architecture": "arm64",
+      "revision": null
+    },
+    "keycloak_optimized": {
+      "requested_reference": "brokerrouter-local-keycloak@sha256:ab348b253b741ff2d289067b5bf05225eded24f578e113d4c036eb16819fe592",
+      "id": "sha256:ab348b253b741ff2d289067b5bf05225eded24f578e113d4c036eb16819fe592",
+      "repo_digests": [
+        "brokerrouter-local-keycloak@sha256:ab348b253b741ff2d289067b5bf05225eded24f578e113d4c036eb16819fe592"
+      ],
+      "architecture": "arm64",
+      "revision": "26018f2a4c6155cfe2c28f078996390bf5191946"
+    },
+    "console": {
+      "requested_reference": "brokerrouter-console@sha256:4634ef080af44903ca89c0e16cd277c0201d2305772f2219ba08d46e2af3c332",
+      "id": "sha256:4634ef080af44903ca89c0e16cd277c0201d2305772f2219ba08d46e2af3c332",
+      "repo_digests": [
+        "brokerrouter-console@sha256:4634ef080af44903ca89c0e16cd277c0201d2305772f2219ba08d46e2af3c332"
+      ],
+      "architecture": "arm64",
+      "revision": null
+    },
+    "provisioner": {
+      "requested_reference": "brokerrouter-provisioner@sha256:9e1e315101845437d5b589795d60cfc8449ca3a06110b8f3e2e83a85c3624a06",
+      "id": "sha256:9e1e315101845437d5b589795d60cfc8449ca3a06110b8f3e2e83a85c3624a06",
+      "repo_digests": [
+        "brokerrouter-provisioner@sha256:9e1e315101845437d5b589795d60cfc8449ca3a06110b8f3e2e83a85c3624a06"
+      ],
+      "architecture": "arm64",
+      "revision": null
+    },
+    "postgres_official": {
+      "requested_reference": "postgres@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675",
+      "id": "sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675",
+      "repo_digests": [
+        "postgres@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675"
+      ],
+      "architecture": "arm64",
+      "revision": null
+    },
+    "nginx_official": {
+      "requested_reference": "nginx@sha256:dc5069ad14f19660b141b21236140b91656bf89bbc3e2417c70ae650cd66104c",
+      "id": "sha256:dc5069ad14f19660b141b21236140b91656bf89bbc3e2417c70ae650cd66104c",
+      "repo_digests": [
+        "nginx@sha256:dc5069ad14f19660b141b21236140b91656bf89bbc3e2417c70ae650cd66104c"
+      ],
+      "architecture": "arm64",
+      "revision": null
+    },
+    "node_official": {
+      "requested_reference": "node@sha256:a9f5f7c91a432850b2a8a7797adf5eadb6c733ceed61167806cee7ea7fbc29df",
+      "id": "sha256:a9f5f7c91a432850b2a8a7797adf5eadb6c733ceed61167806cee7ea7fbc29df",
+      "repo_digests": [
+        "node@sha256:a9f5f7c91a432850b2a8a7797adf5eadb6c733ceed61167806cee7ea7fbc29df"
+      ],
+      "architecture": "arm64",
+      "revision": null
+    },
+    "keycloak_official": {
+      "requested_reference": "quay.io/keycloak/keycloak@sha256:b0f60d489d51c5d113390bdf5461d4c06e6051be026c05549f2e1e10ec352bcc",
+      "id": "sha256:b0f60d489d51c5d113390bdf5461d4c06e6051be026c05549f2e1e10ec352bcc",
+      "repo_digests": [
+        "quay.io/keycloak/keycloak@sha256:b0f60d489d51c5d113390bdf5461d4c06e6051be026c05549f2e1e10ec352bcc"
+      ],
+      "architecture": "arm64",
+      "revision": "26018f2a4c6155cfe2c28f078996390bf5191946"
+    }
+  },
+  "browser_versions": {
+    "node": "v24.19.0",
+    "playwright": "1.63.0",
+    "chromium": "153.0.8010.12"
+  },
+  "logs_sha256": {
+    "r1-local-identity-final.log": "75d549729101234d26734479ebaf6597e0f6d25c7dbed260b5c6ccc1c203cffc",
+    "r1-local-identity-services.log": "e4c1f03d8faeca1b27cd7ae4447107b2bc9f729a8d768b73ea04049064136ff9",
+    "r1-local-identity-browser-official-build.log": "785c3d1a41e1ee683e6de039e8e6e6bdedbd375a55cc9cad4acc1909adb8496f",
+    "r1-local-keycloak-build.log": "dfe015fb95f306ab3fc14cfe97fdfe670d7d06b08559e24aabb6f5a60e4a30a5",
+    "r1-local-identity-browser-version.json": "88cd1caa0824781c1831b744e77a64fa27a88eec4e0350addcb6b4dc855b1bd8"
+  },
+  "workload_purposes": [
+    "runtime",
+    "control",
+    "console",
+    "approvals",
+    "bff"
+  ],
+  "purpose_logins_registered": 19,
+  "workload_pool_limit": 2,
+  "idp_pool_minimum": 2,
+  "idp_pool_maximum": 4,
+  "tool_provider_requests": 0,
+  "ledger_entries": 0,
+  "remaining_owned_containers": [],
+  "remaining_owned_networks": [],
+  "remaining_fixture_secret_roots": [],
+  "excluded": [
+    "user-production-IdP",
+    "OIDC-to-Hermes-real-channel-ingress",
+    "final-publication-native-history-delivery",
+    "media-S3-scanner-delivery",
+    "capacity-load-certification"
+  ],
+  "console_lock_and_deployment_templates_sha256": {
+    "console/package.json": "5caf5ea3973c6ee23b7b8e3a751dc2141bdd56bc33ea6f6a0a157d3cbd64b798",
+    "console/package-lock.json": "09102054a32f11842b57a710fca6fc36da5e808f87fd09340f9d6f95f03147df",
+    "deploy/production/render-control-edge.py": "a4d2beacf67f0332173ae4d0b379431f18092d96cafe73ff5696ec6d02552c7c",
+    "deploy/production/control-plane-nginx.conf": "2514d3fcd33894747ccf19cf8e0b4318c424dd8980ede01ddf7fca243dda35db"
+  },
+  "release_revision": "73aae4b8b060f381a79a19b67987677fdc38b08b",
+  "disk_available_after_gib": 329
+}

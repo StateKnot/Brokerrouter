@@ -41,11 +41,19 @@ pub mod output_scan_api;
 pub mod output_scans;
 pub mod outputs;
 pub mod protocol;
+pub mod runtime_artifact_api;
+pub mod runtime_artifact_delivery;
+pub mod runtime_artifact_delivery_api;
+mod runtime_artifact_sets;
+pub mod runtime_artifacts;
+pub mod runtime_publications;
+pub mod runtime_results;
 pub mod scanner_engine;
 pub mod scanner_worker;
 pub mod settings;
 pub mod settings_api;
 pub mod store;
+mod tls_roots;
 pub mod traces;
 pub mod transport;
 
@@ -55,12 +63,32 @@ use std::time::Duration;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
 pub async fn connect(database_url: &str) -> Result<PgPool, sqlx::Error> {
+    let maximum = database_max_connections(std::env::var("BROKERROUTER_DATABASE_MAX_CONNECTIONS"))?;
     PgPoolOptions::new()
-        .max_connections(20)
+        .max_connections(maximum)
         .acquire_timeout(Duration::from_secs(5))
         .after_connect(|connection, _| Box::pin(configure_connection(connection)))
         .connect(database_url)
         .await
+}
+
+fn database_max_connections(value: Result<String, std::env::VarError>) -> Result<u32, sqlx::Error> {
+    match value {
+        Err(std::env::VarError::NotPresent) => Ok(20),
+        Ok(value) => value
+            .parse::<u32>()
+            .ok()
+            .filter(|maximum| (1..=64).contains(maximum))
+            .ok_or_else(database_pool_configuration_error),
+        Err(std::env::VarError::NotUnicode(_)) => Err(database_pool_configuration_error()),
+    }
+}
+
+fn database_pool_configuration_error() -> sqlx::Error {
+    sqlx::Error::Configuration(Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "BROKERROUTER_DATABASE_MAX_CONNECTIONS must be 1..64",
+    )))
 }
 
 async fn configure_connection(connection: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
@@ -98,6 +126,28 @@ pub async fn check_schema(pool: &PgPool) -> error::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn database_pool_budget_is_bounded_and_defaults_remain_compatible() {
+        assert_eq!(
+            database_max_connections(Err(std::env::VarError::NotPresent)).unwrap(),
+            20
+        );
+        for value in ["1", "2", "8", "20", "64"] {
+            assert_eq!(
+                database_max_connections(Ok(value.into())).unwrap(),
+                value.parse::<u32>().unwrap()
+            );
+        }
+        for value in ["", "0", "65", "-1", "two", "2 ", "4294967296"] {
+            assert!(database_max_connections(Ok(value.into())).is_err());
+        }
+        assert!(
+            database_max_connections(Err(std::env::VarError::NotUnicode(
+                std::ffi::OsString::from("invalid")
+            )))
+            .is_err()
+        );
+    }
     #[sqlx::test(migrations = "./migrations")]
     async fn database_waits_are_bounded_without_overriding_explicit_limits(pool: PgPool) {
         let mut c = pool.acquire().await.unwrap();

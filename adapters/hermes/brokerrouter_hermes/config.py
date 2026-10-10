@@ -31,6 +31,7 @@ class Config:
     request_timeout_seconds: float
     approval_poll_seconds: float
     approval_wait_seconds: float
+    gateway_ca_file: Path | None = None
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Config | None:
@@ -101,6 +102,12 @@ class Config:
         if len(key) != 32:
             raise ConfigurationError("BROKERROUTER_HERMES_STATE_KEY must encode exactly 32 bytes")
 
+        ca_file = None
+        if "BROKERROUTER_HERMES_GATEWAY_CA_FILE" in values:
+            ca_file = Path(values["BROKERROUTER_HERMES_GATEWAY_CA_FILE"])
+            if not ca_file.is_absolute():
+                raise ConfigurationError("BROKERROUTER_HERMES_GATEWAY_CA_FILE requires an absolute file path")
+
         return cls(
             base_url=required["BROKERROUTER_BASE_URL"].rstrip("/"),
             approvals_url=required["BROKERROUTER_HERMES_APPROVALS_URL"].rstrip("/"),
@@ -116,4 +123,5 @@ class Config:
             approval_wait_seconds=_bounded_float(
                 values, "BROKERROUTER_HERMES_APPROVAL_WAIT_SECONDS", 300.0, 30.0, 3600.0
             ),
+            gateway_ca_file=ca_file,
         )

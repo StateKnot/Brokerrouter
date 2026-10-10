@@ -304,7 +304,7 @@ function GuardrailForm({
     stage === "media_output"
       ? ["always", "asset_scan"]
       : stage === "artifact"
-        ? ["always", "contains_any"]
+        ? ["always", "contains_any", "asset_scan"]
         : ["always", "contains_any", "model_judge"];
   return (
     <MutationForm
@@ -880,11 +880,12 @@ function PreviewResult({
             {String(input.model_id ?? "未指定")} · 工具{" "}
             {String(input.tool_name ?? "未指定")} · 阶段 {String(input.stage)}
           </p>
-          {input.stage === "media_output" &&
+          {(input.stage === "media_output" || input.stage === "artifact") &&
             !result.data.data.some((r) => r.kind === "asset_scan") && (
               <p role="alert" className="notice">
-                当前没有匹配的 asset_scan
-                护栏，不能完成隔离媒体交付。请先配置与该模型扫描证据对应的策略。
+                {input.stage === "artifact"
+                  ? "当前没有匹配的 asset_scan 护栏，原生二进制产物不能交付。请配置与该模型当前扫描证据对应的策略。"
+                  : "当前没有匹配的 asset_scan 护栏，不能完成隔离媒体交付。请先配置与该模型扫描证据对应的策略。"}
               </p>
             )}
           {result.data.judge_limit_exceeded && (
