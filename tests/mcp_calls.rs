@@ -1,34 +1,45 @@
 mod common;
 
-use axum::{body::Body, http::Request};
+use axum::{Json, Router, body::Body, http::Request, routing::post};
 use brokerrouter::{
+    McpJudgeWorker,
     cipher::ResultCipher,
     error::Error,
+    gateway::Gateway,
     mcp_calls::{Edge, Worker},
     mcp_catalog::{
         self, Authentication, CacheScope, RecordDiscovery, RegisterServer, SetToolGrant, Transport,
         UpdateServer,
     },
     mcp_client::InjectedCredentialResolver,
-    mcp_server,
+    mcp_server, money,
     store::{self, Identity},
 };
 use http_body_util::BodyExt;
 use rmcp::model::{CallToolResponse, Tool};
 use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-fn cipher() -> Arc<ResultCipher> {
-    Arc::new(
-        ResultCipher::new(
-            "mcp-fixture".into(),
-            HashMap::from([("mcp-fixture".into(), "45".repeat(32))]),
-        )
-        .unwrap(),
+fn result_cipher() -> ResultCipher {
+    ResultCipher::new(
+        "mcp-fixture".into(),
+        HashMap::from([("mcp-fixture".into(), "45".repeat(32))]),
     )
+    .unwrap()
+}
+
+fn cipher() -> Arc<ResultCipher> {
+    Arc::new(result_cipher())
 }
 
 struct Fixture {
@@ -43,7 +54,16 @@ struct Fixture {
 }
 
 async fn fixture(pool: &PgPool, label: &str, close_on_call: bool) -> Fixture {
-    let tenant = store::create_tenant(pool, label, 0).await.unwrap();
+    fixture_with_budget(pool, label, close_on_call, 0).await
+}
+
+async fn fixture_with_budget(
+    pool: &PgPool,
+    label: &str,
+    close_on_call: bool,
+    budget: i64,
+) -> Fixture {
+    let tenant = store::create_tenant(pool, label, budget).await.unwrap();
     store::put_model(pool, tenant, "fixture/model", "Fixture model")
         .await
         .unwrap();
@@ -51,7 +71,7 @@ async fn fixture(pool: &PgPool, label: &str, close_on_call: bool) -> Fixture {
         pool,
         tenant,
         "MCP fixture",
-        0,
+        budget,
         &["fixture/model".into()],
         None,
     )
@@ -240,6 +260,44 @@ done"#,
         registry,
         marker,
     }
+}
+
+async fn refresh_tool(
+    pool: &PgPool,
+    fixture: &Fixture,
+    fingerprint: &str,
+) -> mcp_catalog::AuthorizedTool {
+    mcp_catalog::record_discovery(
+        pool,
+        RecordDiscovery {
+            tenant_id: fixture.who.tenant_id,
+            server_id: fixture.tool.server_id,
+            operation_id: Uuid::new_v4(),
+            actor: "connector:fixture".into(),
+            expected_server_revision: fixture.tool.server_config_revision,
+            protocol_version: mcp_catalog::PROTOCOL_VERSION.into(),
+            result_type: "complete".into(),
+            supported_versions: vec![mcp_catalog::PROTOCOL_VERSION.into()],
+            capabilities: json!({"tools":{}}),
+            server_info: Some(json!({"name":"fixture","version":"1"})),
+            instructions: None,
+            ttl_ms: 300_000,
+            cache_scope: CacheScope::Private,
+            tools: vec![fixture.tool.descriptor.clone()],
+            tools_ttl_ms: Some(300_000),
+            tools_cache_scope: Some(CacheScope::Private),
+            skills: vec![],
+            skills_ttl_ms: None,
+            skills_cache_scope: None,
+            authorization_context_fingerprint: Some(fingerprint.into()),
+        },
+    )
+    .await
+    .unwrap();
+    mcp_catalog::authorized_tool(pool, &fixture.who, &fixture.tool.downstream_name)
+        .await
+        .unwrap()
+        .unwrap()
 }
 
 async fn scoped(pool: &PgPool, role: &'static str) -> PgPool {
@@ -456,6 +514,7 @@ async fn governed_tool_call_executes_once_and_releases_only_after_output_approva
         )
         .await;
     assert!(matches!(pending, Err(Error::ApprovalRequired(_))));
+    let refreshed = refresh_tool(&pool, &fixture, &"a".repeat(64)).await;
     let approval_id: Uuid = sqlx::query_scalar(
         "SELECT id FROM approvals WHERE tenant_id=$1 AND turn_id=$2 AND state='pending'",
     )
@@ -478,7 +537,7 @@ async fn governed_tool_call_executes_once_and_releases_only_after_output_approva
             &fixture.who,
             fixture.turn,
             call_id,
-            fixture.tool.clone(),
+            refreshed.clone(),
             args.clone(),
         )
         .await
@@ -486,13 +545,7 @@ async fn governed_tool_call_executes_once_and_releases_only_after_output_approva
     assert!(matches!(result, CallToolResponse::Complete(_)));
     let repeated = fixture
         .edge
-        .call(
-            &fixture.who,
-            fixture.turn,
-            call_id,
-            fixture.tool.clone(),
-            args,
-        )
+        .call(&fixture.who, fixture.turn, call_id, refreshed.clone(), args)
         .await
         .unwrap();
     assert!(matches!(repeated, CallToolResponse::Complete(_)));
@@ -504,12 +557,987 @@ async fn governed_tool_call_executes_once_and_releases_only_after_output_approva
                 &fixture.who,
                 fixture.turn,
                 call_id,
-                fixture.tool.clone(),
+                refreshed,
                 json!({"id":"different"})
             )
             .await,
         Err(Error::Conflict)
     ));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn completed_tool_result_rechecks_new_output_policy_without_reexecuting(pool: PgPool) {
+    let fixture = fixture(&pool, "mcp-completed-policy", false).await;
+    let call_id = Uuid::new_v4();
+    let args = json!({"id":"already-written"});
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args.clone()
+            )
+            .await,
+        Err(Error::InProgress)
+    ));
+    assert!(fixture.worker.tick().await.unwrap());
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args.clone()
+            )
+            .await
+            .unwrap(),
+        CallToolResponse::Complete(_)
+    ));
+    assert_eq!(call_count(&fixture.marker), 1);
+
+    common::guardrail(
+        &pool,
+        fixture.who.tenant_id,
+        "late-output-review",
+        1,
+        "tool_output",
+        json!({"kind":"always"}),
+    )
+    .await;
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args.clone()
+            )
+            .await,
+        Err(Error::ApprovalRequired(_))
+    ));
+    let approval_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM approvals WHERE tenant_id=$1 AND turn_id=$2 AND state='pending'",
+    )
+    .bind(fixture.who.tenant_id)
+    .bind(fixture.turn)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    common::decide(
+        &pool,
+        "alice",
+        approval_id,
+        common::approve(&["late-output-review"]),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args.clone()
+            )
+            .await
+            .unwrap(),
+        CallToolResponse::Complete(_)
+    ));
+
+    common::guardrail(
+        &pool,
+        fixture.who.tenant_id,
+        "late-output-review",
+        2,
+        "tool_output",
+        json!({"kind":"always"}),
+    )
+    .await;
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args
+            )
+            .await,
+        Err(Error::ApprovalRequired(_))
+    ));
+    assert_eq!(call_count(&fixture.marker), 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn completed_result_is_withheld_after_tool_grant_revocation(pool: PgPool) {
+    let fixture = fixture(&pool, "mcp-completed-revocation", false).await;
+    let call_id = Uuid::new_v4();
+    let args = json!({"id":"already-written"});
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args.clone()
+            )
+            .await,
+        Err(Error::InProgress)
+    ));
+    assert!(fixture.worker.tick().await.unwrap());
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args.clone()
+            )
+            .await
+            .unwrap(),
+        CallToolResponse::Complete(_)
+    ));
+    sqlx::query("UPDATE mcp_key_tool_grants SET active=false WHERE tenant_id=$1 AND key_id=$2")
+        .bind(fixture.who.tenant_id)
+        .bind(fixture.who.key_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args
+            )
+            .await,
+        Err(Error::Unauthorized)
+    ));
+    assert_eq!(call_count(&fixture.marker), 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn expired_turn_fails_pending_mcp_judge_without_dispatch(pool: PgPool) {
+    let fixture = fixture(&pool, "mcp-pending-expiry", false).await;
+    common::guardrail(
+        &pool,
+        fixture.who.tenant_id,
+        "semantic-input",
+        1,
+        "tool_input",
+        json!({"kind":"model_judge","model":"fixture/model","instructions":"Flag risky tool use.","input_format":"text_json","max_input_bytes":65536,"max_output_tokens":32,"maximum_cny":"0.1"}),
+    ).await;
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                Uuid::new_v4(),
+                fixture.tool.clone(),
+                json!({"id":"no-dispatch"})
+            )
+            .await,
+        Err(Error::InProgress)
+    ));
+    sqlx::query("UPDATE governance_turns SET state='completed' WHERE tenant_id=$1 AND id=$2")
+        .bind(fixture.who.tenant_id)
+        .bind(fixture.turn)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../deploy/permissions.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let gateway = Gateway::new(
+        scoped(&pool, "brokerrouter_runtime").await,
+        result_cipher(),
+        HashMap::new(),
+        4,
+        5,
+        60,
+    )
+    .unwrap();
+    assert!(!McpJudgeWorker::new(gateway).tick().await.unwrap());
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM guardrail_evaluations WHERE tenant_id=$1")
+            .bind(fixture.who.tenant_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "failed");
+    assert_eq!(call_count(&fixture.marker), 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn mcp_judge_recovers_approval_after_settlement_before_gate(pool: PgPool) {
+    let fixture = fixture(&pool, "mcp-judge-recovery", false).await;
+    common::guardrail(
+        &pool,
+        fixture.who.tenant_id,
+        "semantic-input",
+        1,
+        "tool_input",
+        json!({"kind":"model_judge","model":"fixture/model","instructions":"Flag risky tool use.","input_format":"text_json","max_input_bytes":65536,"max_output_tokens":32,"maximum_cny":"0.1"}),
+    ).await;
+    let call_id = Uuid::new_v4();
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                json!({"id":"recover"})
+            )
+            .await,
+        Err(Error::InProgress)
+    ));
+    // Recreate the committed state after a classifier settled but its worker
+    // crashed before re-entering the governance gate.
+    sqlx::query("UPDATE guardrail_evaluations SET state='risk',reason_code='judge_risk',finished_at=clock_timestamp() WHERE tenant_id=$1 AND state='pending'")
+        .bind(fixture.who.tenant_id).execute(&pool).await.unwrap();
+    sqlx::raw_sql(include_str!("../deploy/permissions.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let judge = McpJudgeWorker::new(
+        Gateway::new(
+            scoped(&pool, "brokerrouter_runtime").await,
+            result_cipher(),
+            HashMap::new(),
+            4,
+            5,
+            60,
+        )
+        .unwrap(),
+    );
+    assert!(judge.tick().await.unwrap());
+    let approval: (String, String) = sqlx::query_as("SELECT a.state,o.state FROM approvals a JOIN governance_operations o ON o.tenant_id=a.tenant_id AND o.id=a.operation_id WHERE a.tenant_id=$1")
+        .bind(fixture.who.tenant_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(approval, ("pending".into(), "waiting_approval".into()));
+    assert_eq!(call_count(&fixture.marker), 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn unavailable_mcp_judge_fails_closed_into_human_approval(pool: PgPool) {
+    let fixture = fixture(&pool, "mcp-judge-unavailable", false).await;
+    common::guardrail(
+        &pool,
+        fixture.who.tenant_id,
+        "semantic-input",
+        1,
+        "tool_input",
+        json!({"kind":"model_judge","model":"fixture/model","instructions":"Flag risky tool use.","input_format":"text_json","max_input_bytes":65536,"max_output_tokens":32,"maximum_cny":"0.1"}),
+    ).await;
+    let call_id = Uuid::new_v4();
+    let args = json!({"id":"still-private"});
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args.clone()
+            )
+            .await,
+        Err(Error::InProgress)
+    ));
+    sqlx::raw_sql(include_str!("../deploy/permissions.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let judge = McpJudgeWorker::new(
+        Gateway::new(
+            scoped(&pool, "brokerrouter_runtime").await,
+            result_cipher(),
+            HashMap::new(),
+            4,
+            3,
+            60,
+        )
+        .unwrap(),
+    );
+    assert!(judge.tick().await.unwrap());
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM guardrail_evaluations WHERE tenant_id=$1")
+            .bind(fixture.who.tenant_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "failed");
+    let pending: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM approvals WHERE tenant_id=$1 AND state='pending'")
+            .bind(fixture.who.tenant_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(pending, 1);
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args
+            )
+            .await,
+        Err(Error::ApprovalRequired(_))
+    ));
+    assert_eq!(call_count(&fixture.marker), 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn identical_discovery_refresh_preserves_queued_and_completed_call(pool: PgPool) {
+    let fixture = fixture(&pool, "mcp-refresh", false).await;
+    let call_id = Uuid::new_v4();
+    let args = json!({"id":"one-dispatch"});
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args.clone()
+            )
+            .await,
+        Err(Error::InProgress)
+    ));
+    let latest = refresh_tool(&pool, &fixture, &"a".repeat(64)).await;
+    assert_ne!(
+        fixture.tool.discovery_snapshot_id,
+        latest.discovery_snapshot_id
+    );
+    assert!(fixture.worker.tick().await.unwrap());
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                latest.clone(),
+                args.clone()
+            )
+            .await
+            .unwrap(),
+        CallToolResponse::Complete(_)
+    ));
+    let newest = refresh_tool(&pool, &fixture, &"a".repeat(64)).await;
+    assert!(matches!(
+        fixture
+            .edge
+            .call(&fixture.who, fixture.turn, call_id, newest, args.clone())
+            .await
+            .unwrap(),
+        CallToolResponse::Complete(_)
+    ));
+    assert_eq!(call_count(&fixture.marker), 1);
+
+    let mut changed_descriptor = fixture.tool.descriptor.clone();
+    changed_descriptor["description"] = json!("A changed fixture contract");
+    mcp_catalog::record_discovery(
+        &pool,
+        RecordDiscovery {
+            tenant_id: fixture.who.tenant_id,
+            server_id: fixture.tool.server_id,
+            operation_id: Uuid::new_v4(),
+            actor: "connector:fixture".into(),
+            expected_server_revision: fixture.tool.server_config_revision,
+            protocol_version: mcp_catalog::PROTOCOL_VERSION.into(),
+            result_type: "complete".into(),
+            supported_versions: vec![mcp_catalog::PROTOCOL_VERSION.into()],
+            capabilities: json!({"tools":{}}),
+            server_info: Some(json!({"name":"fixture","version":"1"})),
+            instructions: None,
+            ttl_ms: 300_000,
+            cache_scope: CacheScope::Private,
+            tools: vec![changed_descriptor],
+            tools_ttl_ms: Some(300_000),
+            tools_cache_scope: Some(CacheScope::Private),
+            skills: vec![],
+            skills_ttl_ms: None,
+            skills_cache_scope: None,
+            authorization_context_fingerprint: Some("a".repeat(64)),
+        },
+    )
+    .await
+    .unwrap();
+    let reviewed = mcp_catalog::review_tools(&pool, fixture.who.tenant_id, fixture.tool.server_id)
+        .await
+        .unwrap();
+    mcp_catalog::set_tool_grant(
+        &pool,
+        SetToolGrant {
+            tenant_id: fixture.who.tenant_id,
+            key_id: fixture.who.key_id,
+            server_id: fixture.tool.server_id,
+            operation_id: Uuid::new_v4(),
+            actor: "operator:fixture".into(),
+            reason: "reviewed changed descriptor".into(),
+            downstream_name: fixture.tool.downstream_name.clone(),
+            descriptor_sha256: reviewed["tools"][0]["descriptor_sha256"]
+                .as_str()
+                .unwrap()
+                .into(),
+            active: true,
+        },
+    )
+    .await
+    .unwrap();
+    let changed = mcp_catalog::authorized_tool(&pool, &fixture.who, &fixture.tool.downstream_name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(fixture.tool.descriptor_hash, changed.descriptor_hash);
+    assert!(matches!(
+        fixture
+            .edge
+            .call(&fixture.who, fixture.turn, call_id, changed, args)
+            .await,
+        Err(Error::Conflict)
+    ));
+    assert_eq!(call_count(&fixture.marker), 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn expired_latest_discovery_never_falls_back_to_older_tool_grant(pool: PgPool) {
+    let fixture = fixture(&pool, "mcp-latest-expired", false).await;
+    let call_id = Uuid::new_v4();
+    let args = json!({"id":"already-executed"});
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args.clone()
+            )
+            .await,
+        Err(Error::InProgress)
+    ));
+    assert!(fixture.worker.tick().await.unwrap());
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args.clone()
+            )
+            .await,
+        Ok(CallToolResponse::Complete(_))
+    ));
+    mcp_catalog::record_discovery(
+        &pool,
+        RecordDiscovery {
+            tenant_id: fixture.who.tenant_id,
+            server_id: fixture.tool.server_id,
+            operation_id: Uuid::new_v4(),
+            actor: "connector:fixture".into(),
+            expected_server_revision: fixture.tool.server_config_revision,
+            protocol_version: mcp_catalog::PROTOCOL_VERSION.into(),
+            result_type: "complete".into(),
+            supported_versions: vec![mcp_catalog::PROTOCOL_VERSION.into()],
+            capabilities: json!({"tools":{}}),
+            server_info: Some(json!({"name":"fixture","version":"1"})),
+            instructions: None,
+            ttl_ms: 0,
+            cache_scope: CacheScope::Private,
+            tools: vec![fixture.tool.descriptor.clone()],
+            tools_ttl_ms: Some(0),
+            tools_cache_scope: Some(CacheScope::Private),
+            skills: vec![],
+            skills_ttl_ms: None,
+            skills_cache_scope: None,
+            authorization_context_fingerprint: Some("a".repeat(64)),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        mcp_catalog::authorized_tool(&pool, &fixture.who, &fixture.tool.downstream_name)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        mcp_catalog::authorized_tools(&pool, &fixture.who, None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        mcp_catalog::review_tools(&pool, fixture.who.tenant_id, fixture.tool.server_id).await,
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        mcp_catalog::set_tool_grant(
+            &pool,
+            SetToolGrant {
+                tenant_id: fixture.who.tenant_id,
+                key_id: fixture.who.key_id,
+                server_id: fixture.tool.server_id,
+                operation_id: Uuid::new_v4(),
+                actor: "operator:fixture".into(),
+                reason: "must use fresh observation".into(),
+                downstream_name: fixture.tool.downstream_name.clone(),
+                descriptor_sha256: fixture
+                    .tool
+                    .descriptor_hash
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+                active: true,
+            }
+        )
+        .await,
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        fixture
+            .edge
+            .call(&fixture.who, fixture.turn, call_id, fixture.tool, args)
+            .await,
+        Err(Error::Unauthorized)
+    ));
+    assert_eq!(call_count(&fixture.marker), 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn input_approval_survives_identical_refresh_but_not_auth_context_change(pool: PgPool) {
+    let fixture = fixture(&pool, "mcp-refresh-approval", false).await;
+    common::guardrail(
+        &pool,
+        fixture.who.tenant_id,
+        "review-input",
+        1,
+        "tool_input",
+        json!({"kind":"always"}),
+    )
+    .await;
+    let call_id = Uuid::new_v4();
+    let args = json!({"id":"approval-before-queue"});
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args.clone()
+            )
+            .await,
+        Err(Error::ApprovalRequired(_))
+    ));
+    let same = refresh_tool(&pool, &fixture, &"a".repeat(64)).await;
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                same.clone(),
+                args.clone()
+            )
+            .await,
+        Err(Error::ApprovalRequired(_))
+    ));
+    let changed = refresh_tool(&pool, &fixture, &"b".repeat(64)).await;
+    assert!(matches!(
+        fixture
+            .edge
+            .call(&fixture.who, fixture.turn, call_id, changed, args.clone())
+            .await,
+        Err(Error::Conflict)
+    ));
+    let restored = refresh_tool(&pool, &fixture, &"a".repeat(64)).await;
+    let approval_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM approvals WHERE tenant_id=$1 AND turn_id=$2 AND state='pending'",
+    )
+    .bind(fixture.who.tenant_id)
+    .bind(fixture.turn)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    common::decide(
+        &pool,
+        "alice",
+        approval_id,
+        common::approve(&["review-input"]),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                restored.clone(),
+                args.clone()
+            )
+            .await,
+        Err(Error::InProgress)
+    ));
+    assert!(fixture.worker.tick().await.unwrap());
+    assert!(matches!(
+        fixture
+            .edge
+            .call(&fixture.who, fixture.turn, call_id, restored, args)
+            .await
+            .unwrap(),
+        CallToolResponse::Complete(_)
+    ));
+    assert_eq!(call_count(&fixture.marker), 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn mcp_semantic_worker_drives_input_and_completed_output_without_reexecuting(pool: PgPool) {
+    sqlx::raw_sql(include_str!("../deploy/permissions.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let fixture = fixture_with_budget(&pool, "mcp-semantic", false, 10_000_000).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let risky = Arc::new(AtomicBool::new(true));
+    let provider_risky = risky.clone();
+    let provider = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/v1/chat/completions",
+                post(move || {
+                    let provider_risky = provider_risky.clone();
+                    async move {
+                        let verdict = if provider_risky.load(Ordering::Relaxed) {
+                            "{\"decision\":\"risk\"}"
+                        } else {
+                            "{\"decision\":\"pass\"}"
+                        };
+                        Json(json!({
+                            "id":"judge-fixture","object":"chat.completion","created":1,
+                            "model":"judge-upstream",
+                            "choices":[{"index":0,"message":{"role":"assistant","content":verdict},"finish_reason":"stop"}],
+                            "usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}
+                        }))
+                    }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    store::add_endpoint(
+        &pool,
+        &store::Endpoint {
+            id: Uuid::new_v4(),
+            tenant_id: fixture.who.tenant_id,
+            model_id: "fixture/model".into(),
+            name: "judge-provider".into(),
+            upstream_model: "judge-upstream".into(),
+            base_url: url,
+            credential_env: "FIXTURE_PROVIDER_KEY".into(),
+            allow_private: true,
+            currency: "CNY".into(),
+            input_per_million: money::nonnegative("1").unwrap(),
+            output_per_million: money::nonnegative("1").unwrap(),
+            context_tokens: 1000,
+            max_output_tokens: 100,
+            priority: 10,
+            operation: "chat".into(),
+            supports_tools: false,
+            supports_streaming: false,
+            embedding_dimension: None,
+        },
+    )
+    .await
+    .unwrap();
+    let rule = json!({"kind":"model_judge","model":"fixture/model","instructions":"Flag risky tool use.","input_format":"text_json","max_input_bytes":65536,"max_output_tokens":32,"maximum_cny":"0.1"});
+    common::guardrail(
+        &pool,
+        fixture.who.tenant_id,
+        "semantic-input",
+        1,
+        "tool_input",
+        rule.clone(),
+    )
+    .await;
+    let judge = McpJudgeWorker::new(
+        Gateway::new(
+            scoped(&pool, "brokerrouter_runtime").await,
+            result_cipher(),
+            HashMap::from([("FIXTURE_PROVIDER_KEY".into(), "fixture-secret".into())]),
+            4,
+            3,
+            60,
+        )
+        .unwrap(),
+    );
+    let call_id = Uuid::new_v4();
+    let args = json!({"id":"semantic-once"});
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args.clone()
+            )
+            .await,
+        Err(Error::InProgress)
+    ));
+    assert!(judge.tick().await.unwrap());
+    let input_approval_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM approvals WHERE tenant_id=$1 AND state='pending'")
+            .bind(fixture.who.tenant_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(input_approval_count, 1);
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args.clone()
+            )
+            .await,
+        Err(Error::ApprovalRequired(_))
+    ));
+    assert_eq!(call_count(&fixture.marker), 0);
+    let input_approval: Uuid = sqlx::query_scalar(
+        "SELECT id FROM approvals WHERE tenant_id=$1 AND turn_id=$2 AND state='pending'",
+    )
+    .bind(fixture.who.tenant_id)
+    .bind(fixture.turn)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    common::decide(
+        &pool,
+        "alice",
+        input_approval,
+        common::approve(&["semantic-input"]),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args.clone()
+            )
+            .await,
+        Err(Error::InProgress)
+    ));
+    assert!(fixture.worker.tick().await.unwrap());
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args.clone()
+            )
+            .await
+            .unwrap(),
+        CallToolResponse::Complete(_)
+    ));
+
+    common::guardrail(
+        &pool,
+        fixture.who.tenant_id,
+        "semantic-output",
+        1,
+        "tool_output",
+        rule,
+    )
+    .await;
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args.clone()
+            )
+            .await,
+        Err(Error::InProgress)
+    ));
+    assert!(judge.tick().await.unwrap());
+    let output_approval_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM approvals WHERE tenant_id=$1 AND state='pending'")
+            .bind(fixture.who.tenant_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(output_approval_count, 1);
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args.clone()
+            )
+            .await,
+        Err(Error::ApprovalRequired(_))
+    ));
+    let output_approval: Uuid = sqlx::query_scalar(
+        "SELECT id FROM approvals WHERE tenant_id=$1 AND turn_id=$2 AND state='pending'",
+    )
+    .bind(fixture.who.tenant_id)
+    .bind(fixture.turn)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    common::decide(
+        &pool,
+        "alice",
+        output_approval,
+        common::approve(&["semantic-output"]),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                fixture.turn,
+                call_id,
+                fixture.tool.clone(),
+                args
+            )
+            .await
+            .unwrap(),
+        CallToolResponse::Complete(_)
+    ));
+    let evaluated: (i64, i64) = sqlx::query_as(
+        "SELECT count(*),coalesce(sum(final_micros),0)::bigint FROM requests WHERE tenant_id=$1 AND guardrail_evaluation_id IS NOT NULL",
+    )
+    .bind(fixture.who.tenant_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(evaluated.0, 2);
+    assert!(evaluated.1 > 0);
+    assert_eq!(call_count(&fixture.marker), 1);
+
+    risky.store(false, Ordering::Relaxed);
+    let safe_turn = common::turn(&pool, &fixture.who, "alice", 1).await;
+    let safe_call = Uuid::new_v4();
+    let safe_args = json!({"id":"semantic-pass"});
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                safe_turn,
+                safe_call,
+                fixture.tool.clone(),
+                safe_args.clone()
+            )
+            .await,
+        Err(Error::InProgress)
+    ));
+    assert!(judge.tick().await.unwrap());
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                safe_turn,
+                safe_call,
+                fixture.tool.clone(),
+                safe_args.clone()
+            )
+            .await,
+        Err(Error::InProgress)
+    ));
+    assert!(fixture.worker.tick().await.unwrap());
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                safe_turn,
+                safe_call,
+                fixture.tool.clone(),
+                safe_args.clone()
+            )
+            .await,
+        Err(Error::InProgress)
+    ));
+    assert!(judge.tick().await.unwrap());
+    assert!(matches!(
+        fixture
+            .edge
+            .call(
+                &fixture.who,
+                safe_turn,
+                safe_call,
+                fixture.tool.clone(),
+                safe_args
+            )
+            .await
+            .unwrap(),
+        CallToolResponse::Complete(_)
+    ));
+    let passed: i64 = sqlx::query_scalar("SELECT count(*) FROM guardrail_evaluations e JOIN governance_operations o ON o.tenant_id=e.tenant_id AND o.id=e.operation_id WHERE e.tenant_id=$1 AND o.turn_id=$2 AND e.state='passed'")
+        .bind(fixture.who.tenant_id).bind(safe_turn).fetch_one(&pool).await.unwrap();
+    assert_eq!(passed, 2);
+    assert_eq!(call_count(&fixture.marker), 2);
+    provider.abort();
 }
 
 #[sqlx::test(migrations = "./migrations")]

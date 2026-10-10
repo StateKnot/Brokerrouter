@@ -1,0 +1,190 @@
+{
+  "date": "2026-10-11",
+  "scope": "R0 local development exit, not complete production certification",
+  "source_commit": "a633eeff1da55fb1cd5ffa88060e723570f0915d",
+  "image_id": "sha256:874000faca6075f1d9d5ed1b2b28fa8f714921116afc7c1a86c1695979891d81",
+  "rust": {
+    "toolchain": "1.98.1",
+    "regular_passed": 269,
+    "regular_failed": 0,
+    "ignored": 4,
+    "ignored_explicit_passed": 4,
+    "format": "passed",
+    "clippy_all_targets": "passed",
+    "release_all_targets": "passed"
+  },
+  "console": {
+    "runtime": {
+      "node": "v24.19.0",
+      "platform": "linux",
+      "arch": "arm64",
+      "playwright": "1.63.0",
+      "browsers": [
+        {
+          "name": "chromium",
+          "revision": "1243",
+          "browserVersion": "153.0.8010.12"
+        },
+        {
+          "name": "webkit",
+          "revision": "2359",
+          "browserVersion": "26.6"
+        }
+      ]
+    },
+    "checks": {
+      "lock_install": "passed",
+      "audit_high": "passed, zero vulnerabilities",
+      "format": "passed",
+      "build": "passed",
+      "unit_passed": 28,
+      "browser_passed": 132,
+      "chromium_passed": 66,
+      "webkit_passed": 66,
+      "browser_failed": 0,
+      "nginx_edge": "passed",
+      "nginx_preview_edge": "passed"
+    }
+  },
+  "hermes": {
+    "python": "3.12.10",
+    "httpx": "0.28.1",
+    "cryptography": "50.0.0",
+    "tests_passed": 24,
+    "tests_skipped": 2,
+    "fixed_three_file_overlay": "passed",
+    "full_native_runtime": "pending R1"
+  },
+  "deployment": {
+    "started_at": "2026-10-10T16:41:08.310320+00:00",
+    "project": "brokerrouter-local-acceptance-20261010",
+    "port": 28080,
+    "waves": 20,
+    "tcp_limit": 64,
+    "rss_budget_bytes": 402653184,
+    "max_settlement_wait_seconds": 1.5632828749999987,
+    "data_plane_http2_rejected": true,
+    "connection_lifetime_seconds": 180,
+    "database_tls_connections": 8,
+    "slow_connections_opened": 64,
+    "rejected_connections": 16,
+    "ledger": {
+      "requests": 67,
+      "succeeded": 67,
+      "final_micros": 469,
+      "invalid_finalizations": 0
+    },
+    "peak_rss_bytes": 142831616,
+    "peak_cgroup_bytes": 119468032,
+    "peak_established_tcp": 64,
+    "result": "passed"
+  },
+  "deadline": {
+    "started_at": "2026-10-10T16:44:32.512215+00:00",
+    "project": "brokerrouter-local-acceptance-20261010",
+    "port": 28080,
+    "waves": 20,
+    "tcp_limit": 64,
+    "rss_budget_bytes": 402653184,
+    "max_settlement_wait_seconds": 0,
+    "data_plane_http2_rejected": true,
+    "connection_lifetime_seconds": 180,
+    "deadline_elapsed_seconds": 180.004159042,
+    "result": "passed"
+  },
+  "logs": [
+    {
+      "name": "rust-full.log",
+      "bytes": 26682,
+      "sha256": "aeeaf92ed971d67d27ffa259906522b4e77547c6ea91ae011d3fe4355203307f"
+    },
+    {
+      "name": "rust-clippy.log",
+      "bytes": 141,
+      "sha256": "1d8f416836a5626dd7a25264aea6e348acfafb01ca876e5343022a5e8ae4ef53"
+    },
+    {
+      "name": "rust-release.log",
+      "bytes": 143,
+      "sha256": "259fb776a7b3f1b4e678ff3a7574ad0951edd158438fafb0e506ad3ffe272900"
+    },
+    {
+      "name": "transport-final.log",
+      "bytes": 867,
+      "sha256": "a09e3efc9232db1efa02b037b7af04fbed94d03792eb79a5c8fd42be9766ece6"
+    },
+    {
+      "name": "h2c-red.log",
+      "bytes": 6791,
+      "sha256": "3a68c6dfe1277a74badef75f87488ca310387f7e4c3da2504f58f3462e690066"
+    },
+    {
+      "name": "h2c-green.log",
+      "bytes": 415,
+      "sha256": "f680e260e30d3b254e42839df9cde757142c4166dde641529815472b7fdaf020"
+    },
+    {
+      "name": "detector-contract.log",
+      "bytes": 416,
+      "sha256": "50d3f95ff8869ba3a00ce9a6b014fff1a600c5dd0b08c79fc2c15bc6b252ceb4"
+    },
+    {
+      "name": "s3-assets-contract.log",
+      "bytes": 321,
+      "sha256": "4787ebaec2151b6241a58d2dc5407ef782bb4eeffe317cc5493a9c1c5f54d102"
+    },
+    {
+      "name": "s3-outputs-contract.log",
+      "bytes": 302,
+      "sha256": "2a2188a2f388eafa41fa28d5dfa9e388443bf543814bbabd2395fa562fc978e4"
+    },
+    {
+      "name": "console-summary.json",
+      "bytes": 3151,
+      "sha256": "103ba510c210bbe4b0d4eaa2dcb3ecd8bf6f7135dc7340e0d8bdcc58c9ffa9ea"
+    },
+    {
+      "name": "console-browser.log",
+      "bytes": 17752,
+      "sha256": "3faff06a637aee6e21c8c4e303c044ec6dffa891da4f3fba5082ecc46e42df09"
+    },
+    {
+      "name": "r0-hermes.log",
+      "bytes": 7612,
+      "sha256": "d3b5f2a0dcbadfb003381969068e4c933e0342b2930e0f3928ff8013ec1714a8"
+    },
+    {
+      "name": "image-build.log",
+      "bytes": 37948,
+      "sha256": "7755d792560139d2cbf9b095310bcd96655cbdcb79084ad3c240dd8d34f98a51"
+    },
+    {
+      "name": "r0-image-source.json",
+      "bytes": 12293,
+      "sha256": "eccac4696151bf4b02b76a38d98c4a07360179acedaad212dd49605087b13e23"
+    },
+    {
+      "name": "deployment-h2-before.json",
+      "bytes": 336,
+      "sha256": "48abb57e84a05c9bb5d40c1f8919cc624b2ce1467cd787dfe1be641793220b27"
+    },
+    {
+      "name": "deployment-h1.json",
+      "bytes": 4201,
+      "sha256": "72e4e5425b7aea06479e98cbb6043183d0a70c308ccbb98ac314e4b8fbe1b478"
+    },
+    {
+      "name": "deadline-h1.json",
+      "bytes": 551,
+      "sha256": "d88f23f62b034ef701906854be28115b7b3c54464f7d7a3f227090fe2d4a0324"
+    }
+  ],
+  "raw_evidence_directory": "/private/tmp/brokerrouter-acceptance-20261010/evidence",
+  "remaining": [
+    "GitHub checks/required branch protection",
+    "target host capacity and operations",
+    "real OIDC/Hermes native tool output/artifact/publish recovery",
+    "real provider certifications",
+    "R1-R5 complete product acceptance"
+  ]
+}

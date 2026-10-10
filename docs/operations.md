@@ -49,6 +49,18 @@ M5.3b 迁移 `0014` 后重新应用权限脚本，新增专用 `brokerrouter_set
 - `reserve` 占额度但不是花费；`finalize` 是入账消费；`release` 释放未消费预留。不能将三类流水相加当总花费。
 - 预留是租户、Key 两层同时通过的事务。不确定提交保留占用，未发送才能释放；已发送后撤销 Key 不阻止核对和结算，但阻止新准入。
 
+## SSE 与传输容量边界（R0.5，目标环境另行验收）
+
+实时流和密文重放共用 SSE 交付额度。程序默认 `BROKERROUTER_MAX_CONCURRENCY=64` 时，上游并发 U=64、SSE 交付 C=16；生产 Compose 明确设置 U=16、C=4。可用 `BROKERROUTER_MAX_STREAM_CONNECTIONS` 将 C 固定在 1–1024，超额请求在预算预留前返回 `gateway_busy`。每个交付队列固定 4 × 64 KiB，即 Q=256 KiB；实时上游响应 R=4 MiB。SSE 响应建立后最多存活 `BROKERROUTER_REQUEST_TIMEOUT_SECONDS + 60` 秒（默认 180 秒）；建立前仍受上游请求超时约束。实时发送单片等待最多 100 ms，重放单片等待最多 5 秒。慢客户端会被关闭，下游停止交付，后台仍消费上游并尝试持久结算；只有结算成功才向仍连接的客户端发 `[DONE]`。
+
+交付队列之外，数据面还限制全部已接受 TCP 连接，包括空闲、未完成请求头、keepalive 和阻塞发送。`BROKERROUTER_MAX_HTTP_CONNECTIONS` 默认/Compose 为 64（有效范围 1–1024），`BROKERROUTER_HTTP_CONNECTION_TIMEOUT_SECONDS` 默认上游请求时限加 60 秒、Compose 为 180 秒（有效范围 1–900）。期限从接受 socket 起算，独立定时器关闭内核 socket，不依赖请求/响应是否正在 poll IO。许可保留至传输关闭，不能在上游完成或响应体排空时提前释放。超额连接在 HTTP 解析和收费准入前关闭，拒绝累计数以 `http_connection_capacity_full` 告警码按 2 的幂采样记录；连接到期码为 `http_connection_deadline`。
+
+数据面显式使用 Hyper HTTP/1.1。原自动协议协商因传递依赖启用 HTTP/2，允许单 socket 多个滞留流，不能沿用按 socket 的内存预算。HTTPS edge 可对外终止 HTTP/2，但必须以 HTTP/1.1 代理到网关，并关闭 SSE 缓冲。SIGTERM/SIGINT 停止新连接、排空在途 HTTP，再等待独立后台结算；阻塞客户端仍受原绝对连接期限约束。
+
+网关 Compose 的停止宽限为 6 分钟：请求体可能在接近 socket 的 180 秒期限时才读完，并启动受独立 120 秒时限约束的后台收费任务；剩余时间用于结算。不能把宽限只设为 socket 期限。连接关闭、停止交付或进程被强制终止均不代表零费用；受理不确定事实继续核对，不能退款后盲目重提。
+
+程序默认配置中 `C × Q + U × R` 约为 260 MiB；生产 Compose 的 U=16、C=4 时约为 65 MiB。这只是发送队列加实时响应硬限的预算，不包含 SSE 解析/聚合副本、历史重放构造、HTTP/内核 socket 缓冲、连接元数据、数据库池、进程基础内存和反向代理缓冲。生产 Compose 容器内存上限 512 MiB，本地探针在负载前固定 RSS 预算 384 MiB（75%）。目标环境须用相同发布物实测 RSS/容器总内存、连接数、拒绝数和结算延迟后确认容量与告警；本地证据不代替目标主机认证。完整复现步骤见 [本地部署验收](../deploy/verification/README.md)，实测结果以对应版本的验收报告为准。
+
 ## 当前尚未开放
 
 当前已实现非流式 Chat/Embedding、按端点能力开放的 Chat SSE、幂等结果读取、人工费用核对、持久审批/文本语义检测、私有资产/单位计费，以及首个文生视频协议、隔离转存、技术检测和当前轮审批交付服务端。SSE 只能为经认证端点显式开启，真实供应商仍须通过 LIVE-01；命中输出护栏时失败关闭为非流式。Responses、图片/3D/其他供应商协议、专用多模态语义审核、其他模态预览、自动供应商对账，以及真实 BFF/Runtime/供应商/生产存储认证尚未完成，不能据此宣称完整网关可上线。

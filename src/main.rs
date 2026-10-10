@@ -262,6 +262,10 @@ enum Command {
         #[arg(long, default_value_t = 2)]
         concurrency: usize,
     },
+    McpJudgeWorker {
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
+    },
     McpToolsList {
         #[arg(long)]
         tenant: Uuid,
@@ -775,6 +779,46 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("MCP worker exited unexpectedly");
             }
         }
+        Command::McpJudgeWorker { concurrency } => {
+            if !(1..=16).contains(&concurrency) {
+                anyhow::bail!("MCP judge worker concurrency must be 1..16");
+            }
+            brokerrouter::check_schema(&pool).await?;
+            let gateway = brokerrouter::gateway::Gateway::from_env(pool.clone()).await?;
+            let worker = brokerrouter::McpJudgeWorker::new(gateway.clone());
+            let stop = tokio_util::sync::CancellationToken::new();
+            let mut workers = tokio::task::JoinSet::new();
+            for _ in 0..concurrency {
+                let (worker, stop) = (worker.clone(), stop.clone());
+                workers.spawn(async move {
+                    while !stop.is_cancelled() {
+                        let idle = match worker.tick().await {
+                            Ok(processed) => !processed,
+                            Err(error) => {
+                                tracing::error!(error=%error,"MCP semantic worker pass failed; durable state retained");
+                                true
+                            }
+                        };
+                        if idle {
+                            tokio::select! {
+                                _ = stop.cancelled() => break,
+                                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                            }
+                        }
+                    }
+                });
+            }
+            let failed = tokio::select! {
+                _ = shutdown() => false,
+                _ = workers.join_next() => true,
+            };
+            stop.cancel();
+            while workers.join_next().await.is_some() {}
+            gateway.drain().await;
+            if failed {
+                anyhow::bail!("MCP semantic worker exited unexpectedly");
+            }
+        }
         Command::McpToolsList { tenant, server } => {
             brokerrouter::check_schema(&pool).await?;
             println!(
@@ -1072,9 +1116,13 @@ async fn main() -> anyhow::Result<()> {
             });
             let listener = tokio::net::TcpListener::bind(bind).await?;
             tracing::info!(address=%bind,"brokerrouter listening");
-            axum::serve(listener, api::gateway_router(gateway.clone()))
-                .with_graceful_shutdown(shutdown())
-                .await?;
+            let listener = brokerrouter::transport::BoundedListener::from_env(listener)?;
+            brokerrouter::transport::serve_h1(
+                listener,
+                api::gateway_router(gateway.clone()),
+                shutdown(),
+            )
+            .await;
             gateway.drain().await;
             maintenance.abort();
         }

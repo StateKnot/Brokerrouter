@@ -64,6 +64,108 @@ pub(crate) enum Observation {
     Complete { outcome: String, reason: String },
 }
 
+/// Uses the existing runtime/judge role and provider credentials, never the
+/// public MCP edge or the connector worker's upstream MCP credentials.
+#[derive(Clone)]
+pub struct McpJudgeWorker {
+    gateway: Gateway,
+}
+
+impl McpJudgeWorker {
+    pub fn new(gateway: Gateway) -> Self {
+        Self { gateway }
+    }
+
+    pub async fn tick(&self) -> Result<bool> {
+        maintain(&self.gateway.pool).await?;
+        let pending: Option<(Uuid, Uuid, Uuid, Uuid)> = sqlx::query_as(
+            "SELECT e.tenant_id,o.key_id,e.id,o.id FROM guardrail_evaluations e
+             JOIN governance_operations o ON o.tenant_id=e.tenant_id AND o.id=e.operation_id
+             JOIN governance_turns t ON t.tenant_id=o.tenant_id AND t.id=o.turn_id
+             JOIN tenants n ON n.id=e.tenant_id
+             JOIN virtual_keys k ON k.tenant_id=o.tenant_id AND k.id=o.key_id
+             JOIN runtime_bindings b ON b.tenant_id=t.tenant_id AND b.key_id=t.key_id AND b.user_id=t.user_id
+             JOIN governance_users u ON u.tenant_id=t.tenant_id AND u.id=t.user_id
+             WHERE e.state='pending' AND t.state='active' AND t.expires_at>clock_timestamp()
+               AND n.active AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>clock_timestamp())
+               AND b.active AND u.active AND
+               ((o.stage='tool_input' AND o.operation_key LIKE 'mcp-tool:%') OR
+                (o.stage='tool_output' AND o.operation_key LIKE 'mcp-output:%'))
+             ORDER BY e.id LIMIT 1",
+        )
+        .fetch_optional(&self.gateway.pool)
+        .await?;
+        if let Some((tenant_id, key_id, id, operation_id)) = pending {
+            let who = Identity { tenant_id, key_id };
+            evaluate(&self.gateway, &who, id).await?;
+            self.resume_operation(&who, operation_id).await?;
+            return Ok(true);
+        }
+        // A crash after the paid evaluation settles but before its approval is
+        // materialized must not leave an operation in "checking" forever.
+        let ready: Option<(Uuid, Uuid, Uuid)> = sqlx::query_as(
+            "SELECT o.tenant_id,o.key_id,o.id FROM governance_operations o
+             JOIN governance_turns t ON t.tenant_id=o.tenant_id AND t.id=o.turn_id
+             JOIN tenants n ON n.id=o.tenant_id
+             JOIN virtual_keys k ON k.tenant_id=o.tenant_id AND k.id=o.key_id
+             JOIN runtime_bindings b ON b.tenant_id=t.tenant_id AND b.key_id=t.key_id AND b.user_id=t.user_id
+             JOIN governance_users u ON u.tenant_id=t.tenant_id AND u.id=t.user_id
+             WHERE o.state='checking' AND t.state='active' AND t.expires_at>clock_timestamp()
+               AND n.active AND k.revoked_at IS NULL AND (k.expires_at IS NULL OR k.expires_at>clock_timestamp())
+               AND b.active AND u.active
+               AND ((o.stage='tool_input' AND o.operation_key LIKE 'mcp-tool:%') OR
+                    (o.stage='tool_output' AND o.operation_key LIKE 'mcp-output:%'))
+               AND NOT EXISTS (SELECT 1 FROM guardrail_evaluations e
+                               WHERE e.tenant_id=o.tenant_id AND e.operation_id=o.id
+                                 AND e.state IN ('pending','running'))
+             ORDER BY o.id LIMIT 1",
+        )
+        .fetch_optional(&self.gateway.pool)
+        .await?;
+        if let Some((tenant_id, key_id, operation_id)) = ready {
+            self.resume_operation(&Identity { tenant_id, key_id }, operation_id)
+                .await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn resume_operation(&self, who: &Identity, id: Uuid) -> Result<()> {
+        type Stored = (
+            Uuid,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Vec<u8>,
+        );
+        let stored: Stored = sqlx::query_as(
+            "SELECT turn_id,operation_key,stage,model_id,tool_name,payload_ciphertext
+             FROM governance_operations WHERE tenant_id=$1 AND key_id=$2 AND id=$3",
+        )
+        .bind(who.tenant_id)
+        .bind(who.key_id)
+        .bind(id)
+        .fetch_one(&self.gateway.pool)
+        .await?;
+        let payload: Value =
+            serde_json::from_slice(&self.gateway.cipher.decrypt(who.tenant_id, id, &stored.5)?)
+                .map_err(|_| Error::ResultUnavailable)?;
+        let check = governance::Check {
+            turn_id: stored.0,
+            operation_key: stored.1,
+            stage: stored.2,
+            model_id: stored.3,
+            tool_name: stored.4,
+            payload,
+        };
+        match governance::check(&self.gateway.pool, &self.gateway.cipher, who, check).await {
+            Ok(_) | Err(Error::TurnClosed | Error::Unauthorized | Error::NotFound) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 pub(crate) async fn observe(
     tx: &mut Tx<'_>,
     who: &Identity,
@@ -230,6 +332,24 @@ fn decision(body: &Value) -> Option<&str> {
 }
 
 pub(crate) async fn maintain(pool: &PgPool) -> Result<()> {
+    let stale: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(
+        "SELECT e.tenant_id,o.key_id,e.id FROM guardrail_evaluations e
+         JOIN governance_operations o ON o.tenant_id=e.tenant_id AND o.id=e.operation_id
+         JOIN governance_turns t ON t.tenant_id=o.tenant_id AND t.id=o.turn_id
+         JOIN tenants n ON n.id=e.tenant_id
+         JOIN virtual_keys k ON k.tenant_id=o.tenant_id AND k.id=o.key_id
+         JOIN runtime_bindings b ON b.tenant_id=t.tenant_id AND b.key_id=t.key_id AND b.user_id=t.user_id
+         JOIN governance_users u ON u.tenant_id=t.tenant_id AND u.id=t.user_id
+         WHERE e.state='pending' AND (t.state<>'active' OR t.expires_at<=clock_timestamp()
+           OR NOT n.active OR k.revoked_at IS NOT NULL OR (k.expires_at IS NOT NULL AND k.expires_at<=clock_timestamp())
+           OR NOT b.active OR NOT u.active)
+         ORDER BY e.id LIMIT 100",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (tenant_id, key_id, id) in stale {
+        fail_stale_pending(pool, &Identity { tenant_id, key_id }, id).await?;
+    }
     let rows:Vec<(Uuid,Uuid,Uuid)>=sqlx::query_as("SELECT e.tenant_id,o.key_id,e.id FROM guardrail_evaluations e JOIN governance_operations o ON o.tenant_id=e.tenant_id AND o.id=e.operation_id WHERE e.state='running' AND e.deadline<=clock_timestamp() ORDER BY e.deadline LIMIT 100")
         .fetch_all(pool).await?;
     for (tenant_id, key_id, id) in rows {
@@ -242,6 +362,39 @@ pub(crate) async fn maintain(pool: &PgPool) -> Result<()> {
         )
         .await?;
     }
+    Ok(())
+}
+
+async fn fail_stale_pending(pool: &PgPool, who: &Identity, id: Uuid) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    accounting::lock_accounts(&mut tx, who).await?;
+    let turn: Turn = sqlx::query_as("SELECT t.* FROM governance_turns t JOIN governance_operations o ON o.tenant_id=t.tenant_id AND o.turn_id=t.id JOIN guardrail_evaluations e ON e.tenant_id=o.tenant_id AND e.operation_id=o.id WHERE e.tenant_id=$1 AND e.id=$2 AND o.key_id=$3 FOR UPDATE OF t")
+        .bind(who.tenant_id).bind(id).bind(who.key_id).fetch_one(&mut *tx).await?;
+    let stale: bool = sqlx::query_scalar(
+        "SELECT t.state<>'active' OR t.expires_at<=clock_timestamp() OR NOT n.active
+           OR k.revoked_at IS NOT NULL OR (k.expires_at IS NOT NULL AND k.expires_at<=clock_timestamp())
+           OR NOT b.active OR NOT u.active
+         FROM governance_turns t JOIN tenants n ON n.id=t.tenant_id
+         JOIN virtual_keys k ON k.tenant_id=t.tenant_id AND k.id=t.key_id
+         JOIN runtime_bindings b ON b.tenant_id=t.tenant_id AND b.key_id=t.key_id AND b.user_id=t.user_id
+         JOIN governance_users u ON u.tenant_id=t.tenant_id AND u.id=t.user_id
+         WHERE t.tenant_id=$1 AND t.id=$2",
+    )
+    .bind(who.tenant_id).bind(turn.id).fetch_one(&mut *tx).await?;
+    if stale {
+        let changed = sqlx::query("UPDATE guardrail_evaluations SET state='failed',reason_code='judge_unavailable',finished_at=clock_timestamp() WHERE tenant_id=$1 AND id=$2 AND state='pending'")
+            .bind(who.tenant_id).bind(id).execute(&mut *tx).await?;
+        if changed.rows_affected() == 1 {
+            governance::event(
+                &mut tx,
+                &turn,
+                "guardrail.finished",
+                json!({"evaluation_id":id,"outcome":"failed","reason_code":"judge_unavailable"}),
+            )
+            .await?;
+        }
+    }
+    tx.commit().await?;
     Ok(())
 }
 

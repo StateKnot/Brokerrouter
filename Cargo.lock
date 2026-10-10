@@ -300,6 +300,8 @@ dependencies = [
  "futures-util",
  "http",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "jsonwebtoken",
  "object_store",
  "openidconnect",

@@ -5,7 +5,7 @@
 ## 调用契约
 
 - 下游 `POST /mcp` 使用已有虚拟 Key 或 OAuth `mcp:tools:call` scope，以及精确工具描述摘要 grant。每个 `tools/call` 的逐请求 `_meta` 必须含 UUID 字符串 `io.brokerrouter/turnId` 和 `io.brokerrouter/callId`。Runtime 必须从受信 BFF 创建并绑定的当前 turn 获取前者；后者每个逻辑工具动作生成一次，重试原样复用。
-- 相同 `callId` 只允许相同 tenant、Key、turn、服务器 revision、发现快照、上下游工具名、描述 SHA-256 和规范化参数 SHA-256。任何变化返回冲突；绝不作为新动作再次派发。
+- 相同 `callId` 只允许相同 tenant、Key、turn、服务器 revision、上下游工具名、完整描述 SHA-256、规范化参数 SHA-256 和授权上下文。同内容发现刷新可换用新快照，原快照 ID 仅保留为不可变审计证据；稳定身份或授权上下文变化返回冲突，绝不作为新动作再次派发。
 - `tool_input` 在排队前执行现有护栏检查。命中审批时返回 `approval_required`，由独立真人工作台决定，Agent/MCP 客户端不能自行批准。批准后重放原请求进入持久队列；Worker 在派发前重新核对 Key、grant、连接 revision、描述摘要与治理 claim。
 - 只有隔离的 `mcp-worker` 角色解析上游凭据并发出工具调用。它在相同认证生命周期内重新发现工具并核对完整描述；每个已 claim 的动作最多调用一次上游 `tools/call`，不自动重试结果未知的副作用。
 - 完整上游响应作为密文与 SHA-256 保存，并与治理执行回执同一事务提交。`tool_output` 再次通过策略和真人审批后才解密释放给下游。审核拒绝、过期、Key/turn 失效或不可用时不返回正文。
@@ -21,6 +21,12 @@
 ## 部署与权限
 
 先应用 0024 迁移及最新 `deploy/permissions.sql`。`serve-mcp` 使用 `brokerrouter_mcp_server` 登录，只持有结果密钥环和目录/治理/入队权限；`mcp-worker --concurrency <N>` 使用 `brokerrouter_mcp_worker` 登录，持有**不同** MCP 配置密钥环、结果密钥环、Secret 注入映射和固定的 stdio launcher registry。两个进程不能使用表拥有者或超级用户登录。结果密钥环轮换必须保留旧 key，直至所有未过期密文退出保留期。
+
+MCP 输入和输出的 `model_judge` 检测由独立 `mcp-judge-worker --concurrency <N>` 进程推进；它使用 `brokerrouter_runtime` 权限组及仅供检测模型的供应商凭据和结果密钥环，不使用 `brokerrouter_mcp_server` 或 `brokerrouter_mcp_worker` 登录与 MCP 上游凭据。`serve-mcp` 登记检测后返回可恢复的等待状态，worker 根据持久 evaluation 只 claim 一次付费检测，并在结果落库后推进治理状态，使风险审批无需等待客户端再次调用即可出现在审批箱。worker 重启后继续处理 pending，补做已结算但仍在 checking 的治理操作；已进入 running 且结果未知的检测到期转人工审批，不盲目再次调用。未部署该 worker 时语义规则会一直等待，不能将此配置作为可用能力开放。
+
+生产 Compose 的 `mcp-judge` profile 只启动此检测 worker，不开放 MCP 入口。新装会生成独立的 root-only `mcp-judge.env`；旧部署须按[生产部署说明](production-deployment.md)单独生成。该 Secret 目前复用受限的 runtime 数据库登录和结果密钥环，检测供应商凭据只添加到 worker Secret，不复制到 MCP edge。启用语义规则前必须验证 worker 存活、受限数据库权限、检测预算和失败转审批；目标环境验收仍由 R0.6 和后续 MCP 发布闸门控制。
+
+工具完成后重放结果仍须按当前输出规则、审批版本和 turn 授权重新检查；新增规则可再次隔离已保存的结果，但不会重新执行工具。同内容目录刷新保留原始快照作为审计证据，以连接 revision、完整工具描述、参数和现行授权上下文判断原调用身份；描述、授权上下文或权限变化不会沿用旧批准。每次只以最新一次发现判断目录是否仍有效；最新快照或工具 TTL 过期时必须重新发现，不回退到更早但尚未过期的快照继续授权。
 
 Worker 只允许出站访问已登记的 HTTPS MCP 服务及明确授权的 Secret/OAuth 地址；受管 stdio profile 必须由部署方固定程序 SHA-256、工作目录和环境。边界代理必须使用精确 Host/Origin、TLS、无客户端转发头透传。不要把用户模型供应商密钥、上游 MCP 凭据或审批私钥传入 MCP edge。
 

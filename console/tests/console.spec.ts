@@ -1156,6 +1156,44 @@ test("renders untrusted labels as text, preserves huge integers and unknown stat
       .getByText("提交不确定", { exact: true }),
   ).toBeVisible();
 });
+function checkWidth(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    // Page-edge clipping is a visual safeguard, not permission to hide a
+    // broken layout. Measure the intrinsic document with clipping removed.
+    const nodes = [document.documentElement, document.body];
+    const previous = nodes.map((node) => node.style.overflowX);
+    nodes.forEach((node) => {
+      node.style.overflowX = "visible";
+    });
+    const fits = nodes.every((node) => node.scrollWidth <= innerWidth);
+    nodes.forEach((node, index) => {
+      node.style.overflowX = previous[index]!;
+    });
+    return fits;
+  });
+}
+// Separate viewport ranges keep resize work inside each test's 30s budget.
+for (const [minWidth, maxWidth] of [
+  [320, 864],
+  [896, 1440],
+  [1472, 1920],
+] as const) {
+  test(`workbench fits every unclipped viewport from ${minWidth} to ${maxWidth}px`, async ({
+    page,
+  }) => {
+    await setup(page);
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.goto("/");
+    await expect(
+      page.getByText("¥0.000408", { exact: true }).first(),
+    ).toBeVisible();
+    await expect(page.locator(".chart-bar")).toHaveCount(7);
+    for (let width = minWidth; width <= maxWidth; width += 32) {
+      await page.setViewportSize({ width, height: 1000 });
+      expect(await checkWidth(page), `unclipped width ${width}`).toBe(true);
+    }
+  });
+}
 for (const width of [320, 375, 414, 768, 1440]) {
   test(`responsive and accessible workbench at ${width}px`, async ({
     page,
@@ -1169,22 +1207,7 @@ for (const width of [320, 375, 414, 768, 1440]) {
     await expect(
       page.getByText("¥0.000408", { exact: true }).first(),
     ).toBeVisible();
-    const checkWidth = () =>
-      page.evaluate(() => {
-        // Page-edge clipping is a visual safeguard, not permission to hide a
-        // broken layout. Measure the intrinsic document with clipping removed.
-        const nodes = [document.documentElement, document.body];
-        const previous = nodes.map((node) => node.style.overflowX);
-        nodes.forEach((node) => {
-          node.style.overflowX = "visible";
-        });
-        const fits = nodes.every((node) => node.scrollWidth <= innerWidth);
-        nodes.forEach((node, index) => {
-          node.style.overflowX = previous[index]!;
-        });
-        return fits;
-      });
-    expect(await checkWidth()).toBe(true);
+    expect(await checkWidth(page)).toBe(true);
     await expect(page.locator(".chart-bar")).toHaveCount(7);
     for (const bar of await page.locator(".chart-bar").all()) {
       const box = await bar.boundingBox();
@@ -1193,13 +1216,6 @@ for (const width of [320, 375, 414, 768, 1440]) {
       expect(
         await bar.evaluate((element) => getComputedStyle(element).fill),
       ).not.toBe("none");
-    }
-    if (width === 1440) {
-      for (let sample = 320; sample <= 1920; sample += 32) {
-        await page.setViewportSize({ width: sample, height: 1000 });
-        expect(await checkWidth(), `unclipped width ${sample}`).toBe(true);
-      }
-      await page.setViewportSize({ width, height: 1000 });
     }
     for (const control of await page
       .locator("input:visible, select:visible, button:visible")
@@ -1218,7 +1234,7 @@ for (const width of [320, 375, 414, 768, 1440]) {
     if (width < 960) await page.getByRole("button", { name: "菜单" }).click();
     await page.getByRole("link", { name: "请求日志", exact: true }).click();
     await expect(page.getByText("待结算", { exact: true })).toBeVisible();
-    expect(await checkWidth()).toBe(true);
+    expect(await checkWidth(page)).toBe(true);
     await page.screenshot({
       path: testInfo.outputPath(`requests-${width}.png`),
       fullPage: true,

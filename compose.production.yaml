@@ -127,6 +127,9 @@ services:
     environment:
       BROKERROUTER_ENV_FILE: /run/secrets/runtime_env
       BROKERROUTER_MAX_CONCURRENCY: "16"
+      BROKERROUTER_MAX_STREAM_CONNECTIONS: "4"
+      BROKERROUTER_MAX_HTTP_CONNECTIONS: "64"
+      BROKERROUTER_HTTP_CONNECTION_TIMEOUT_SECONDS: "180"
       BROKERROUTER_REQUEST_TIMEOUT_SECONDS: "120"
       BROKERROUTER_RESULT_TTL_SECONDS: "86400"
       RUST_LOG: brokerrouter=info
@@ -148,6 +151,36 @@ services:
       timeout: 5s
       retries: 12
       start_period: 10s
+    init: true
+    # A late request body may start a paid task near the socket's 180s deadline.
+    # Allow that task's 120s deadline plus bounded settlement before SIGKILL.
+    stop_grace_period: 6m
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  mcp-judge:
+    <<: *app-common
+    profiles: [mcp]
+    restart: unless-stopped
+    command: ["mcp-judge-worker", "--concurrency", "4"]
+    environment:
+      BROKERROUTER_ENV_FILE: /run/secrets/mcp_judge_env
+      BROKERROUTER_MAX_CONCURRENCY: "4"
+      BROKERROUTER_REQUEST_TIMEOUT_SECONDS: "120"
+      RUST_LOG: brokerrouter=info
+    secrets:
+      - pg_ca
+      - mcp_judge_env
+    networks:
+      backend: {}
+      egress:
+        gw_priority: 1
+    depends_on:
+      postgres:
+        condition: service_healthy
     init: true
     stop_grace_period: 3m
     logging:
@@ -179,3 +212,5 @@ secrets:
     file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/runtime.env
   operator_env:
     file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/operator.env
+  mcp_judge_env:
+    file: ${BROKERROUTER_SECRET_DIR:?set BROKERROUTER_SECRET_DIR}/mcp-judge.env

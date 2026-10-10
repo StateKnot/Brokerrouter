@@ -217,11 +217,11 @@ async fn stream_chat(g: Gateway, headers: HeaderMap, body: Value) -> Response {
         Err(error) => return error.into_response(),
     };
     let id = session.id;
-    let stream = futures_util::stream::unfold(session.receiver, |mut receiver| async move {
-        receiver
-            .recv()
+    let stream = futures_util::stream::unfold(session, |mut session| async move {
+        session
+            .next()
             .await
-            .map(|bytes| (Ok::<_, Infallible>(bytes), receiver))
+            .map(|bytes| (Ok::<_, Infallible>(bytes), session))
     });
     let mut response = axum::body::Body::from_stream(stream).into_response();
     response.headers_mut().insert(

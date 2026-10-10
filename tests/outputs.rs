@@ -744,7 +744,7 @@ async fn s3_output_import_quarantine_and_cleanup(pool: PgPool) {
     }
     assert_eq!(data.as_slice(), f.r.data.as_ref());
     scans
-        .report(&scanner, attempt_id(&task), scan_report(&task))
+        .report(&scanner, attempt_id(&task), scan_report(&pool, &task).await)
         .await
         .unwrap();
     common::guardrail(
@@ -835,9 +835,15 @@ async fn scanner(pool: &PgPool, f: &Fixture, version: i32) -> (scan::Profile, Sc
     let who = scan::authenticate(pool, &token).await.unwrap();
     (profile, who, token)
 }
-fn scan_report(v: &Value) -> Report {
+async fn scan_report(pool: &PgPool, v: &Value) -> Report {
+    // Synthetic reports share the authority clock used for claim timestamps.
+    // Host/Docker wall-clock skew must not make a valid fixture predate its claim.
+    let scanned_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(pool)
+        .await
+        .unwrap();
     // Synthetic attestations exercise the gateway contract, not malware/format detection quality.
-    serde_json::from_value(json!({"sha256":v["sha256"],"byte_length":v["byte_length"],"profile_version":v["profile_version"],"engine_revision":v["engine_revision"],"technical":"clean","content":"risk","media_type":"video/mp4","reason_codes":["fixture_risk"],"evidence_sha256":"a".repeat(64),"scanned_at":chrono::Utc::now()})).unwrap()
+    serde_json::from_value(json!({"sha256":v["sha256"],"byte_length":v["byte_length"],"profile_version":v["profile_version"],"engine_revision":v["engine_revision"],"technical":"clean","content":"risk","media_type":"video/mp4","reason_codes":["fixture_risk"],"evidence_sha256":"a".repeat(64),"scanned_at":scanned_at})).unwrap()
 }
 fn attempt_id(v: &Value) -> Uuid {
     serde_json::from_value(v["attempt_id"].clone()).unwrap()
@@ -874,7 +880,7 @@ async fn scanner_claim_read_receipt_is_durable_and_never_grants_delivery(pool: P
     }
     assert_eq!(bytes.as_slice(), f.r.data.as_ref());
     assert_eq!(common::hex(&store::hash(&bytes)), v["sha256"]);
-    let report = scan_report(&v);
+    let report = scan_report(&pool, &v).await;
     let done = s.report(&who, id, report.clone()).await.unwrap();
     assert_eq!(done["state"], "complete");
     assert_eq!(done["delivery"], "not_released");
@@ -956,7 +962,11 @@ async fn scanner_stale_owner_cannot_read_renew_or_publish_and_retries_are_bounde
     assert_eq!(second["scan_id"], first["scan_id"]);
     assert!(s.chunk(&who, old, 0).await.is_err());
     assert!(s.renew(&who, old).await.is_err());
-    assert!(s.report(&who, old, scan_report(&first)).await.is_err());
+    assert!(
+        s.report(&who, old, scan_report(&pool, &first).await)
+            .await
+            .is_err()
+    );
     expire_scan_attempt(&pool, attempt_id(&second)).await;
     let third = s.claim(&who, Uuid::new_v4()).await.unwrap().unwrap();
     expire_scan_attempt(&pool, attempt_id(&third)).await;
@@ -991,7 +1001,7 @@ async fn scanner_receipt_must_bind_exact_bytes_profile_revision_and_strict_outco
         ("reason_codes", json!(["untrusted text, not code"])),
         ("scanned_at", json!("2000-01-01T00:00:00Z")),
     ] {
-        let mut data = serde_json::to_value(scan_report(&v)).unwrap();
+        let mut data = serde_json::to_value(scan_report(&pool, &v).await).unwrap();
         data[field] = value;
         assert!(
             s.report(&who, id, serde_json::from_value(data).unwrap())
@@ -1000,7 +1010,7 @@ async fn scanner_receipt_must_bind_exact_bytes_profile_revision_and_strict_outco
             "{field}"
         );
     }
-    let mut r = scan_report(&v);
+    let mut r = scan_report(&pool, &v).await;
     r.technical = scan::Technical::Unsafe;
     assert!(s.report(&who, id, r.clone()).await.is_err());
     r.content = scan::Content::Unknown;
@@ -1009,7 +1019,7 @@ async fn scanner_receipt_must_bind_exact_bytes_profile_revision_and_strict_outco
     assert_eq!(done["report"]["technical"], "unsafe");
     r.reason_codes = vec!["other".into()];
     assert!(matches!(s.report(&who, id, r).await, Err(Error::Conflict)));
-    let mut bad = serde_json::to_value(scan_report(&v)).unwrap();
+    let mut bad = serde_json::to_value(scan_report(&pool, &v).await).unwrap();
     bad["approved"] = json!(true);
     assert!(serde_json::from_value::<Report>(bad).is_err());
     assert!(
@@ -1070,7 +1080,7 @@ async fn scanner_credential_rotation_and_profile_upgrade_fence_prior_work(pool: 
     assert_eq!(latest["profile_version"], 2);
     assert_ne!(latest["scan_id"], new["scan_id"]);
     assert!(
-        s.report(&who3, attempt_id(&latest), scan_report(&new))
+        s.report(&who3, attempt_id(&latest), scan_report(&pool, &new).await)
             .await
             .is_err()
     );
@@ -1116,7 +1126,11 @@ async fn scanner_cancellation_key_and_turn_revocation_stop_reads_and_keep_model_
             }
         }
         assert!(s.chunk(&who, id, 1).await.is_err());
-        assert!(s.report(&who, id, scan_report(&v)).await.is_err());
+        assert!(
+            s.report(&who, id, scan_report(&pool, &v).await)
+                .await
+                .is_err()
+        );
         s.maintain().await.unwrap();
         assert_eq!(
             sqlx::query_scalar::<_, String>("SELECT state FROM output_scans WHERE id=$1")
@@ -1138,7 +1152,7 @@ async fn scanner_report_transaction_failure_recovers_without_new_generation(pool
     let (_, who, _) = scanner(&pool, &f, 1).await;
     let s = Scans::new(f.o.assets.clone());
     let v = s.claim(&who, Uuid::new_v4()).await.unwrap().unwrap();
-    let r = scan_report(&v);
+    let r = scan_report(&pool, &v).await;
     sqlx::raw_sql("CREATE FUNCTION fail_scan_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action='output_scan.report_recorded' THEN RAISE EXCEPTION 'injected'; END IF; RETURN NEW; END; $$; CREATE TRIGGER injected_scan BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION fail_scan_audit();").execute(&pool).await.unwrap();
     assert!(s.report(&who, attempt_id(&v), r.clone()).await.is_err());
     assert_eq!(
@@ -1204,7 +1218,7 @@ async fn scanner_actual_database_role_cannot_read_inputs_change_money_or_approve
     let v = s.claim(&who, Uuid::new_v4()).await.unwrap().unwrap();
     s.chunk(&who, attempt_id(&v), 0).await.unwrap();
     s.renew(&who, attempt_id(&v)).await.unwrap();
-    s.report(&who, attempt_id(&v), scan_report(&v))
+    s.report(&who, attempt_id(&v), scan_report(&pool, &v).await)
         .await
         .unwrap();
     assert_eq!(
@@ -1307,7 +1321,7 @@ async fn scanner_http_auth_scope_and_binary_boundary_are_enforced(pool: PgPool) 
     assert_eq!(r.bytes().await.unwrap(), f.r.data.slice(..CHUNK_BYTES));
     assert!(s.chunk(&who, id, -1).await.is_err());
     assert!(s.chunk(&who, id, 999).await.is_err());
-    let mut r = serde_json::to_value(scan_report(&v)).unwrap();
+    let mut r = serde_json::to_value(scan_report(&pool, &v).await).unwrap();
     r["approved"] = json!(true);
     assert_eq!(
         client

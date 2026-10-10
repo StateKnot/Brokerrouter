@@ -9,6 +9,7 @@ use brokerrouter::{
 };
 
 async fn scan_done(
+    pool: &PgPool,
     f: &Fixture,
     who: &Scanner,
     s: &Scans,
@@ -16,7 +17,7 @@ async fn scan_done(
     technical: Technical,
 ) -> Value {
     let v = s.claim(who, Uuid::new_v4()).await.unwrap().unwrap();
-    let mut report = scan_report(&v);
+    let mut report = scan_report(pool, &v).await;
     report.content = content;
     report.technical = technical;
     if report.technical != Technical::Clean {
@@ -38,7 +39,7 @@ async fn prepared(
     f.o.tick().await.unwrap();
     let (profile, who, _) = scanner(pool, &f, 1).await;
     let scans = Scans::new(f.o.assets.clone());
-    scan_done(&f, &who, &scans, Content::Unknown, Technical::Clean).await;
+    scan_done(pool, &f, &who, &scans, Content::Unknown, Technical::Clean).await;
     common::guardrail(
         pool,
         f.who.tenant_id,
@@ -135,12 +136,12 @@ async fn output_delivery_grant_is_current_turn_only_and_technical_gate_never_ski
     let second = generate(&f, &pool, Some(turn)).await;
     f.o.tick().await.unwrap();
     let s = Scans::new(f.o.assets.clone());
-    scan_done(&f, &scanner, &s, Content::Risk, Technical::Clean).await;
+    scan_done(&pool, &f, &scanner, &s, Content::Risk, Technical::Clean).await;
     assert_eq!(d.check(&f.who, second).await.unwrap()["state"], "ready");
     d.chunk(&f.who, second, 0).await.unwrap();
     let unsafe_job = generate(&f, &pool, Some(turn)).await;
     f.o.tick().await.unwrap();
-    scan_done(&f, &scanner, &s, Content::Unknown, Technical::Unsafe).await;
+    scan_done(&pool, &f, &scanner, &s, Content::Unknown, Technical::Unsafe).await;
     assert!(matches!(
         d.check(&f.who, unsafe_job).await,
         Err(Error::OutputUnsafe)
@@ -156,7 +157,7 @@ async fn output_delivery_grant_is_current_turn_only_and_technical_gate_never_ski
     let new_turn = common::turn(&pool, &f.who, "turn-user", 1).await;
     let third = generate(&f, &pool, Some(new_turn)).await;
     f.o.tick().await.unwrap();
-    scan_done(&f, &scanner, &s, Content::Risk, Technical::Clean).await;
+    scan_done(&pool, &f, &scanner, &s, Content::Risk, Technical::Clean).await;
     assert_eq!(
         d.check(&f.who, third).await.unwrap()["state"],
         "waiting_approval"
@@ -175,7 +176,15 @@ async fn output_delivery_profile_and_policy_upgrades_invalidate_approval_and_gra
             .is_err()
     );
     let s = Scans::new(f.o.assets.clone());
-    scan_done(&f, &new_scanner, &s, Content::Unknown, Technical::Clean).await;
+    scan_done(
+        &pool,
+        &f,
+        &new_scanner,
+        &s,
+        Content::Unknown,
+        Technical::Clean,
+    )
+    .await;
     assert!(matches!(
         d.check(&f.who, job).await,
         Err(Error::PolicyChanged)
@@ -669,14 +678,14 @@ async fn output_delivery_closed_without_policy_or_trusted_turn_and_rules_are_str
     f.o.tick().await.unwrap();
     let (p, scanner, _) = scanner(&pool, &f, 1).await;
     let s = Scans::new(f.o.assets.clone());
-    scan_done(&f, &scanner, &s, Content::Pass, Technical::Clean).await;
+    scan_done(&pool, &f, &scanner, &s, Content::Pass, Technical::Clean).await;
     let d = Delivery::new(f.o.assets.clone());
     assert!(d.check(&f.who, job).await.is_err());
     common::provision(&pool, &f.who, "strict").await;
     let turn = common::turn(&pool, &f.who, "strict", 0).await;
     let job = generate(&f, &pool, Some(turn)).await;
     f.o.tick().await.unwrap();
-    scan_done(&f, &scanner, &s, Content::Pass, Technical::Clean).await;
+    scan_done(&pool, &f, &scanner, &s, Content::Pass, Technical::Clean).await;
     assert!(matches!(
         d.check(&f.who, job).await,
         Err(Error::OutputPolicyMissing)
@@ -755,7 +764,7 @@ async fn output_delivery_expiry_and_long_turn_approval_are_bounded(pool: PgPool)
         f.o.tick().await.unwrap();
         let (p, scanner, _) = scanner(&pool, &f, 1).await;
         let s = Scans::new(f.o.assets.clone());
-        scan_done(&f, &scanner, &s, Content::Unknown, Technical::Clean).await;
+        scan_done(&pool, &f, &scanner, &s, Content::Unknown, Technical::Clean).await;
         common::guardrail(
             &pool,
             f.who.tenant_id,

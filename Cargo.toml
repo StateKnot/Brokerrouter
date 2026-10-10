@@ -22,6 +22,8 @@ bytes = "1"
 base64 = "0.22"
 futures-util = "0.3"
 http = "1"
+hyper = { version = "=1.11.1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "=0.1.20", default-features = false, features = ["server", "http1", "tokio", "service"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json", "stream"] }
 rmcp = { version = "=3.4.0", default-features = false, features = ["auth", "client", "server", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
 rust_decimal = { version = "1.37", features = ["serde-with-str"] }
