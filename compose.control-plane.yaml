@@ -17,7 +17,7 @@ x-control-app: &control-app
   cap_drop: [ALL]
   cap_add: [SETGID, SETUID]
   read_only: true
-  tmpfs: [/tmp:size=16m,mode=1777]
+  tmpfs: ["/tmp:size=16m,mode=1777"]
   init: true
   pids_limit: 128
   mem_limit: 256m
@@ -37,7 +37,7 @@ x-edge: &edge
   # Nginx's root TLS master creates/chowns bounded /tmp buffers, then UID101 serves.
   cap_add: [CHOWN, SETGID, SETUID]
   read_only: true
-  tmpfs: [/tmp:size=16m,mode=1777]
+  tmpfs: ["/tmp:size=16m,mode=1777"]
   pids_limit: 64
   mem_limit: 128m
   cpus: 0.5

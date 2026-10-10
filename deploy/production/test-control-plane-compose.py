@@ -41,6 +41,7 @@ class ComposeTest(unittest.TestCase):
                 expected.add("asset_s3_ca")
             self.assertEqual(sources, expected)
             self.assertTrue(service["read_only"])
+            self.assertEqual(service["tmpfs"], ["/tmp:size=16m,mode=1777"])
             self.assertEqual(service["environment"]["BROKERROUTER_COMPONENT"], purpose)
             self.assertEqual(service["environment"]["BROKERROUTER_DATABASE_MAX_CONNECTIONS"], "2")
             self.assertNotIn("ports", service)
@@ -56,6 +57,7 @@ class ComposeTest(unittest.TestCase):
         self.assertTrue(merged["networks"]["preview"]["internal"])
         self.assertTrue(merged["networks"]["backend"]["internal"])
         for name in ("control-tls", "console-edge", "preview-edge"):
+            self.assertEqual(services[name]["tmpfs"], ["/tmp:size=16m,mode=1777"])
             self.assertEqual(services[name]["ports"][0]["host_ip"], "127.0.0.1")
             self.assertEqual(set(services[name]["cap_add"]), {"CHOWN", "SETGID", "SETUID"})
         print("PASS: actual default merge has 11 isolated APIs/3 workers, exact purpose Secrets, 48/80 pool budget and separate loopback TLS ingress", flush=True)
