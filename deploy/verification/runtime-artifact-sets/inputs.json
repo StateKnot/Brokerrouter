@@ -1,0 +1,25 @@
+{
+  "status": "independent_local_upgrade_scope_passed_not_full_production_acceptance",
+  "reused_files": {
+    "deploy/verification/final-publications/acceptance.py": "8cb9e7415c6f2c948dc5f9d51a74ecab0dacd32263d4ed1b8047e2e201ee2843",
+    "deploy/verification/final-publications/native_acceptance.py": "c019dd04fdb71e8251b50b04dfcaa095e0939b6dfcfa02bd774030d284111a04",
+    "deploy/verification/final-publications/provider.js": "fce9695efd840367deadd49fa82afd2220651d90d354573cbf9c33d26740a563",
+    "deploy/verification/identity/acceptance.py": "fe36149ca474ab6c899216688733f60bb82a2d851fc997fb2b872a50bc97142b"
+  },
+  "old_schema": 32,
+  "new_schema": 33,
+  "old_image": "sha256:f91fefbc1b5dec597983bc26cd5ad6fdc2493fda737075a7bffcedfce719efdc",
+  "new_image": "sha256:10d188d816b29cb0f9228dfa2b695d6a9099fa9351034351d99e5385426fa396",
+  "provisioner_image": "sha256:2483917b35fd9b6941d2a3b45a95659ec443d96770cc47201d9b7e347ee42847",
+  "candidate_files": {
+    "upgrade.py": "8a0f1ee854fcc12e40f50f2dc2a0cefe9753f5ae6add083df862638c3daa4d75",
+    "README.md": "a0600bfa28941e1ca3ff9ec89f54e421d819106d2498ddfedffffa8b30287eb7"
+  },
+  "storage_fixture_image": "quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
+  "input_manifest_hashes": {
+    "old_source_manifest": "92cfdc55648163977d7bcd8acd1325f492b350267fc3bde3cbf4a5dc96831068",
+    "old_core_input_manifest": "7d5da53ccd9462ac922f37e7c5737aed5a5f6faaa51594dd64a46ace94089acd",
+    "core_input_manifest": "5fe505faa2ff171907b5153fe6b93cfb05e881064da4c97dcb7bd658bf4d3bec"
+  },
+  "deployment_source_manifest_sha256": "11858359d60a5d9a7e411839c5734d32144dea5a66fe2da7fe80c47f392bcdb0"
+}
