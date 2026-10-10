@@ -1,0 +1,61 @@
+{
+  "date": "2026-10-11",
+  "scope": "production PKI strict-client compatibility",
+  "base_image": "agentos-mcp-runtime-contract@sha256:943ff581ef4016d9385cbf91b85be7dc5f7176e02091f359fd097432aedfa30f",
+  "image_id": "sha256:943ff581ef4016d9385cbf91b85be7dc5f7176e02091f359fd097432aedfa30f",
+  "runtime": {
+    "openssl_cli": "OpenSSL 3.5.6 7 Apr 2026 (Library: OpenSSL 3.5.6 7 Apr 2026)",
+    "python": "3.13.5",
+    "python_ssl": "OpenSSL 3.5.6 7 Apr 2026"
+  },
+  "source_files": {
+    "deploy/production/generate-secrets.sh": {
+      "sha256": "725c14920cf85d408f9c120e030f8516c500f0049f06c87a0275580d8ff11453",
+      "before_sha256": "2978697811da54618934edc2b48d69e0b1ed35fa65901c5595cc9bd42db8a41a"
+    },
+    "deploy/production/verify-control-plane.py": {
+      "sha256": "d60a1470d4aaea96ece5780d89173f13dca4ae3ab13a3390ad49a06c8831fed2",
+      "before_sha256": "1b296a5a479a1120a87857e3904fb7f1979b7b07c989fa3be46ee270a735fe5e"
+    },
+    "deploy/production/test-control-plane-release.py": {
+      "sha256": "2cc9ae83e39632fa9dd3f0154a058e0cfe829ab7026202975e5211e5e6a04003",
+      "before_sha256": "2135e52ceb850e09e03354a7c33ff01b2285105b620e03068b155f98a064f1ca"
+    },
+    "deploy/production/test-control-plane-pki.py": {
+      "sha256": "2a5ba1ad71fd718a495baf219d9cc5143aa4d223a72bcb247c310a70e05bccff"
+    }
+  },
+  "logs": {
+    "production-pki-current-preflight-red.log": "5db8dbee5717881edf0b73e688af5f8ae1149607d5277a3a98c17d57af1c68d4",
+    "production-pki-python313-green.log": "88f5b784ee43502bca9dbcfe0695cebf452af3758b6703ab7e4a938c875e17f9",
+    "production-pki-release-green.log": "bee88a25b54365c00c8ffaf7b0b221caf2d3960650e6794e4c8582d35c31ec64",
+    "production-pki-runtime-identity.json": "645e9c23c2036ac45376fd86ec7fb0c28bbf5bb1dee70b6a17e46f6986118ac0"
+  },
+  "verification": {
+    "old_full_preflight_passed_python_default_tls_rejected": {
+      "verify_code": 92,
+      "default_strict": true,
+      "hostname_check": true,
+      "verify_mode": "CERT_REQUIRED"
+    },
+    "python313_actual_tls_tests": {
+      "tests": 8,
+      "passed": 8,
+      "skipped": 0,
+      "seconds": 2.478
+    },
+    "full_protected_release_preflight": {
+      "tests": 1,
+      "passed": 1,
+      "seconds": 9.652
+    },
+    "shell_syntax": true,
+    "python_source_compilation": true
+  },
+  "limits": [
+    "Existing deployment CA and leaf certificates are not silently replaced; operators must explicitly issue/install strict-compatible certificates and rerun the actual deployment/client checks.",
+    "This package proves actual TLS chain compatibility and the protected release preflight; it does not certify a running PostgreSQL/control-plane deployment or real OIDC/S3/scanner/capacity.",
+    "Public browser TLS root trust retains the existing separate browser acceptance contract.",
+    "Frozen native and sixteen-case service deployment fixture bytes were not changed."
+  ]
+}

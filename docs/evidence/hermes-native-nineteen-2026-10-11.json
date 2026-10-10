@@ -98,7 +98,7 @@
     "tests/test_adapter.py": "4dd7820f0f5d75e31525322767436b9d426ac4fea87fd1763a86a3cebd411b74",
     "tests/test_artifact_spool.py": "34d752cb3d8212895ce93c24abe79a505580e00bb9c3217f9946f0dd469a73a6",
     "tests/test_final_publication.py": "e77cfcff41c65135d9b89a08477304efd98dc7506c5842ab341d678b72beda24",
-    "tests/test_final_publication_boundary.py": "845638086d0ee88aa1fe2dd36bde19ff322f303fad6b4bfaf502e02cdbf4230d",
+    "tests/test_final_publication_boundary.py": "48c14a3c5ba926629c6f5431fb4394f2c0c3913021a40191adc25781f20e283e",
     "tests/test_host_contract.py": "f485984a30518f600667ab7a34b8fbb7ba379ea6d75450b716f66bd5de821101",
     "tests/test_installer.py": "82f4f0ac7aba5477b316f92b9afab53697d1ee37cd83683785c74db593e57ee8",
     "tests/test_model_transport.py": "4c81007ccab41f45226366cca27e687dee699da7ef70d31cff937548cc2b86bc",
@@ -115,9 +115,9 @@
     "tests": 212,
     "passed": 212,
     "skipped": 0,
-    "seconds": 69.482,
-    "log": "hermes-final-nineteen-builtins-212.log",
-    "sha256": "ff712ce9b2e29ed1a366f6151363f0812746b414b2a7ae7b7a993b3c41a33f2a",
+    "seconds": 87.538,
+    "log": "hermes-final-nineteen-eof-212.log",
+    "sha256": "f5788c9a31e978d911bb23822ccb8b92b2ee4956500fa3b02f3a3c466f3f7599",
     "complete_imports": 19
   },
   "limits": [
@@ -159,7 +159,8 @@
     "hermes-native-builtin-private-green.log": "c42037acee22e8bb6d6016ac7deaf0ed5e415f890665537b90bd8ecb69da903f",
     "hermes-native-builtin-five-green.log": "996a9300e9d79ed611cd890b001cb525a0d1321ce154e7a2621735ab08d2c281",
     "hermes-native-builtin-five-final-green.log": "172845e64e47a554515fd7a43e55e966302eac32709fdd10751dc772fbb6ce0d",
-    "hermes-final-nineteen-builtins-212.log": "ff712ce9b2e29ed1a366f6151363f0812746b414b2a7ae7b7a993b3c41a33f2a"
+    "hermes-final-nineteen-builtins-212.log": "ff712ce9b2e29ed1a366f6151363f0812746b414b2a7ae7b7a993b3c41a33f2a",
+    "hermes-final-nineteen-eof-212.log": "f5788c9a31e978d911bb23822ccb8b92b2ee4956500fa3b02f3a3c466f3f7599"
   },
   "status": "fixed nineteen-source host and adapter contracts passed locally; actual native separated-service deployment pending",
   "whole_base_image_is_official_commit": false,

@@ -67,7 +67,10 @@ class ReleaseTest(unittest.TestCase):
             self.assertEqual(command("python3", str(HERE / "control-plane-config.py"), str(source), str(root)).returncode, 0)
             self.assertEqual(command("python3", str(HERE / "render-control-edge.py"), bff["BROKERROUTER_BFF_ORIGIN"], bff["BROKERROUTER_BFF_MEDIA_PREVIEW_ORIGIN"], str(root)).returncode, 0)
             ca_key, ca_cert = root / "ca.key", root / "bff-ca.crt"
-            self.assertEqual(command("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "14", "-subj", "/CN=task-only-ca", "-keyout", str(ca_key), "-out", str(ca_cert)).returncode, 0)
+            self.assertEqual(command("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "14", "-subj", "/CN=task-only-ca",
+                                     "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+                                     "-addext", "subjectKeyIdentifier=hash", "-addext", "authorityKeyIdentifier=keyid:always",
+                                     "-keyout", str(ca_key), "-out", str(ca_cert)).returncode, 0)
             ca_cert.chmod(0o444)
             for filename in ("pg-ca.crt", "asset-s3-ca.crt"):
                 (root / filename).write_bytes(ca_cert.read_bytes())
@@ -76,7 +79,9 @@ class ReleaseTest(unittest.TestCase):
             for purpose, hosts in (("control-plane", private_hosts), ("console", ["console.fixture.invalid"]), ("preview", ["review.fixture-media.invalid"])):
                 key, csr, certificate = root / (purpose + "-privkey.pem"), root / (purpose + ".csr"), root / (purpose + "-fullchain.pem")
                 extensions = root / (purpose + ".ext")
-                extensions.write_text("subjectAltName=" + ",".join("DNS:" + host for host in hosts) + "\n")
+                extensions.write_text("basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\n"
+                                      "extendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n"
+                                      "subjectAltName=" + ",".join("DNS:" + host for host in hosts) + "\n")
                 self.assertEqual(command("openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=" + hosts[0], "-keyout", str(key), "-out", str(csr)).returncode, 0)
                 self.assertEqual(command("openssl", "x509", "-req", "-days", "14", "-in", str(csr), "-CA", str(ca_cert), "-CAkey", str(ca_key), "-CAcreateserial", "-extfile", str(extensions), "-out", str(certificate)).returncode, 0)
                 key.chmod(0o600)

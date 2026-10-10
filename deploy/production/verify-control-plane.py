@@ -45,6 +45,13 @@ def public_pem(pem):
     return run(["openssl", "pkey", "-pubin", "-pubout"], pem.encode())
 
 
+def verify_tls_server(ca, fullchain, hostname):
+    # Keep intermediate certificates as untrusted inputs; only the explicit CA
+    # bundle anchors trust. Match default strict TLS clients, including key strength.
+    run(["openssl", "verify", "-x509_strict", "-auth_level", "2", "-purpose", "sslserver",
+         "-CAfile", str(ca), "-untrusted", str(fullchain), "-verify_hostname", hostname, str(fullchain)])
+
+
 def keyring(config, prefix):
     active = config["BROKERROUTER_ACTIVE_RESULT_KEY"] if prefix == "RESULT" else config["BROKERROUTER_BFF_ACTIVE_KEY"]
     keys = json.loads(config["BROKERROUTER_" + prefix + "_KEYS"])
@@ -140,7 +147,7 @@ def main():
             info = ca.lstat()
             cfg.require(stat.S_ISREG(info.st_mode) and info.st_mode & 0o022 == 0 and info.st_size <= cfg.LIMIT, "invalid public BFF CA")
             for name in ("control", "assets", "media-api", "output-scan", "output-delivery", "console", "catalog", "settings", "approvals", "media-review"):
-                run(["openssl", "verify", "-CAfile", str(ca), "-verify_hostname", name + ".brokerrouter.internal", str(root / "control-plane-fullchain.pem")])
+                verify_tls_server(ca, root / "control-plane-fullchain.pem", name + ".brokerrouter.internal")
         else:
             # x509's checkhost output is deterministic but its exit code alone is not portable.
             output = run(["openssl", "x509", "-noout", "-checkhost", hostname], pem)
