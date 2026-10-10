@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from contextlib import nullcontext
+from datetime import datetime, timezone
 import hashlib
 import json
 import secrets
@@ -13,10 +14,11 @@ from uuid import UUID
 from .client import GatewayFailure, GovernanceClient, HttpTransport, Transport, TransportFailure
 from .config import Config
 from .integrity import verify_runtime_installation
-from .store import Checkpoint, CheckpointConflict, CheckpointStore
+from .store import Checkpoint, CheckpointConflict, CheckpointStore, FrozenResult, MAX_RESULT_BYTES
 
 
 SUPPORTED_HERMES_REVISION = "67764dc0863349a384c16425e73ee8571f3a94b7"
+MAX_RESULT_WIRE_BYTES = 512 * 1024
 
 
 class GovernanceHalt(BaseException):
@@ -93,6 +95,10 @@ class ToolContext:
     def operation_key(self) -> str:
         return f"hermes-v1-{self.identity_hash}"
 
+    @property
+    def model_binding_hash(self) -> str:
+        return _sha(_canonical({"model_id": self.model_id}))
+
 
 @dataclass(frozen=True, repr=False)
 class GatewayTurnBinding:
@@ -131,11 +137,14 @@ class GovernanceGate:
         self.client = GovernanceClient(
             transport
             if transport is not None
-            else HttpTransport(config.base_url, config.virtual_key, config.request_timeout_seconds)
+            else HttpTransport(config.base_url, config.virtual_key, config.request_timeout_seconds,
+                               config.gateway_ca_file)
         )
         self._sleep = sleeper
         self._monotonic = monotonic
         self._human_wait = human_wait
+        self._native_returns: set[str] = set()
+        self._native_lock = threading.Lock()
 
     def _status(self, callback: Callable[[str], None] | None, state: str) -> None:
         if callback is not None:
@@ -165,24 +174,28 @@ class GovernanceGate:
         return self.store.checked(context.operation_key, operation_id, state, gateway_hash)
 
     def _approval_id(
-        self, context: ToolContext, response: dict[str, Any], checkpoint: Checkpoint
+        self, context: ToolContext, response: dict[str, Any], checkpoint: Checkpoint | FrozenResult
     ) -> str | None:
         if checkpoint.state != "waiting_approval":
             return None
+        operation_id = (
+            checkpoint.output_operation_id if isinstance(checkpoint, FrozenResult)
+            else checkpoint.operation_id
+        )
         approval = response.get("approval")
         if not isinstance(approval, dict):
-            raise GovernanceHalt("gateway_approval_invalid", checkpoint.operation_id)
+            raise GovernanceHalt("gateway_approval_invalid", operation_id)
         approval_id = _uuid(approval.get("id"), "gateway_approval_invalid")
         if (
             _uuid(approval.get("operation_id"), "gateway_approval_invalid")
-            != checkpoint.operation_id
+            != operation_id
             or _uuid(approval.get("turn_id"), "gateway_approval_invalid") != context.turn_id
             or approval.get("state") != "pending"
             or approval.get("scope") != "current_turn_only"
             or approval.get("resume_requires_recheck") is not True
             or approval.get("options") != ["continue_this_turn", "reject", "feedback"]
         ):
-            raise GovernanceHalt("gateway_approval_invalid", checkpoint.operation_id)
+            raise GovernanceHalt("gateway_approval_invalid", operation_id)
         return approval_id
 
     def _notify_approval(
@@ -265,6 +278,155 @@ class GovernanceGate:
         except (GatewayFailure, TransportFailure):
             return False
 
+    def _result_metadata(
+        self,
+        context: ToolContext,
+        checkpoint: Checkpoint,
+        frozen: FrozenResult,
+        response: dict[str, Any],
+    ) -> datetime:
+        try:
+            value = response.get("expires_at")
+            if type(value) is not str or len(value) > 64:
+                raise ValueError("invalid expiration")
+            expires_at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if expires_at.tzinfo is None or expires_at <= datetime.now(timezone.utc):
+                raise ValueError("expired result")
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise GovernanceHalt("gateway_result_expiry_invalid", checkpoint.operation_id) from exc
+        if (
+            _uuid(response.get("input_operation_id"), "gateway_result_identity_invalid")
+            != checkpoint.operation_id
+            or _uuid(response.get("turn_id"), "gateway_result_identity_invalid") != context.turn_id
+            or response.get("text_sha256") != frozen.sha256
+            or type(response.get("bytes")) is not int
+            or response["bytes"] != frozen.byte_length
+        ):
+            raise GovernanceHalt("gateway_result_identity_invalid", checkpoint.operation_id)
+        return expires_at
+
+    def _complete_execution_receipt(self, checkpoint: Checkpoint) -> Checkpoint:
+        if checkpoint.state == "effect_recorded" and checkpoint.evidence_ref and self._receipt_best_effort(
+            checkpoint, "completed", checkpoint.evidence_ref
+        ):
+            checkpoint = self.store.transition(checkpoint.operation_key, {"effect_recorded"}, "completed")
+        return checkpoint
+
+    def _release_result(
+        self,
+        context: ToolContext,
+        checkpoint: Checkpoint,
+        status: Callable[[str], None] | None,
+        approval: Callable[[dict[str, str]], None] | None,
+    ) -> str:
+        frozen = self.store.load_result(context.operation_key)
+        if frozen is None or frozen.text is None:
+            self._complete_execution_receipt(checkpoint)
+            raise GovernanceHalt("result_unavailable_after_restart", checkpoint.operation_id)
+        if not checkpoint.operation_id or not checkpoint.claim_token or not checkpoint.evidence_ref:
+            raise GovernanceHalt("checkpoint_incomplete", checkpoint.operation_id)
+        if (
+            frozen.byte_length > MAX_RESULT_WIRE_BYTES
+            or len(json.dumps(frozen.text, ensure_ascii=False).encode("utf-8")) > MAX_RESULT_WIRE_BYTES
+        ):
+            self._complete_execution_receipt(checkpoint)
+            raise GovernanceHalt("result_wire_unsupported", checkpoint.operation_id)
+        try:
+            # This endpoint commits the immutable result and completed execution receipt
+            # atomically. Lost acknowledgements are recovered with the same claim and bytes.
+            response = self.client.record_tool_result(
+                checkpoint.operation_id, checkpoint.claim_token, checkpoint.evidence_ref, frozen.text
+            )
+        except (GatewayFailure, TransportFailure) as exc:
+            raise GovernanceHalt("receipt_not_persisted", checkpoint.operation_id) from exc
+        result_id = _uuid(response.get("id"), "gateway_result_identity_invalid")
+        expires_at = self._result_metadata(context, checkpoint, frozen, response)
+        if response.get("state") != "recorded" or "text" in response:
+            raise GovernanceHalt("gateway_result_record_invalid", checkpoint.operation_id)
+        frozen = self.store.bind_remote_result(
+            context.operation_key, result_id, checkpoint.operation_id,
+            response["text_sha256"], response["bytes"],
+        )
+        checkpoint = self.store.load(context.operation_key)
+        if checkpoint is None:
+            raise GovernanceHalt("checkpoint_incomplete")
+        if checkpoint.state == "effect_recorded":
+            checkpoint = self.store.transition(context.operation_key, {"effect_recorded"}, "completed")
+        if checkpoint.state != "completed":
+            raise GovernanceHalt("execution_fact_invalid", checkpoint.operation_id)
+
+        deadline = self._monotonic() + self.config.approval_wait_seconds
+        while self._monotonic() < deadline:
+            waiting = False
+            try:
+                # Even a local ready observation is rechecked against current policy.
+                response = self.client.release_tool_result(result_id)
+                if (
+                    _uuid(response.get("result_id"), "gateway_result_identity_invalid") != result_id
+                    or self._result_metadata(context, checkpoint, frozen, response) != expires_at
+                ):
+                    raise GovernanceHalt("gateway_result_identity_invalid", checkpoint.operation_id)
+                output_id = _uuid(response.get("id"), "gateway_output_operation_invalid")
+                if _uuid(response.get("output_operation_id"), "gateway_output_operation_invalid") != output_id:
+                    raise GovernanceHalt("gateway_output_operation_invalid", output_id)
+                payload_hash = _valid_gateway_hash(response.get("payload_hash"))
+                if payload_hash is None:
+                    raise GovernanceHalt("gateway_payload_hash_invalid", output_id)
+                state = response.get("state")
+                if state not in {"checking", "waiting_approval", "ready", "rejected"}:
+                    raise GovernanceHalt("gateway_state_invalid", output_id)
+                if state != "ready" and "text" in response:
+                    raise GovernanceHalt("gateway_result_body_before_release", output_id)
+                if state == "ready":
+                    text = response.get("text")
+                    if type(text) is not str or text != frozen.text:
+                        raise GovernanceHalt("gateway_result_bytes_invalid", output_id)
+                    try:
+                        clear = text.encode("utf-8")
+                    except UnicodeEncodeError as exc:
+                        raise GovernanceHalt("gateway_result_bytes_invalid", output_id) from exc
+                    if len(clear) != frozen.byte_length or _sha(clear) != frozen.sha256:
+                        raise GovernanceHalt("gateway_result_bytes_invalid", output_id)
+                if state == "checking":
+                    evaluations = response.get("evaluations")
+                    if type(evaluations) is not list or not 1 <= len(evaluations) <= 128:
+                        raise GovernanceHalt("gateway_evaluation_invalid", output_id)
+                    for evaluation in evaluations:
+                        _uuid(evaluation, "gateway_evaluation_invalid")
+                frozen = self.store.output_checked(
+                    context.operation_key, output_id, state, payload_hash
+                )
+                self._status(status, f"output_{state}")
+                approval_id = self._approval_id(context, response, frozen)
+                if approval_id is not None:
+                    self._notify_approval(context, approval_id, approval)
+                    waiting = True
+                if state == "ready":
+                    return text
+                if state == "rejected":
+                    raise GovernanceHalt("action_rejected", output_id)
+            except GatewayFailure as exc:
+                if exc.code == "action_rejected":
+                    if frozen.output_operation_id:
+                        self.store.output_checked(
+                            context.operation_key, frozen.output_operation_id,
+                            "rejected", frozen.output_payload_hash,
+                        )
+                    else:
+                        self.store.mark_result_unavailable(context.operation_key)
+                if 400 <= exc.status < 500:
+                    raise GovernanceHalt(exc.code, frozen.output_operation_id) from exc
+                self._status(status, "gateway_unavailable")
+            except TransportFailure:
+                self._status(status, "gateway_unavailable")
+            remaining = max(0.0, deadline - self._monotonic())
+            if waiting:
+                with self._human_wait():
+                    self._sleep(min(self.config.approval_poll_seconds, remaining))
+            else:
+                self._sleep(min(self.config.approval_poll_seconds, remaining))
+        raise GovernanceHalt("approval_wait_timeout", frozen.output_operation_id)
+
     def run_tool(
         self,
         context: ToolContext,
@@ -279,17 +441,111 @@ class GovernanceGate:
         except Exception as exc:
             raise GovernanceHalt("adapter_internal_failure") from exc
 
+    def native_open(
+        self, context: ToolContext, status: Callable[[str], None] | None = None,
+        approval: Callable[[dict[str, str]], None] | None = None,
+    ) -> str | None:
+        """Bind original identity before Relay; recovery never reenters middleware."""
+        try:
+            context = context.validate()
+            origin = self.store.register_native_origin(
+                context.operation_key, context.identity_hash, context.tool_name,
+                context.model_binding_hash, _sha(_canonical(context.arguments)),
+            )
+            checkpoint = self.store.load(context.operation_key)
+            if checkpoint is None:
+                return None
+            if checkpoint.state in {"dispatch_authorized", "dispatching"}:
+                checkpoint = self.store.transition(
+                    context.operation_key, {"dispatch_authorized", "dispatching"}, "execution_unknown",
+                    f"hermes://brokerrouter/{context.operation_key}/restart-ambiguity",
+                )
+                self._receipt_best_effort(checkpoint, "execution_unknown", checkpoint.evidence_ref or "")
+            if checkpoint.state in {"effect_recorded", "completed"}:
+                if (
+                    origin.effect_recorded_at_ns is None
+                    or origin.final_payload_hash != checkpoint.local_payload_hash
+                    or origin.model_binding_hash != checkpoint.model_binding_hash
+                ):
+                    raise GovernanceHalt("native_execution_fact_invalid", checkpoint.operation_id)
+                return self._release_result(context, checkpoint, status, approval)
+            if checkpoint.state in {"claim_unknown", "execution_unknown", "rejected"}:
+                raise GovernanceHalt(checkpoint.state, checkpoint.operation_id)
+            return None
+        except GovernanceHalt:
+            raise
+        except Exception as exc:
+            raise GovernanceHalt("native_origin_conflict") from exc
+
+    def run_execution(
+        self, context: ToolContext, dispatch: Callable[[], Any],
+        status: Callable[[str], None] | None = None,
+        approval: Callable[[dict[str, str]], None] | None = None,
+    ) -> Any:
+        """Claim final arguments and record the known effect before returning to Relay."""
+        try:
+            context = context.validate()
+            self.store.bind_native_final(
+                context.operation_key, context.identity_hash, context.tool_name,
+                context.model_binding_hash, _sha(_canonical(context.arguments)),
+            )
+            return self._run_tool(context, dispatch, status, approval, native_execution=True)
+        except GovernanceHalt:
+            raise
+        except Exception as exc:
+            raise GovernanceHalt("native_execution_conflict") from exc
+
+    def finish_native(
+        self, context: ToolContext, final_text: str,
+        status: Callable[[str], None] | None = None,
+        approval: Callable[[dict[str, str]], None] | None = None,
+    ) -> str:
+        """Freeze once after all host transformations, before any content projection."""
+        try:
+            context = context.validate()
+            self.store.bind_native_final(
+                context.operation_key, context.identity_hash, context.tool_name,
+                context.model_binding_hash, _sha(_canonical(context.arguments)),
+            )
+            checkpoint = self.store.stage(
+                context.operation_key, context.identity_hash, context.tool_name,
+                _sha(_canonical(context.arguments)), model_binding_hash=context.model_binding_hash,
+                native=True,
+            )
+            frozen = self.store.load_result(context.operation_key)
+            with self._native_lock:
+                returned = context.operation_key in self._native_returns
+            if frozen is None and not returned:
+                raise GovernanceHalt("native_final_result_unavailable", checkpoint.operation_id)
+            if checkpoint.state not in {"effect_recorded", "completed"} or not checkpoint.evidence_ref:
+                raise GovernanceHalt("native_execution_fact_invalid", checkpoint.operation_id)
+            try:
+                self.store.freeze_native_result(context.operation_key, final_text, checkpoint.evidence_ref)
+            except Exception as exc:
+                frozen = self.store.load_result(context.operation_key)
+                if frozen is None or type(final_text) is not str or frozen.text != final_text:
+                    raise GovernanceHalt("native_final_result_not_persisted", checkpoint.operation_id) from exc
+            with self._native_lock:
+                self._native_returns.discard(context.operation_key)
+            return self._release_result(context, checkpoint, status, approval)
+        except GovernanceHalt:
+            raise
+        except Exception as exc:
+            raise GovernanceHalt("native_final_result_invalid") from exc
+
     def _run_tool(
         self,
         context: ToolContext,
         dispatch: Callable[[], Any],
         status: Callable[[str], None] | None = None,
         approval: Callable[[dict[str, str]], None] | None = None,
+        *, native_execution: bool = False,
     ) -> Any:
         context = context.validate()
         payload_hash = _sha(_canonical(context.arguments))
         checkpoint = self.store.stage(
-            context.operation_key, context.identity_hash, context.tool_name, payload_hash
+            context.operation_key, context.identity_hash, context.tool_name, payload_hash,
+            model_binding_hash=context.model_binding_hash, native=native_execution,
         )
 
         if checkpoint.state in {"dispatch_authorized", "dispatching"}:
@@ -300,16 +556,11 @@ class GovernanceGate:
                 f"hermes://brokerrouter/{context.operation_key}/restart-ambiguity",
             )
             self._receipt_best_effort(checkpoint, "execution_unknown", checkpoint.evidence_ref or "")
-        if checkpoint.state == "effect_recorded":
-            if checkpoint.evidence_ref and self._receipt_best_effort(
-                checkpoint, "completed", checkpoint.evidence_ref
-            ):
-                checkpoint = self.store.transition(
-                    context.operation_key, {"effect_recorded"}, "completed"
-                )
-            raise GovernanceHalt("result_unavailable_after_restart", checkpoint.operation_id)
+        if checkpoint.state in {"effect_recorded", "completed"}:
+            if native_execution:
+                raise GovernanceHalt("native_final_result_unavailable", checkpoint.operation_id)
+            return self._release_result(context, checkpoint, status, approval)
         if checkpoint.state in {
-            "completed",
             "claim_unknown",
             "execution_unknown",
             "rejected",
@@ -373,6 +624,20 @@ class GovernanceGate:
         )
         self._status(status, "dispatch_authorized")
         try:
+            unchanged = _sha(_canonical(context.arguments)) == payload_hash
+        except (Exception, GovernanceHalt):
+            unchanged = False
+        if not unchanged:
+            # A claim authorizes precisely the checked arguments. Mutable host
+            # references and callbacks must not change them during approval/HTTP
+            # waits. The claim remains consumed; no tool has run or may be retried.
+            evidence = f"hermes://brokerrouter/{context.operation_key}/final-arguments-changed-before-dispatch"
+            checkpoint = self.store.transition(
+                context.operation_key, {"dispatching"}, "execution_unknown", evidence
+            )
+            self._receipt_best_effort(checkpoint, "execution_unknown", evidence)
+            raise GovernanceHalt("final_arguments_changed", checkpoint.operation_id)
+        try:
             result = dispatch()
         except BaseException as exc:
             evidence = f"hermes://brokerrouter/{context.operation_key}/execution-unknown/{type(exc).__name__}"
@@ -383,14 +648,57 @@ class GovernanceGate:
             raise GovernanceHalt("execution_unknown", checkpoint.operation_id) from exc
 
         evidence = f"hermes://brokerrouter/{context.operation_key}/tool-returned"
-        checkpoint = self.store.transition(
-            context.operation_key, {"dispatching"}, "effect_recorded", evidence
-        )
-        if not self._receipt_best_effort(checkpoint, "completed", evidence):
-            raise GovernanceHalt("receipt_not_persisted", checkpoint.operation_id)
-        self.store.transition(context.operation_key, {"effect_recorded"}, "completed")
-        self._status(status, "completed")
-        return result
+        if native_execution:
+            try:
+                checkpoint = self.store.record_native_effect(context.operation_key, evidence)
+            except Exception as exc:
+                checkpoint = self.store.load(context.operation_key)
+                if checkpoint is None or checkpoint.state not in {"effect_recorded", "completed"}:
+                    raise GovernanceHalt("native_effect_not_persisted") from exc
+            with self._native_lock:
+                self._native_returns.add(context.operation_key)
+            self._complete_execution_receipt(checkpoint)
+            return result
+        unsupported = None
+        if type(result) is not str:
+            unsupported = "tool_result_not_string"
+        elif len(result) > MAX_RESULT_BYTES:
+            unsupported = "result_storage_unsupported"
+        else:
+            try:
+                if len(result.encode("utf-8")) > MAX_RESULT_BYTES:
+                    unsupported = "result_storage_unsupported"
+            except UnicodeEncodeError:
+                unsupported = "tool_result_not_utf8"
+        if unsupported:
+            checkpoint = self.store.transition(
+                context.operation_key, {"dispatching"}, "effect_recorded", evidence
+            )
+            self._complete_execution_receipt(checkpoint)
+            raise GovernanceHalt(unsupported, checkpoint.operation_id)
+        try:
+            self.store.freeze_result(context.operation_key, result, evidence)
+        except (Exception, GovernanceHalt) as exc:
+            # A freeze can commit before its observation fails. Authentic persisted bytes
+            # are recoverable; absent or corrupt bytes never justify another dispatch.
+            try:
+                frozen = self.store.load_result(context.operation_key)
+            except Exception:
+                frozen = None
+            if frozen is None or frozen.text is None:
+                current = self.store.load(context.operation_key)
+                if current is not None and current.state == "dispatching":
+                    current = self.store.transition(
+                        context.operation_key, {"dispatching"}, "execution_unknown", evidence
+                    )
+                    self._receipt_best_effort(current, "execution_unknown", evidence)
+                if isinstance(exc, GovernanceHalt):
+                    raise
+                raise GovernanceHalt("result_not_persisted", checkpoint.operation_id) from exc
+        checkpoint = self.store.load(context.operation_key)
+        if checkpoint is None:
+            raise GovernanceHalt("checkpoint_incomplete")
+        return self._release_result(context, checkpoint, status, approval)
 
     def bind_turn(self, binding: GatewayTurnBinding) -> str:
         binding = binding.validate()

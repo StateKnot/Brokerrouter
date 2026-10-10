@@ -22,6 +22,10 @@ REVISION = "67764dc0863349a384c16425e73ee8571f3a94b7"
 TOOL_EXECUTOR_SHA256 = "1610a0893588cbc067aaf84b3d019a683cd83ba0fdb92d69baf4f7b9e6d121b9"
 RUN_TURN_SHA256 = "dd203228bdfb7f69f1442adf4e24cc7e3196fb348b096ab6e7c2cb2bd2af5214"
 RUN_TURN_RUNNER_SHA256 = "9bfa045616264e944b417ce3bfe0e302168c7b6d0218ceeb253b2dad2629e4ba"
+MODEL_TOOLS_SHA256 = "875512e422e3e0d1502f7f7e127d47288bf1f1b350b4442ad5fc210e526b3f67"
+REGISTRY_SHA256 = "ca02644ea36dfa08ab7e12893d283a3b12549a5ffd33ea72c29c632a94e7b201"
+PLATFORM_BASE_SHA256 = "14f2bcd915e97ecb2d14cae290e1dc07d36c3247ac9b7599f38c3175670ec52a"
+RUN_VOICE_SHA256 = "236853144929c0165f766c9c44927c8acb0c2e575776b68b8a5f6dd0f9e8651f"
 
 OLD = '''    if ref.name == "memory":
         agent._turns_since_memory = 0
@@ -33,6 +37,7 @@ OLD = '''    if ref.name == "memory":
 '''
 
 NEW = '''    dispatch_started = False
+    frozen_arguments = None
 
     def _dispatch_now():
         nonlocal dispatch_started
@@ -48,20 +53,38 @@ NEW = '''    dispatch_started = False
             _begin_tool_execution(agent, ref, display_index)
 
         _advance_start_order(_begin_governed_execution)
-        return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
+        if frozen_arguments is None:
+            execution_args = ref.args
+        else:
+            # Display/preflight callbacks and the executor cannot mutate each other's
+            # arguments or the gate's checked context. Bytes fix the actual dispatch.
+            ref.args = json.loads(frozen_arguments)
+            state.args = ref.args
+            execution_args = json.loads(frozen_arguments)
+            from brokerrouter_hermes.native import quarantine_tool_output
 
-    # Strong Brokerrouter boundary: all Relay/execution middleware, pre-tool modifiers,
-    # scope checks and Hermes guardrails have already fixed ref.args. Import failure is
+            with quarantine_tool_output():
+                return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(execution_args))
+        return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(execution_args))
+
+    # Strong Brokerrouter input boundary: pre-tool modifiers, scope checks and Hermes
+    # guardrails have already fixed ref.args. Import failure is
     # fail-closed (it propagates); it never falls through to _dispatch_now.
     from brokerrouter_hermes import GovernanceHalt, gate_for_agent
-    from brokerrouter_hermes.gate import context_for_agent
+    from brokerrouter_hermes.gate import _canonical, context_for_agent
 
     try:
         brokerrouter_gate = gate_for_agent(agent)
         if brokerrouter_gate is None:
             return _dispatch_now()
-        return brokerrouter_gate.run_tool(
-            context_for_agent(agent, ref),
+        frozen_arguments = _canonical(ref.args)
+        ref.args = json.loads(frozen_arguments)
+        state.args = ref.args
+        checked_ref = _ToolCallRef(
+            ref.name, json.loads(frozen_arguments), ref.task_id, ref.call_id, ref.trace,
+        )
+        return brokerrouter_gate.run_execution(
+            context_for_agent(agent, checked_ref),
             _dispatch_now,
             status=lambda message: agent._emit_status(message),
             approval=getattr(agent, "_brokerrouter_approval_callback", None),
@@ -87,6 +110,272 @@ NEW = '''    dispatch_started = False
             guardrail_decision=decision,
         )
 '''
+
+TOOL_EXECUTOR_REPLACEMENTS = (
+    (OLD, NEW),
+    (
+        '''    trace: list
+
+    def middleware_kwargs''',
+        '''    trace: list
+    brokerrouter_finalized: bool = False
+    brokerrouter_recovered: bool = False
+
+    def middleware_kwargs''',
+    ),
+    (
+        '''    blocked: bool
+    dispatched: bool
+
+
+class _ToolTimeoutResult''',
+        '''    blocked: bool
+    dispatched: bool
+    brokerrouter_finalized: bool = False
+    brokerrouter_recovered: bool = False
+
+
+class _ToolTimeoutResult''',
+    ),
+    (
+        '''    from agent import relay_tools
+    from hermes_cli.middleware import (
+        apply_tool_request_middleware,
+        run_tool_execution_middleware,
+    )
+
+    trace = middleware_trace if middleware_trace is not None else []
+''',
+        '''    from brokerrouter_hermes import GovernanceHalt
+    from brokerrouter_hermes.native import NativeInvocation
+
+    trace = middleware_trace if middleware_trace is not None else []
+''',
+    ),
+    (
+        '''    state.result, _relay_args = relay_tools.execute(
+''',
+        '''    origin_ref = _ToolCallRef(function_name, function_args, effective_task_id, tool_call_id, trace)
+    try:
+        native = NativeInvocation.for_call(agent, origin_ref)
+        if native is not None:
+            if scope_block is not None:
+                # A frozen result does not override a current Hermes scope denial.
+                # This existing branch only emits safe blocked metadata; no tool runs.
+                state.result = _authorized_dispatch(function_args)
+                return state
+            # No optional Python Relay/request/execution continuations are trusted
+            # in required mode: they can publish raw bytes themselves. Core Hermes
+            # scope, pre-tool modifiers and input guardrails still run below.
+            recovered = native.open()
+            if recovered is not None:
+                if begin_execution is not None:
+                    begin_execution(None)
+                state.result = recovered
+                state.brokerrouter_finalized = state.brokerrouter_recovered = True
+                return state
+            state.result = _authorized_dispatch(function_args)
+            if not state.blocked:
+                state.result = native.finish(
+                    _ToolCallRef(function_name, state.args, effective_task_id, tool_call_id, trace),
+                    state.result,
+                )
+                state.brokerrouter_finalized = True
+            return state
+    except GovernanceHalt as governance_halt:
+        if not state.dispatched and begin_execution is not None:
+            begin_execution(None)
+        from agent.tool_guardrails import ToolGuardrailDecision
+
+        decision = ToolGuardrailDecision(
+            action="halt", code=f"brokerrouter_{governance_halt.code}",
+            message="Brokerrouter governance stopped this tool; review its operation state before retrying.",
+            tool_name=function_name,
+        )
+        agent._tool_guardrail_halt_decision = decision
+        state.blocked = True
+        state.result = _blocked_tool_result(
+            agent, origin_ref, block_message=None,
+            block_error_type="brokerrouter_governance_halt", guardrail_decision=decision,
+        )
+        return state
+
+    from agent import relay_tools
+    from hermes_cli.middleware import (
+        apply_tool_request_middleware,
+        run_tool_execution_middleware,
+    )
+    state.result, _relay_args = relay_tools.execute(
+''',
+    ),
+    (
+        '''            result, ref.args, ref.trace = managed.result, managed.args, managed.middleware_trace
+            blocked, dispatched = managed.blocked, managed.dispatched
+''',
+        '''            result, ref.args, ref.trace = managed.result, managed.args, managed.middleware_trace
+            ref.brokerrouter_finalized = managed.brokerrouter_finalized
+            ref.brokerrouter_recovered = managed.brokerrouter_recovered
+            blocked, dispatched = managed.blocked, managed.dispatched
+''',
+    ),
+    (
+        '''        if not blocked and not dispatched:
+            ref.emit_post(agent, result, duration_ms=int(duration * 1000))
+''',
+        '''        if not blocked and not ref.brokerrouter_recovered and (not dispatched or ref.brokerrouter_finalized):
+            ref.emit_post(agent, result, duration_ms=int(duration * 1000))
+''',
+    ),
+    (
+        '''    ref.args, ref.trace, function_result = managed.args, managed.middleware_trace, managed.result
+''',
+        '''    ref.args, ref.trace, function_result = managed.args, managed.middleware_trace, managed.result
+    ref.brokerrouter_finalized = managed.brokerrouter_finalized
+    ref.brokerrouter_recovered = managed.brokerrouter_recovered
+''',
+    ),
+    (
+        '''    if not managed.blocked and not _execution_timed_out:
+''',
+        '''    if not managed.blocked and not _execution_timed_out and not managed.brokerrouter_recovered:
+''',
+    ),
+    (
+        '''        if not blocked:
+            function_result = agent._append_guardrail_observation(
+''',
+        '''        if not blocked and not ref.brokerrouter_finalized:
+            function_result = agent._append_guardrail_observation(
+''',
+    ),
+    (
+        '''        if not blocked:
+            try:
+                agent._record_file_mutation_result''',
+        '''        if not blocked and not ref.brokerrouter_recovered:
+            try:
+                agent._record_file_mutation_result''',
+    ),
+    (
+        '''    subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
+''',
+        '''    subdir_hints = (
+        None if ref.brokerrouter_finalized else
+        agent._subdirectory_hints.check_tool_call(function_name, function_args)
+    )
+''',
+    ),
+    (
+        '''    if not blocked:
+        # ``tool.completed`` projects AFTER''',
+        '''    if not blocked and not ref.brokerrouter_recovered:
+        # ``tool.completed`` projects AFTER''',
+    ),
+    (
+        '''    if not blocked and agent.tool_complete_callback:
+''',
+        '''    if not blocked and not ref.brokerrouter_recovered and agent.tool_complete_callback:
+''',
+    ),
+)
+
+MODEL_TOOLS_REPLACEMENTS = (
+    (
+        '''    first string return wins. Gated on has_hook so the no-listener path is cheap.
+    """
+    try:
+''',
+        '''    first string return wins. Gated on has_hook so the no-listener path is cheap.
+    """
+    from brokerrouter_hermes.native import output_is_quarantined
+    if output_is_quarantined():
+        # Required mode has no trusted arbitrary result transformers. The native
+        # guardrail observer and hints run before the dedicated final freeze.
+        return result
+    try:
+''',
+    ),
+    (
+        '''    except Exception as e:
+        error_msg = f"Error executing {function_name}: {str(e)}"
+''',
+        '''    except Exception as e:
+        from brokerrouter_hermes.native import output_is_quarantined
+        if output_is_quarantined():
+            from brokerrouter_hermes import GovernanceHalt
+            raise GovernanceHalt("native_tool_execution_failed") from e
+        error_msg = f"Error executing {function_name}: {str(e)}"
+''',
+    ),
+)
+
+REGISTRY_REPLACEMENTS = (
+    (
+        '''        except Exception as e:
+            # exc_info already renders the exception, so keep the message copy bounded.
+''',
+        '''        except Exception as e:
+            from brokerrouter_hermes.native import output_is_quarantined
+            if output_is_quarantined():
+                from brokerrouter_hermes import GovernanceHalt
+                raise GovernanceHalt("native_tool_execution_failed") from e
+            # exc_info already renders the exception, so keep the message copy bounded.
+''',
+    ),
+)
+
+PLATFORM_BASE_REPLACEMENTS = (
+    (
+        '''    def __init__(self, config: PlatformConfig, platform: Platform):
+        self.config = config
+''',
+        '''    def __init__(self, config: PlatformConfig, platform: Platform):
+        # Binary output remains unsupported until isolated byte references have
+        # their own release grant. Close the actual APIs, including overrides.
+        from brokerrouter_hermes.native import restrict_binary_capabilities
+        restrict_binary_capabilities(self)
+        self.config = config
+''',
+    ),
+)
+
+RUN_VOICE_REPLACEMENTS = (
+    (
+        '''        — UNLESS streaming consumed the response (already_sent): then the runner must do it."""
+        if not response or response.startswith("Error:"):
+''',
+        '''        — UNLESS streaming consumed the response (already_sent): then the runner must do it."""
+        from brokerrouter_hermes.native import binary_delivery_disabled
+        if binary_delivery_disabled():
+            return False
+        if not response or response.startswith("Error:"):
+''',
+    ),
+    (
+        '''        over a platform limit); legacy single-file results keep working."""
+        audio_path, actual_paths = None, []
+''',
+        '''        over a platform limit); legacy single-file results keep working."""
+        from brokerrouter_hermes.native import binary_delivery_disabled
+        if binary_delivery_disabled():
+            logger.warning("brokerrouter_binary_artifact_release_unsupported")
+            return
+        audio_path, actual_paths = None, []
+''',
+    ),
+    (
+        '''        """Play the files in the connected voice channel, else send them as voice messages."""
+        adapter = self._adapter_for_source(event.source)
+''',
+        '''        """Play the files in the connected voice channel, else send them as voice messages."""
+        from brokerrouter_hermes.native import binary_delivery_disabled
+        if binary_delivery_disabled():
+            logger.warning("brokerrouter_binary_artifact_release_unsupported")
+            return
+        adapter = self._adapter_for_source(event.source)
+''',
+    ),
+)
 
 RUN_TURN_REPLACEMENTS = (
     (
@@ -219,7 +508,7 @@ def _replace_exact(source: bytes, replacements: tuple[tuple[str, str], ...], nam
 
 def patched_bytes(source: bytes) -> bytes:
     """Backwards-compatible name for the tool executor patch contract."""
-    return _replace_exact(source, ((OLD, NEW),), "agent/tool_executor.py")
+    return _replace_exact(source, TOOL_EXECUTOR_REPLACEMENTS, "agent/tool_executor.py")
 
 
 def patched_run_turn_bytes(source: bytes) -> bytes:
@@ -232,6 +521,22 @@ def patched_run_turn_runner_bytes(source: bytes) -> bytes:
     )
 
 
+def patched_model_tools_bytes(source: bytes) -> bytes:
+    return _replace_exact(source, MODEL_TOOLS_REPLACEMENTS, "model_tools.py")
+
+
+def patched_registry_bytes(source: bytes) -> bytes:
+    return _replace_exact(source, REGISTRY_REPLACEMENTS, "tools/registry.py")
+
+
+def patched_platform_base_bytes(source: bytes) -> bytes:
+    return _replace_exact(source, PLATFORM_BASE_REPLACEMENTS, "gateway/platforms/base.py")
+
+
+def patched_run_voice_bytes(source: bytes) -> bytes:
+    return _replace_exact(source, RUN_VOICE_REPLACEMENTS, "gateway/run_voice.py")
+
+
 PATCHES: tuple[tuple[str, str, Callable[[bytes], bytes]], ...] = (
     ("agent/tool_executor.py", TOOL_EXECUTOR_SHA256, patched_bytes),
     ("gateway/run_turn.py", RUN_TURN_SHA256, patched_run_turn_bytes),
@@ -240,6 +545,10 @@ PATCHES: tuple[tuple[str, str, Callable[[bytes], bytes]], ...] = (
         RUN_TURN_RUNNER_SHA256,
         patched_run_turn_runner_bytes,
     ),
+    ("model_tools.py", MODEL_TOOLS_SHA256, patched_model_tools_bytes),
+    ("tools/registry.py", REGISTRY_SHA256, patched_registry_bytes),
+    ("gateway/platforms/base.py", PLATFORM_BASE_SHA256, patched_platform_base_bytes),
+    ("gateway/run_voice.py", RUN_VOICE_SHA256, patched_run_voice_bytes),
 )
 
 

@@ -51,7 +51,7 @@ class HermesHostContractTest(unittest.TestCase):
         dispatched = []
 
         class Gate:
-            def run_tool(_self, context, dispatch, status=None, approval=None):
+            def run_execution(_self, context, dispatch, status=None, approval=None):
                 observed.append(context.arguments)
                 self.assertIs(
                     approval,
@@ -94,7 +94,7 @@ class HermesHostContractTest(unittest.TestCase):
         from brokerrouter_hermes import GovernanceHalt
 
         class Gate:
-            def run_tool(self, _context, _dispatch, status=None, approval=None):
+            def run_execution(self, _context, _dispatch, status=None, approval=None):
                 raise GovernanceHalt("claim_response_unknown", str(uuid4()))
 
         state = self.managed()
