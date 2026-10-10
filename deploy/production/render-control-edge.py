@@ -48,7 +48,11 @@ def main():
         source = source.replace("default_type application/octet-stream;", "default_type application/octet-stream;\n    client_body_temp_path /tmp/client-body;\n    proxy_temp_path /tmp/proxy;\n    fastcgi_temp_path /tmp/fastcgi;\n    uwsgi_temp_path /tmp/uwsgi;\n    scgi_temp_path /tmp/scgi;")
         source = source.replace("/etc/brokerrouter/tls/fullchain.pem", "/run/secrets/tls_fullchain")
         source = source.replace("/etc/brokerrouter/tls/privkey.pem", "/run/secrets/tls_private_key")
-        source = source.replace("proxy_pass http://127.0.0.1:8087;", "proxy_pass http://bff:8087;")
+        if component == "console":
+            source = source.replace("server_tokens off;", "server_tokens off;\n    resolver 127.0.0.11 valid=5s ipv6=off;\n    resolver_timeout 2s;")
+            # Fixed service target only. No URI part preserves the original request
+            # path/query; request data can never select the upstream origin.
+            source = source.replace("proxy_pass http://127.0.0.1:8087;", "set $fixed_bff_upstream bff:8087;\n            proxy_pass http://$fixed_bff_upstream;")
         files[component + "-nginx.conf"] = source.encode()
     files["origins.json"] = (json.dumps({"console_origin": args.console_origin, "preview_origin": args.preview_origin}, sort_keys=True) + "\n").encode()
     target = root / "control-edge"
