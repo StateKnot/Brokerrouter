@@ -22,7 +22,7 @@ HOST_FILES = {
     },
     "gateway/run_turn_runner.py": {
         "original_sha256": "9bfa045616264e944b417ce3bfe0e302168c7b6d0218ceeb253b2dad2629e4ba",
-        "patched_sha256": "1aac0ad4dcb229f4b0dc9827a4a9cf3647378340d6977f381ab91b80ea44efcf",
+        "patched_sha256": "83e82be9a8b6666c84793ba538d6981797c019b869ab2844ab1589df7914ba86",
     },
     "model_tools.py": {
         "original_sha256": "875512e422e3e0d1502f7f7e127d47288bf1f1b350b4442ad5fc210e526b3f67",
@@ -43,6 +43,14 @@ HOST_FILES = {
     "gateway/delivery_ledger.py": {
         "original_sha256": "b2656cd6429fb848f8df405fd7bb5e50f2ea6cb0620141c59ccccc3f7c314ab7",
         "patched_sha256": "d5bafbd4fc6e1598f31d5b4e3e93c27c22e0f9d48c19446fa941e4abb463df63",
+    },
+    "agent/agent_runtime_helpers.py": {
+        "original_sha256": "328f3f8ee5e6956ae530007ec0c22457e3bb681b6125c918cd43ea7124b1767e",
+        "patched_sha256": "18d611d086aac9991c787d7fd751dbeccd814c4bff8f9d7e7c83d8728481c485",
+    },
+    "agent/turn_api_call.py": {
+        "original_sha256": "5dead01b498131df2ee987e431ded73ca21313ef1a52633e9aa802efc2aa00b5",
+        "patched_sha256": "61993076054bf2b1a6dac58f51c3d02c655d4bf389da9d8c69b01708fe436ca0",
     },
 }
 MAX_MANIFEST_BYTES = 1024 * 1024

@@ -27,6 +27,8 @@ REGISTRY_SHA256 = "ca02644ea36dfa08ab7e12893d283a3b12549a5ffd33ea72c29c632a94e7b
 PLATFORM_BASE_SHA256 = "14f2bcd915e97ecb2d14cae290e1dc07d36c3247ac9b7599f38c3175670ec52a"
 RUN_VOICE_SHA256 = "236853144929c0165f766c9c44927c8acb0c2e575776b68b8a5f6dd0f9e8651f"
 DELIVERY_LEDGER_SHA256 = "b2656cd6429fb848f8df405fd7bb5e50f2ea6cb0620141c59ccccc3f7c314ab7"
+AGENT_RUNTIME_HELPERS_SHA256 = "328f3f8ee5e6956ae530007ec0c22457e3bb681b6125c918cd43ea7124b1767e"
+TURN_API_CALL_SHA256 = "5dead01b498131df2ee987e431ded73ca21313ef1a52633e9aa802efc2aa00b5"
 
 OLD = '''    if ref.name == "memory":
         agent._turns_since_memory = 0
@@ -552,11 +554,55 @@ verify_runtime_installation()
         from brokerrouter_hermes import GovernanceHalt, bind_gateway_agent
         try:
             bind_gateway_agent(agent, ctx, self)
+            from brokerrouter_hermes.model_transport import bind_model_origin
+            bind_model_origin(agent, ctx)
         except GovernanceHalt as governance_halt:
             raise RuntimeError(
                 f"Brokerrouter governance stopped turn: {governance_halt.code}"
             ) from governance_halt
 ''',
+    ),
+)
+
+AGENT_RUNTIME_HELPERS_REPLACEMENTS = (
+    (
+        '''    client_kwargs = dict(client_kwargs)
+    # The MoA virtual provider has no OpenAI wire endpoint; the facade *is* the client. Rebuild the
+''',
+        '''    client_kwargs = dict(client_kwargs)
+    from brokerrouter_hermes.model_transport import create_governed_model_client
+    governed_client = create_governed_model_client(agent, client_kwargs)
+    if governed_client is not None:
+        return governed_client
+    # The MoA virtual provider has no OpenAI wire endpoint; the facade *is* the client. Rebuild the
+''',
+    ),
+)
+
+TURN_API_CALL_REPLACEMENTS = (
+    (
+        '''    """Issue the request (see ``_should_stream`` for the streaming decision)."""
+    response = None
+''',
+        '''    """Issue the request (see ``_should_stream`` for the streaming decision)."""
+    from brokerrouter_hermes.model_transport import verify_model_client
+    verify_model_client(agent)
+    response = None
+''',
+    ),
+    (
+        '''    return _verdict("fallthrough")
+
+
+@dataclass
+class ApiInterruptVerdict:''',
+        '''    from brokerrouter_hermes.model_transport import complete_model_response
+    complete_model_response(agent, response)
+    return _verdict("fallthrough")
+
+
+@dataclass
+class ApiInterruptVerdict:''',
     ),
 )
 
@@ -612,6 +658,14 @@ def patched_run_voice_bytes(source: bytes) -> bytes:
     return _replace_exact(source, RUN_VOICE_REPLACEMENTS, "gateway/run_voice.py")
 
 
+def patched_agent_runtime_helpers_bytes(source: bytes) -> bytes:
+    return _replace_exact(source, AGENT_RUNTIME_HELPERS_REPLACEMENTS, "agent/agent_runtime_helpers.py")
+
+
+def patched_turn_api_call_bytes(source: bytes) -> bytes:
+    return _replace_exact(source, TURN_API_CALL_REPLACEMENTS, "agent/turn_api_call.py")
+
+
 PATCHES: tuple[tuple[str, str, Callable[[bytes], bytes]], ...] = (
     ("agent/tool_executor.py", TOOL_EXECUTOR_SHA256, patched_bytes),
     ("gateway/run_turn.py", RUN_TURN_SHA256, patched_run_turn_bytes),
@@ -625,6 +679,8 @@ PATCHES: tuple[tuple[str, str, Callable[[bytes], bytes]], ...] = (
     ("gateway/platforms/base.py", PLATFORM_BASE_SHA256, patched_platform_base_bytes),
     ("gateway/run_voice.py", RUN_VOICE_SHA256, patched_run_voice_bytes),
     ("gateway/delivery_ledger.py", DELIVERY_LEDGER_SHA256, patched_delivery_ledger_bytes),
+    ("agent/agent_runtime_helpers.py", AGENT_RUNTIME_HELPERS_SHA256, patched_agent_runtime_helpers_bytes),
+    ("agent/turn_api_call.py", TURN_API_CALL_SHA256, patched_turn_api_call_bytes),
 )
 
 

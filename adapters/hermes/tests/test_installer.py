@@ -71,6 +71,17 @@ class InstallerTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             installer.patched_delivery_ledger_bytes(source.replace(b"otherwise never claim", b"drifted"))
 
+    def test_primary_model_factory_anchor_is_exact_and_refuses_drift(self):
+        source = "\n".join(old for old, _ in installer.AGENT_RUNTIME_HELPERS_REPLACEMENTS).encode()
+        patched = installer.patched_agent_runtime_helpers_bytes(source)
+        self.assertIn(b"create_governed_model_client", patched)
+        with self.assertRaises(RuntimeError):
+            installer.patched_agent_runtime_helpers_bytes(source.replace(b"dict(client_kwargs)", b"dict(changed)"))
+        dispatch = "\n".join(old for old, _ in installer.TURN_API_CALL_REPLACEMENTS).encode()
+        self.assertIn(b"complete_model_response", installer.patched_turn_api_call_bytes(dispatch))
+        with self.assertRaises(RuntimeError):
+            installer.patched_turn_api_call_bytes(dispatch + dispatch)
+
     def test_apply_resumes_an_exact_partial_installation(self):
         tool = "\n".join(old for old, _ in installer.TOOL_EXECUTOR_REPLACEMENTS).encode()
         turn = "\n".join(old for old, _ in installer.RUN_TURN_REPLACEMENTS).encode()

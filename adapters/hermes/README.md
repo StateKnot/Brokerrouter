@@ -38,9 +38,9 @@ PYTHONPATH=/opt/hermes python -m unittest discover -s /build/brokerrouter-hermes
 ```
 
 首次命令同时核验 `agent/tool_executor.py`、`gateway/run_turn.py` 和
-`gateway/run_turn_runner.py`、`model_tools.py`、`tools/registry.py`、`gateway/platforms/base.py`、`gateway/run_voice.py` 和 `gateway/delivery_ledger.py` 的固定源码摘要；`--apply` 原子写入 overlay、保存固定源码备份并
+`gateway/run_turn_runner.py`、`model_tools.py`、`tools/registry.py`、`gateway/platforms/base.py`、`gateway/run_voice.py` 、`gateway/delivery_ledger.py`、`agent/agent_runtime_helpers.py` 和 `agent/turn_api_call.py` 的固定源码摘要；`--apply` 原子写入 overlay、保存固定源码备份并
 生成安装清单。安装中断只允许从精确的“原始/已审计补丁”混合态恢复；任何其他漂移都拒绝。治理模式在
-Gateway 模块导入时重新校验八个宿主文件、适配器全文件集与清单，不匹配则进程无法接受 turn。镜像发布必须
+Gateway 模块导入时重新校验十个宿主文件、适配器全文件集与清单，不匹配则进程无法接受 turn。镜像发布必须
 固定内容 digest，不使用浮动 tag。
 
 治理模式必须由受管部署设置：
